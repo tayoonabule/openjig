@@ -158,6 +158,26 @@ function computeRecoveryGuidance(input: {
     };
   }
 
+  if (runtime === "jcode") {
+    const commands: string[] = [];
+    if (resumeToken) {
+      const cmd = buildNativeResumeCommand(runtime, resumeToken);
+      if (cmd) commands.push(cmd);
+    }
+    if (cwd) {
+      commands.push(`cd ${cwd}`);
+    }
+
+    return {
+      summary: resumeToken
+        ? "Try native jcode resume first in the workspace."
+        : "No stored jcode resume token. Start jcode in the workspace.",
+      commands,
+      // The per-seat temporary server keeps seat hooks and identity isolated.
+      notes: ["The seat's own jcode server lives under $OPENRIG_HOME/state/jcode/<seat>/runtime."],
+    };
+  }
+
   return null;
 }
 

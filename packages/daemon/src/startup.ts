@@ -39,6 +39,8 @@ import { ClaudeResumeAdapter } from "./adapters/claude-resume.js";
 import { CodexResumeAdapter } from "./adapters/codex-resume.js";
 import { codexDaemonSupportProbe } from "./domain/codex-daemon-support.js";
 import { codexNetworkDefaultReader } from "./domain/codex-network-default.js";
+import { JcodeResumeAdapter } from "./adapters/jcode-resume.js";
+import { JcodeRuntimeAdapter } from "./adapters/jcode-runtime-adapter.js";
 import { PiResumeAdapter } from "./adapters/pi-resume.js";
 import { OmpResumeAdapter } from "./adapters/omp-resume.js";
 import { OMP_PROVIDER_ENV_VARS, OMP_PROVIDER_EXTRA_ENV_VARS } from "./adapters/pi-runner-protocol.js";
@@ -615,6 +617,23 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // #275: one reader for both Codex launch adapters, with the PATH, HOME and CODEX_HOME a seat session gets.
   const readCodexNetworkDefault = codexNetworkDefaultReader({ launchPath: process.env.PATH, home: daemonHome, codexHome });
   const codexResume = new CodexResumeAdapter(tmuxAdapter, { seatLaunchEnvironment, codexHome: configuredCodexHome, launchPath: process.env.PATH, detectDaemonSupport: codexDaemonSupportProbe(process.env.PATH, undefined, configuredCodexHome), readNetworkDefault: readCodexNetworkDefault });
+  const jcodeStateRoot = nodePath.join(OPENRIG_HOME, "state", "jcode");
+  const jcodeAdapter = new JcodeRuntimeAdapter({
+    tmux: tmuxAdapter,
+    fsOps: {
+      readFile: (p: string) => fs.readFileSync(p, "utf-8"),
+      writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"),
+      exists: (p: string) => fs.existsSync(p),
+      mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }),
+      listFiles: (dir: string) => fs.readdirSync(dir, { recursive: true }).map(String).filter((p) => fs.statSync(nodePath.join(dir, p)).isFile()),
+      statMode: (p: string) => fs.statSync(p).mode,
+      chmod: (p: string, mode: number) => fs.chmodSync(p, mode),
+    },
+    stateRoot: jcodeStateRoot,
+    launchPath: process.env.PATH,
+    activityRelayPath: nodePath.resolve(import.meta.dirname, "../assets/plugins/openrig-core/hooks/scripts/activity-relay.cjs"),
+  });
+  const jcodeResume = new JcodeResumeAdapter(jcodeAdapter);
   // OPR.0.4.6.PI1 — the Pi seat-state root + the compiled runner entry (daemon
   // dist). Shared by the Pi runtime adapter, the resume adapter, and the
   // resume-token capture sidecar reader.
@@ -640,7 +659,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
 
   const restoreOrchestrator = new RestoreOrchestrator({
     db, rigRepo, sessionRegistry, eventBus, snapshotRepo, snapshotCapture,
-    checkpointStore, nodeLauncher, tmuxAdapter, claudeResume, codexResume, piResume, ompResume,
+    checkpointStore, nodeLauncher, tmuxAdapter, claudeResume, codexResume, jcodeResume, piResume, ompResume,
     transcriptStore, serviceOrchestrator,
   });
 
@@ -961,7 +980,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     db, rigRepo, podRepo,
     sessionRegistry, eventBus, nodeLauncher, startupOrchestrator,
     fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), exists: (p: string) => fs.existsSync(p) },
-    adapters: { "claude-code": claudeAdapter, "codex": codexAdapter, "pi": piAdapter, "omp": ompAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() },
+    adapters: { "claude-code": claudeAdapter, "codex": codexAdapter, "jcode": jcodeAdapter, "pi": piAdapter, "omp": ompAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() },
     tmuxAdapter,
     agentImageLibrary,
     continuityPolicyMaterializer,
@@ -1035,6 +1054,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       // "cwd is inside the OpenRig installation". Use the resolved
       // workspace.root setting as the per-operator default.
       cwdOverride: runtimeSettings.workspaceRoot,
+      preferredRuntime: runtimeSettings.kernelRuntime,
       degradedTimeoutMs,
     });
     try {
@@ -1099,9 +1119,10 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // OPR.0.4.3.20 FR-4 — inject contextUsageStore so refresh() can null-fill a
   // Claude token from the sidecar during periodic/manual snapshot refresh.
   // #421 — the pane's current Claude process start time; a sidecar sampled earlier is not this
-  // process's, so capture and null-fill skip it.
+  // process's, so capture and null-fill skip it. Jcode session metadata is read
+  // through the adapter on the same refresher path.
   const claudeProcessStartedAt = (sessionName: string) => observeClaudePaneStartedAt({ target: sessionName, tmux: tmuxAdapter });
-  const resumeMetadataRefresher = new ResumeMetadataRefresher({ sessionRegistry, tmuxAdapter, contextUsageStore, claudeProcessStartedAt, codexHome: configuredCodexHome });
+  const resumeMetadataRefresher = new ResumeMetadataRefresher({ sessionRegistry, tmuxAdapter, contextUsageStore, claudeProcessStartedAt, codexHome: configuredCodexHome, jcodeSessionReader: jcodeAdapter });
   const claimService = new ClaimService({
     db, rigRepo, sessionRegistry, discoveryRepo, eventBus, tmuxAdapter, transcriptStore,
     claudeContextProvisioner: claudeAdapter,
@@ -1113,6 +1134,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     // OPR.0.4.6.PI1 FR-6 — pi-runner sidecar reader (the adapter exposes it).
     piRunnerStateStore: piAdapter,
     ompRunnerStateStore: ompAdapter,
+    jcodeSessionReader: jcodeAdapter,
   });
   const selfAttachService = new SelfAttachService({
     db, rigRepo, podRepo, sessionRegistry, eventBus, tmuxAdapter, transcriptStore,
@@ -1231,7 +1253,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     }),
     podInstantiator,
     podBundleSourceResolver,
-    runtimeAdapters: { "claude-code": claudeAdapter, "codex": codexAdapter, "pi": piAdapter, "omp": ompAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() },
+    runtimeAdapters: { "claude-code": claudeAdapter, "codex": codexAdapter, "jcode": jcodeAdapter, "pi": piAdapter, "omp": ompAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() },
     transcriptStore,
     sessionTransport: (() => {
       const t = new SessionTransport({
@@ -1760,6 +1782,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   {
     const { TerminalService } = await import("./domain/terminal/terminal-service.js");
     const { HerdrAdapter } = await import("./domain/terminal/herdr-adapter.js");
+    const { HerdrAgentBridge } = await import("./domain/terminal/jcode-herdr-agent-bridge.js");
     const { createHerdrSocketRpc, createHerdrSocketTransport } = await import(
       "./domain/terminal/herdr-transport.js"
     );
@@ -1788,9 +1811,25 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       logicalId: e.logicalId,
     });
 
+    const herdrTransport = createHerdrSocketTransport(createHerdrSocketRpc())();
+    const herdrAgentBridge = new HerdrAgentBridge({
+      transport: herdrTransport,
+      eventBus,
+      resolveSeat: (sessionName) => {
+        const row = db.prepare(
+          `SELECT n.id AS node_id, n.runtime, s.resume_token
+             FROM sessions s JOIN nodes n ON n.id = s.node_id
+            WHERE s.session_name = ? AND s.status = 'running'
+            ORDER BY s.id DESC LIMIT 1`,
+        ).get(sessionName) as { node_id: string; runtime: string | null; resume_token: string | null } | undefined;
+        return row ? { nodeId: row.node_id, runtime: row.runtime, resumeToken: row.resume_token } : null;
+      },
+      getSeatState: (nodeId) => seatActivityService.getSeatState(nodeId),
+    });
     const herdrProvider = new HerdrAdapter({
       // FB4: herdr speaks its unix control socket (there is no `layout` CLI).
-      transportFactory: createHerdrSocketTransport(createHerdrSocketRpc()),
+      transportFactory: () => herdrTransport,
+      agentBridge: herdrAgentBridge,
     });
     const cmuxProvider = new CmuxProviderAdapter({
       cmuxAdapter,
@@ -2380,6 +2419,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const contextMonitor = new ContextMonitor(db, contextUsageStore, claudeAdapter, compactionEnforcer, {
     "claude-code": claudeAdapter,
     codex: codexAdapter,
+    jcode: jcodeAdapter,
     pi: piAdapter,
     omp: ompAdapter,
   }, usageSamplesStore, () => providerWindowSamplesFromSignals(

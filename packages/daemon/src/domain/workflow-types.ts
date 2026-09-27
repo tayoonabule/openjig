@@ -18,7 +18,7 @@ export const WORKFLOW_EXIT_KINDS = ["handoff", "waiting", "done", "failed"] as c
 /** OPR.0.4.6.WF2 FR-2: the pinnable harness value space — AGENT harnesses
  *  only. `terminal` is deliberately excluded (a terminal node is not an
  *  agent harness); Pi Agent joins in 0.4.7 as a value-space extension. */
-export const WORKFLOW_AGENT_HARNESSES = ["claude-code", "codex"] as const;
+export const WORKFLOW_AGENT_HARNESSES = ["claude-code", "codex", "jcode"] as const;
 export type WorkflowAgentHarness = (typeof WORKFLOW_AGENT_HARNESSES)[number];
 
 /** OPR.0.4.6.WF2 FR-5: the structured step-level gate declaration (singular

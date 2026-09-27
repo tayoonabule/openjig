@@ -24,7 +24,7 @@ import {
   validateRestoreSummary,
   type ValidationError,
 } from "../restore-packet/schema-validator.js";
-import type { SourceRuntime, StructuredTranscript } from "../restore-packet/types.js";
+import type { SourceRuntime, StructuredTranscript, TargetRuntime } from "../restore-packet/types.js";
 
 // Per M1 contract § 1: 4 required packet files. Used by validate's
 // packet-shape check and by read for transcript-presence detection.
@@ -137,6 +137,10 @@ function isValidRuntime(value: string | undefined): value is SourceRuntime {
   return value === "codex" || value === "claude-code";
 }
 
+function isValidTargetRuntime(value: string | undefined): value is TargetRuntime {
+  return isValidRuntime(value) || value === "jcode";
+}
+
 async function fetchSourceTranscriptViaDaemon(
   session: string,
   deps: RestorePacketDeps | undefined,
@@ -190,7 +194,7 @@ function buildWritePacketOptions(
     structured,
     sourceRuntime,
     targetRig: opts.targetRig ?? "openrig-velocity",
-    targetRuntime: isValidRuntime(opts.targetRuntime) ? opts.targetRuntime : "claude-code",
+    targetRuntime: isValidTargetRuntime(opts.targetRuntime) ? opts.targetRuntime : "claude-code",
     targetWorkspaceRoot: opts.targetWorkspaceRoot ?? structured.sessionMeta?.cwd ?? sourceCwdFallback,
     defaultTargetRepo: opts.defaultTargetRepo ?? null,
     rolePointer: opts.rolePointer ?? `rigs/${opts.targetRig ?? "openrig-velocity"}/state/velocity/role.md`,
@@ -233,7 +237,7 @@ export function restorePacketCommand(depsOverride?: RestorePacketDeps): Command 
     .option("--target-rig <rig>", "Target rig name for the restored seat")
     .option(
       "--target-runtime <runtime>",
-      "Target runtime (claude-code | codex)",
+      "Target runtime (claude-code | codex | jcode)",
     )
     .option(
       "--target-workspace-root <path>",

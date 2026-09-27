@@ -8,6 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
 import { ConfigStore } from "../../config-store.js";
+import { catalogProjectRootFor } from "../jcode-project-catalog.js";
 
 import type {
   MissionInfo,
@@ -119,9 +120,9 @@ export function updateFrontmatter(
 // Mission discovery
 // ---------------------------------------------------------------------
 
-/** Locate the missions root from an explicit workspace override or the typed
- * `workspace.slices_root` setting. No cwd walk: discovery may enumerate
- * candidates, but selection comes from configuration. */
+/** Locate the missions root from an explicit workspace override, the catalogued
+ * project that contains cwd, or the typed `workspace.slices_root` setting.
+ * Selection still comes from configuration: only catalogued roots are matched. */
 export function resolveMissionsRoot(opts: {
   override?: string | null;
   cwd?: string;
@@ -135,7 +136,13 @@ export function resolveMissionsRoot(opts: {
     if (fs.existsSync(missions) && fs.statSync(missions).isDirectory()) return missions;
     if (path.basename(candidate) === "missions" && fs.existsSync(candidate)) return candidate;
   }
-  const configured = new ConfigStore(opts.configPath).get("workspace.slices_root") as string;
+  const store = new ConfigStore(opts.configPath);
+  if (!fromOverride) {
+    const project = catalogProjectRootFor(store.get("workspace.catalog_path") as string, cwd);
+    const missions = project && path.join(project, "missions");
+    if (missions && fs.existsSync(missions) && fs.statSync(missions).isDirectory()) return missions;
+  }
+  const configured = store.get("workspace.slices_root") as string;
   if (configured && fs.existsSync(configured) && fs.statSync(configured).isDirectory()) return configured;
   throw new ScopeCliError({
     fact: `Configured workspace.slices_root is not a readable directory: ${configured || "(unset)"}.`,

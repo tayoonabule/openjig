@@ -1,8 +1,8 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseJsonlExchanges } from "../src/domain/session-jsonl.js";
+import { parseJsonlExchanges, readJcodeSessionExchanges } from "../src/domain/session-jsonl.js";
 
 // Seat-handover boot recap: read the PROVIDER session JSONL (claude sidecar
 // transcript_path / codex rollout_path) into the last-N {role, content} exchanges for the boot recap.
@@ -75,5 +75,72 @@ describe("parseJsonlExchanges — claude-projects role/content shape", () => {
       { payload: { type: "token_count", info: {} } }, // non-message — skipped
     ]);
     expect(parseJsonlExchanges(p, 10)).toEqual([{ role: "user", content: "codex hello" }]);
+  });
+});
+
+// readJcodeSessionExchanges reads ~/.jcode/sessions/<resumeToken>.json (a single JSON
+// document, not a JSONL transcript) into {role, content} exchanges, reusing extractText.
+describe("readJcodeSessionExchanges — jcode session-JSON shape (structured document, not JSONL)", () => {
+  function jcodeHome(sessionId: string, body: Record<string, unknown>): string {
+    const home = mkdtempSync(join(tmpdir(), "jcode-recap-"));
+    dirs.push(home);
+    mkdirSync(join(home, ".jcode", "sessions"), { recursive: true });
+    writeFileSync(join(home, ".jcode", "sessions", `${sessionId}.json`), JSON.stringify(body));
+    return home;
+  }
+
+  it("extracts {role, content} from messages[] with string content", () => {
+    const home = jcodeHome("sess-1", {
+      id: "sess-1",
+      messages: [
+        { role: "user", content: "do the thing" },
+        { role: "assistant", content: "done the thing" },
+      ],
+    });
+    const result = readJcodeSessionExchanges(home, "sess-1");
+    expect(result?.exchanges).toEqual([
+      { role: "user", content: "do the thing" },
+      { role: "assistant", content: "done the thing" },
+    ]);
+    expect(result?.path).toBe(join(home, ".jcode", "sessions", "sess-1.json"));
+  });
+
+  it("joins text blocks and skips tool_use/reasoning-only blocks in an array content field", () => {
+    const home = jcodeHome("sess-2", {
+      messages: [
+        { role: "assistant", content: [{ type: "text", text: "part A" }, { type: "tool_use", name: "x" }, { type: "text", text: "part B" }] },
+        { role: "assistant", content: [{ type: "reasoning_trace", text: "hmm" }] }, // no text block — skipped
+      ],
+    });
+    expect(readJcodeSessionExchanges(home, "sess-2")?.exchanges).toEqual([
+      { role: "assistant", content: "part A\npart B" },
+    ]);
+  });
+
+  it("a missing session file returns null (honest 'no record', distinct from an empty one)", () => {
+    const home = mkdtempSync(join(tmpdir(), "jcode-recap-"));
+    dirs.push(home);
+    mkdirSync(join(home, ".jcode", "sessions"), { recursive: true });
+    expect(readJcodeSessionExchanges(home, "does-not-exist")).toBeNull();
+  });
+
+  it("a malformed (corrupt JSON) session file returns null, never throws", () => {
+    const home = mkdtempSync(join(tmpdir(), "jcode-recap-"));
+    dirs.push(home);
+    mkdirSync(join(home, ".jcode", "sessions"), { recursive: true });
+    writeFileSync(join(home, ".jcode", "sessions", "sess-bad.json"), "{ not json");
+    expect(readJcodeSessionExchanges(home, "sess-bad")).toBeNull();
+  });
+
+  it("a session file with no messages[] array returns null (malformed shape)", () => {
+    const home = jcodeHome("sess-noarr", { id: "sess-noarr" });
+    expect(readJcodeSessionExchanges(home, "sess-noarr")).toBeNull();
+  });
+
+  it("an empty messages[] array (or all text-less messages) returns a present result with zero exchanges — distinct from null", () => {
+    const home = jcodeHome("sess-empty", { messages: [] });
+    const result = readJcodeSessionExchanges(home, "sess-empty");
+    expect(result).not.toBeNull();
+    expect(result?.exchanges).toEqual([]);
   });
 });

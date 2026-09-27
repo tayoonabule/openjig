@@ -39,7 +39,7 @@ interface CliKnownTenure {
 }
 
 type WakeResolution =
-  | { resolved: true; token: string; runtime: "claude" | "codex"; sessionId: number }
+  | { resolved: true; token: string; runtime: "claude" | "codex" | "jcode"; sessionId: number }
   | { resolved: false; reason: string; known: CliKnownTenure[] };
 
 /** Parse a --wake seat target with an optional trailing @<generation>. A seat is
@@ -86,7 +86,7 @@ export function askCommand(depsOverride?: StatusDeps): Command {
     .option("--seat <session-name>", "Scope the search to ONE seat's transcript across every generation that sat in it (cross-generation archaeology)")
     .option("--session <token>", "Search ONE specific session's JSONL by its session token (read-only)")
     .option("--wake <seat[@gen]|token>", "EXECUTES: wake a session (by seat[@generation] or raw resume token) — ask one question, get a snapshot answer, back to cold (runtime cost; explicit, never an implicit escalation from a search)")
-    .option("--runtime <runtime>", "runtime for --wake: claude (default) or codex")
+    .option("--runtime <runtime>", "runtime for --wake: claude (default), codex, or jcode")
     .option("--wake-timeout <seconds>", "bounded wake timeout in seconds (default 180)")
     .addHelpText("after", `
 rig ask is one verb for information about the PAST, three ways to reach it:
@@ -139,7 +139,7 @@ Exit codes:
       }
 
       let token = target;
-      let runtime: "claude" | "codex" = opts.runtime === "codex" ? "codex" : "claude";
+      let runtime: "claude" | "codex" | "jcode" = opts.runtime === "codex" ? "codex" : opts.runtime === "jcode" ? "jcode" : "claude";
 
       if (target.includes("@")) {
         const status = await getDaemonStatus(deps.lifecycleDeps);

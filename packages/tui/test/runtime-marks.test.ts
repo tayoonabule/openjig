@@ -2,7 +2,8 @@
 // (RuntimeMark.tsx), never invented: the grid math is pinned against the
 // transcribed rect list, the row marks against their exact cell strings.
 import { describe, it, expect } from "vitest";
-import { clawdGrid, clawdFaithfulRows, clawdMiniA, clawdMiniB, codexMark, terminalMark, runtimeMarkSegs, markText } from "../src/topology/runtime-marks.js";
+import { createStyle } from "../src/theme.js";
+import { clawdGrid, clawdFaithfulRows, clawdMiniA, clawdMiniB, codexMark, jcodeMark, terminalMark, runtimeMarkSegs, markText } from "../src/topology/runtime-marks.js";
 
 describe("clawd grid = the RuntimeMark.tsx rect list", () => {
   it("body, arms, legs, and eyes land exactly where the SVG rects put them", () => {
@@ -30,13 +31,19 @@ describe("clawd grid = the RuntimeMark.tsx rect list", () => {
 });
 
 describe("row-scale mark family", () => {
-  it("runtime → mark mapping: claude family = clawd cells, codex = >_, terminal = dark >_, unknown = honest ?", () => {
+  it("runtime → mark mapping: claude family = clawd cells, codex = >_, Jcode = J>, terminal = dark >_, unknown = honest ?", () => {
     expect(markText(runtimeMarkSegs("claude-code"))).toBe("><"); // picks v4 amendment 14afeb74: inward squinty eyes (supersedes the round-4 quadrant pair)
     expect(markText(runtimeMarkSegs("codex"))).toBe(">_"); // the LOCKED web token
+    expect(markText(runtimeMarkSegs("JCODE"))).toBe("J>");
+    expect(jcodeMark()[0]).toMatchObject({ text: "J", token: "jcodeTeal" });
     expect(markText(runtimeMarkSegs("terminal"))).toBe(">_");
     expect(runtimeMarkSegs("terminal").every((s) => s.bg === "markBg")).toBe(true); // the dark-cell variant
     expect(markText(runtimeMarkSegs("something-else"))).toBe("?");
     expect(runtimeMarkSegs(null)[0]!.token).toBe("dim"); // honest, never fabricated
+  });
+
+  it("degrades the Jcode teal mark to cyan in 16-color terminals", () => {
+    expect(createStyle("16").paint("jcodeTeal", "J")).toBe("\u001b[36mJ\u001b[0m");
   });
 
   it("both downscale candidates are OUTPUTS of the grid downsample (provably derived — guard finding 4)", async () => {

@@ -117,6 +117,10 @@ Preserve any existing managed kernel and working rigs.
 ### Launch the two project seats
 
 Set `starter` to the chosen name from the table; the existing Codex route remains:
+`rig setup` also checks the optional Jcode harness without installing it; a
+missing Jcode is a warning. Its overall result can include optional components,
+so read the individual selected-provider results rather than treating an unused
+provider's absence as a blocker.
 
 ```sh
 cd <your-repository>

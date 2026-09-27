@@ -127,6 +127,29 @@ describe("native resume probe", () => {
         paneContent: `› Earlier conversation prompt\n${gate}\n${reportedFooter}`,
       })).toMatchObject({ status: "inconclusive", code });
     });
+  it("requires a numbered Jcode prompt instead of process presence", () => {
+    expect(assessNativeResumeProbe({ runtime: "jcode", paneCommand: "jcode", paneContent: "Jcode starting" }))
+      .toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
+    expect(assessNativeResumeProbe({ runtime: "jcode", paneCommand: "jcode", paneContent: "Jcode\n1> " }))
+      .toMatchObject({ status: "resumed", code: "active_runtime" });
+  });
+
+  it("requires the current bottom prompt and Jcode foreground process", () => {
+    const probe = (paneCommand: string, paneContent: string) => assessNativeResumeProbe({ runtime: "jcode", paneCommand, paneContent });
+    expect(probe("jcode", "Jcode\n1> \n1› request\nwaiting for response…")).toMatchObject({ status: "inconclusive" });
+    expect(probe("zsh", "Jcode\n1> ")).toMatchObject({ status: "failed", code: "returned_to_shell" });
+    expect(probe("jcode", "Jcode\n1> \nlast turn result")).toMatchObject({ status: "inconclusive" });
+    expect(probe("jcode", "Log in to continue\n1> previous\nWelcome to onboarding"))
+      .toMatchObject({ status: "attention_required", code: "login_required" });
+    expect(probe("jcode", "Jcode\n2> \n16k/1.0M ▱▱▱▱ 2%"))
+      .toMatchObject({ status: "resumed", code: "active_runtime" });
+  });
+
+  it("marks Jcode login and missing resume session distinctly", () => {
+    expect(assessNativeResumeProbe({ runtime: "jcode", paneCommand: "jcode", paneContent: "Log in to continue" }))
+      .toMatchObject({ status: "attention_required", code: "login_required" });
+    expect(assessNativeResumeProbe({ runtime: "jcode", paneCommand: "zsh", paneContent: "No saved session found" }))
+      .toMatchObject({ status: "failed", code: "no_saved_session" });
   });
   it("accepts a new input prompt after dismissed hook review without requiring another header", () => {
     const paneContent = "OpenAI Codex (v0.153.4)\n1 hook needs review before it can run.\nPress t to trust; esc to go back\n› Ask Codex to do anything\n  gpt-6-astra xhigh · /work";
@@ -213,6 +236,12 @@ describe("native resume probe", () => {
   it("builds a Codex profile resume with -p flag", () => {
     expect(buildNativeResumeCommand("codex", "019d-token", null, "my-profile")).toBe(
       "codex -p 'my-profile' resume '019d-token'"
+    );
+  });
+
+  it("builds a jcode resume command", () => {
+    expect(buildNativeResumeCommand("jcode", "session-jcode-123")).toBe(
+      "jcode --resume 'session-jcode-123'"
     );
   });
 

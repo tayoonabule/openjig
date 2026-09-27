@@ -287,7 +287,7 @@ run after the harness is ready: `after_files` (the default) after the post-launc
 | Capability | Status | Notes |
 |------------|--------|-------|
 | Guidance file projection (`guidance_merge`) | **Supported** | Reliable. Primary delivery mechanism. |
-| Skill projection (`skill_install`) | **Supported** | Reliable. Skills are copied to workspace. |
+| Skill projection (`skill_install`) | **Supported** | Reliable. Claude Code uses `.claude/skills`; Codex and Jcode use `.agents/skills`. |
 | `send_text` delivery after ready | **Supported** | Reliable. Requires harness to be ready. |
 | Hooks | **Through plugins** | Declare a plugin under `resources.plugins[]`; `resources.hooks` is refused. |
 | Runtime resource projection | **Supported for recognized fragments** | `claude_settings_fragment`, `claude_mcp_fragment`, and `codex_config_fragment` are applied to provider config. Unknown types are copied to runtime extension directories. |
@@ -403,6 +403,13 @@ remain shared.
 **Terminal seats** (`builtin:terminal`) get no agent or profile layers and no startup proof.
 
 When authoring startup content, note which instructions are runtime-specific. For example, an orchestrator that needs a monitoring loop should include instructions like: "If running Claude Code, use `/loop 3m` to periodically check rig health. If running Codex, check rig health at the start of each task cycle instead."
+
+**Jcode:**
+- Reads `AGENTS.md` and discovers project skills from `.jcode/skills`, `.agents/skills`, and `.claude/skills`. OpenRig installs managed skills in `.agents/skills`
+- Has no compatible Claude/Codex plugin loader, so only skill-only plugin content is applicable
+- Native Jcode startup, restore, provider, and permission behavior remains runtime-specific and is not configured by OpenRig's Codex settings fragment
+
+When authoring startup content, note which instructions are runtime-specific. For example, an orchestrator that needs a monitoring loop should include instructions like: "If running Claude Code, use `/loop 3m` to periodically check rig health. If running Codex or Jcode, check rig health at the start of each task cycle instead."
 
 ---
 

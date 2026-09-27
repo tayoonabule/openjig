@@ -532,7 +532,7 @@ export class BootstrapOrchestrator {
       // Install once per runtime that references this package
       const runtimes = runtimesForRef.size > 0 ? [...runtimesForRef] : ["claude-code"];
       for (const rt of runtimes) {
-        const runtime = rt as "claude-code" | "codex";
+        const runtime = rt as "claude-code" | "codex" | "jcode";
         const outcome = this.deps.packageInstallService.install({
           resolved: resolved.resolved,
           targetRoot: opts.targetRoot ?? specDir,

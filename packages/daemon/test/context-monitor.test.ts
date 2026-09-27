@@ -27,6 +27,7 @@ describe("ContextMonitor", () => {
   let checkReadySpy: ReturnType<typeof vi.fn>;
   let tmpDir: string;
   let codexHomeDir: string;
+  let jcodeHomeDir: string;
 
   beforeEach(() => {
     db = createDb();
@@ -37,7 +38,10 @@ describe("ContextMonitor", () => {
     mkdirSync(join(tmpDir, "state", "context-usage"), { recursive: true });
     codexHomeDir = join(tmpDir, "codex-home");
     mkdirSync(join(codexHomeDir, ".codex"), { recursive: true });
-    store = new ContextUsageStore(db, { stateDir: tmpDir, codexHomeDir });
+    // A tmp jcodeHomeDir seam, mirroring codexHomeDir.
+    jcodeHomeDir = join(tmpDir, "jcode-home");
+    mkdirSync(join(jcodeHomeDir, ".jcode", "sessions"), { recursive: true });
+    store = new ContextUsageStore(db, { stateDir: tmpDir, codexHomeDir, jcodeHomeDir });
     ensureContextCollectorSpy = vi.fn();
     checkReadySpy = vi.fn(async (): Promise<ReadinessResult> => ({ ready: false, reason: "not_ready", code: "awaiting_runtime" }));
     monitor = new ContextMonitor(db, store, {
@@ -69,6 +73,18 @@ describe("ContextMonitor", () => {
     db.prepare("UPDATE sessions SET status = ?, resume_type = 'codex_id', resume_token = ? WHERE id = ?")
       .run(status, "thread-1", session.id);
     return { rig, node, sessionName: "dev-qa@test", threadId: "thread-1" };
+  }
+
+  // Mirrors seedCodexNode: a jcode seat with a resume token recorded.
+  function seedJcodeNode(status: "running" | "detached" = "running", startupStatus?: string) {
+    const rig = rigRepo.createRig("test-rig-jcode");
+    const node = rigRepo.addNode(rig.id, "dev.jcode", { runtime: "jcode", cwd: "/project" });
+    const session = sessionRegistry.registerSession(node.id, "dev-jcode@test");
+    db.prepare(
+      "UPDATE sessions SET status = ?, resume_type = 'jcode_id', resume_token = ?" +
+      (startupStatus ? ", startup_status = ?" : "") + " WHERE id = ?",
+    ).run(...(startupStatus ? [status, "sess-jcode-1", startupStatus, session.id] : [status, "sess-jcode-1", session.id]));
+    return { rig, node, sessionName: "dev-jcode@test", resumeToken: "sess-jcode-1", session };
   }
 
   function seedClaimedNode() {
@@ -131,6 +147,20 @@ describe("ContextMonitor", () => {
           model_context_window: 258400,
         },
       },
+    }));
+  }
+
+  // Writes ~/.jcode/sessions/<resumeToken>.json with a token_usage-bearing message so
+  // readJcodeAndNormalize has something to sum.
+  function writeJcodeSession(resumeToken: string) {
+    writeFileSync(join(jcodeHomeDir, ".jcode", "sessions", `${resumeToken}.json`), JSON.stringify({
+      id: resumeToken,
+      working_dir: "/project",
+      messages: [
+        { role: "user", content: "hi", timestamp: new Date().toISOString() },
+        { role: "assistant", content: "hello", timestamp: new Date().toISOString(),
+          token_usage: { input_tokens: 1000, output_tokens: 50, cache_read_input_tokens: 200 } },
+      ],
     }));
   }
 
@@ -253,6 +283,64 @@ describe("ContextMonitor", () => {
     expect(usage.availability).toBe("known");
     expect(usage.source).toBe("codex_token_count_jsonl");
     expect(usage.usedPercentage).toBe(88);
+  });
+
+  // Mirrors the codex test above via the jcode arm of readContextUsage.
+  it("pollOnce discovers running jcode sessions and persists context usage", async () => {
+    const { node: jcodeNode, sessionName, resumeToken } = seedJcodeNode();
+    writeJcodeSession(resumeToken);
+
+    await monitor.pollOnce();
+
+    const usage = store.getForNode(jcodeNode.id, sessionName);
+    expect(usage.availability).toBe("known");
+    expect(usage.source).toBe("jcode_session_json");
+    expect(usage.totalInputTokens).toBe(1000);
+    expect(usage.totalOutputTokens).toBe(50);
+    // No claude-only collector provisioning for a jcode seat (mirrors the codex assertion).
+    expect(ensureContextCollectorSpy).not.toHaveBeenCalled();
+  });
+
+  it("pollOnce backfills detached jcode sessions from resume tokens", async () => {
+    const { node: jcodeNode, sessionName, resumeToken } = seedJcodeNode("detached");
+    writeJcodeSession(resumeToken);
+
+    await monitor.pollOnce();
+
+    const usage = store.getForNode(jcodeNode.id, sessionName);
+    expect(usage.availability).toBe("known");
+    expect(usage.source).toBe("jcode_session_json");
+  });
+
+  // Mirrors the existing Codex attention_required self-heal test.
+  it("pollOnce normalizes stale jcode attention_required state once the runtime reports ready", async () => {
+    const { session } = seedJcodeNode("running", "attention_required");
+    // No resume token on this row so the eligibility SQL's self-heal branch (not the
+    // context-usage branch) is what admits it — proves the OR-clause's second arm.
+    db.prepare("UPDATE sessions SET resume_token = NULL WHERE id = ?").run(session.id);
+
+    const jcodeReadySpy = vi.fn(async (): Promise<ReadinessResult> => ({ ready: true }));
+    monitor = new ContextMonitor(db, store, {
+      ensureContextCollector: ensureContextCollectorSpy,
+      checkReady: checkReadySpy,
+    }, undefined, {
+      "claude-code": { checkReady: checkReadySpy },
+      jcode: { checkReady: jcodeReadySpy },
+    });
+
+    await monitor.pollOnce();
+
+    const refreshed = db.prepare("SELECT startup_status, startup_completed_at FROM sessions WHERE id = ?").get(session.id) as {
+      startup_status: string;
+      startup_completed_at: string | null;
+    };
+    expect(refreshed.startup_status).toBe("ready");
+    expect(refreshed.startup_completed_at).toBeTruthy();
+    expect(jcodeReadySpy).toHaveBeenCalledWith(expect.objectContaining({
+      nodeId: session.nodeId,
+      tmuxSession: "dev-jcode@test",
+      cwd: "/project",
+    }));
   });
 
   // STUB-A (51-01 GAP-1): running stub sessions with a context sidecar are polled and observed

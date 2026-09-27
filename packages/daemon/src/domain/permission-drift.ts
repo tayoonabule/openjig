@@ -112,11 +112,17 @@ export function observeOmpApprovalMode(arg: string): AppliedLaunchObservation {
   return { runtime: "omp", axis: "permission", state: "unknown", value: null, reason: "unrecognized_launch_argument" };
 }
 
+/** Jcode has no approval or sandbox launch flag; YOLO cannot alter its posture. */
+export function observeJcodePosture(): AppliedLaunchObservation {
+  return { runtime: "jcode", axis: "not_applicable", state: "observed", value: "unrestricted", reason: "permission_flags_unavailable" };
+}
+
 function runtimeCommand(runtime: string): string | null {
   if (runtime === "claude-code") return "claude";
   if (runtime === "codex") return "codex";
   if (runtime === "pi") return "pi";
   if (runtime === "omp") return "omp";
+  if (runtime === "jcode") return "jcode";
   return null;
 }
 
@@ -244,7 +250,7 @@ function inspectLaunchBoundRuntime(
     expected: applied.value,
     effective: applied.value,
     sourcePath: null,
-    reason: "generation_matched_launch_effect",
+    reason: runtime === "jcode" ? "permission_flags_unavailable" : "generation_matched_launch_effect",
   };
 }
 

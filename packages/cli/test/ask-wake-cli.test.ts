@@ -206,6 +206,19 @@ describe("rig ask --wake (L3 CLI)", () => {
     expect(exitCode).toBeUndefined();
   });
 
+  it("resolves a jcode seat via the daemon, then wakes with jcode's one-shot resume command", async () => {
+    const runner: WakeRunner = vi.fn(async () => ({ stdout: "jcode-resumed", stderr: "", code: 0, timedOut: false }));
+    const deps = seatDeps(runner, { resolved: true, token: "session-jcode-123", runtime: "jcode", sessionId: 7 });
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd(deps).parseAsync(["node", "rig", "ask", "my-rig", "q", "--wake", "dev-qa@my-rig"]);
+    });
+    const call = (runner as unknown as { mock: { calls: [string, string[], unknown][] } }).mock.calls[0]!;
+    expect(call[0]).toBe("jcode");
+    expect(call[1]).toEqual(["--quiet", "run", "--resume", "session-jcode-123", expect.stringContaining("q")]);
+    expect(logs.join("\n")).toContain("jcode-resumed");
+    expect(exitCode).toBeUndefined();
+  });
+
   it("renders the teaching REFUSAL for an unresolvable seat (lists tenures), exit 2, no wake", async () => {
     const runner: WakeRunner = vi.fn(async () => ({ stdout: "x", stderr: "", code: 0, timedOut: false }));
     const deps = seatDeps(runner, {

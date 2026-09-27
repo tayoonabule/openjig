@@ -48,17 +48,17 @@ describe("rig skill loadout", () => {
   });
 
   it("inspects and applies one deterministic three-selector loadout", async () => {
-    const run = async (apply: boolean) => {
+    const run = async (apply: boolean, runtime: "codex" | "jcode" = "codex") => {
       logs.length = 0;
       const cmd = skillCommand();
       await cmd.parseAsync([
-        "node", "rig", "loadout", "--runtime", "codex", "--cwd", project,
+        "node", "rig", "loadout", "--runtime", runtime, "--cwd", project,
         "--topology", "topology-skill", "--json", ...(apply ? ["--apply"] : []),
       ]);
       return JSON.parse(logs.join("")) as {
         ok: boolean;
         loadout: { entries: Array<{ id: string; selectedBy: string[] }> };
-        projection: { ok: boolean; applied: boolean; receipts: Array<{ status: string }> };
+        projection: { ok: boolean; applied: boolean; receipts: Array<{ status: string; target: string }> };
       };
     };
 
@@ -71,6 +71,13 @@ describe("rig skill loadout", () => {
     expect(inspected.projection).toMatchObject({ ok: true, applied: false });
     expect(inspected.projection.receipts.every((receipt) => receipt.status === "missing")).toBe(true);
 
+    const jcodeInspected = await run(false, "jcode");
+    expect(jcodeInspected.projection.receipts.map((receipt) => receipt.target)).toEqual([
+      join(project, ".agents", "skills", "project-skill"),
+      join(project, ".agents", "skills", "system-skill"),
+      join(project, ".agents", "skills", "topology-skill"),
+    ]);
+
     const applied = await run(true);
     expect(applied.projection).toMatchObject({ ok: true, applied: true });
     expect(applied.projection.receipts.every((receipt) => receipt.status === "current")).toBe(true);
@@ -81,6 +88,6 @@ describe("rig skill loadout", () => {
     const cmd = skillCommand();
     await cmd.parseAsync(["node", "rig", "loadout", "--runtime", "terminal", "--cwd", project]);
     expect(process.exitCode).toBe(1);
-    expect(errors).toEqual(["invalid_runtime: --runtime must be claude-code or codex"]);
+    expect(errors).toEqual(["invalid_runtime: --runtime must be claude-code, codex, or jcode"]);
   });
 });

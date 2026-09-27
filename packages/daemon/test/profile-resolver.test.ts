@@ -61,6 +61,31 @@ function makeCtx(overrides?: Partial<ResolutionContext>): ResolutionContext {
 }
 
 describe("Profile resolver + precedence engine", () => {
+  it("discovers a Jcode project skill through the .agents layout", () => {
+    const root = mkdtempSync(join(tmpdir(), "openrig-jcode-profile-"));
+    try {
+      const cwd = join(root, "project");
+      const skillDir = join(cwd, ".agents", "skills", "jcode-discovered");
+      mkdirSync(skillDir, { recursive: true });
+      writeFileSync(join(skillDir, "SKILL.md"), "---\nname: jcode-discovered\ndescription: A Jcode-discovered skill.\n---\n\nUse it.\n");
+      const spec = makeSpec({
+        resources: { skills: [], guidance: [], subagents: [], plugins: [], runtimeResources: [] },
+        profiles: {
+          default: { uses: { skills: ["jcode-discovered"], guidance: [], subagents: [], plugins: [], runtimeResources: [] } },
+        },
+      });
+      const result = resolveNodeConfig(makeCtx({
+        baseSpec: makeResolved(spec, root),
+        member: makeMember({ runtime: "jcode", cwd }),
+        homedir: join(root, "home"),
+      }));
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.config.selectedResources.skills.map((skill) => skill.effectiveId)).toContain("jcode-discovered");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   // T1: profile selects from combined base+import pool
   it("profile selects from combined base+import pool with effectiveId and sourcePath", () => {
     const importSpec = makeSpec({

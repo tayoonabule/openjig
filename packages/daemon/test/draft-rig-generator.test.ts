@@ -65,6 +65,17 @@ describe("Draft rig generator", () => {
     expect(validation.valid).toBe(true);
   });
 
+  it("drafts a discovered jcode pane as a jcode member, not claude-code", () => {
+    const result = generateDraftRig([
+      makeSession({ id: "s1", tmuxSession: "impl", runtimeHint: "jcode", cwd: "/project" }),
+    ]);
+    const raw = RigSpecCodec.parse(result.yaml);
+    expect(RigSpecSchema.validate(raw).valid).toBe(true);
+    const pods = (raw as Record<string, unknown>)["pods"] as Array<Record<string, unknown>>;
+    const members = (pods[0] as Record<string, unknown>)["members"] as Array<Record<string, unknown>>;
+    expect(members[0]!["runtime"]).toBe("jcode");
+  });
+
   // Test 4: handles mixed runtimes
   it("handles mixed runtimes (claude-code + codex + terminal)", () => {
     const sessions = [

@@ -91,6 +91,9 @@ export interface RiggedConfig {
     autoDriveProviderPrompts: boolean;
     providerAuthEnvAllowlist: string;
   };
+  kernel: {
+    runtime: string;
+  };
   // V1 attempt-3 Phase 4 — Advisor / Operator rail icon V1 placeholders
   // per universal-shell.md L82–L84. SC-29 EXCEPTION: allowlist-only
   // additions (no schema migrations / new endpoints / event types).
@@ -255,6 +258,9 @@ const DEFAULTS = {
     autoDriveProviderPrompts: false,
     providerAuthEnvAllowlist: "",
   },
+  kernel: {
+    runtime: "auto",
+  },
   // V1 Phase 4 — Advisor default per universal-shell.md L83;
   // Operator default empty per L84 ("not configured").
   agents: {
@@ -387,6 +393,8 @@ export const VALID_KEYS = [
   "ui.enabled",
   "recovery.auto_drive_provider_prompts",
   "recovery.provider_auth_env_allowlist",
+  // openjig: runtime for the auto-booted kernel rig.
+  "kernel.runtime",
   // V1 Phase 4 SC-29 exception — allowlist-only additions.
   "agents.advisor_session",
   "agents.operator_session",
@@ -485,6 +493,7 @@ export const ENV_MAP: Record<ValidKey, { primary: string; legacy?: string }> = {
   "ui.preview.default_lines": { primary: "OPENRIG_UI_PREVIEW_DEFAULT_LINES" },
   "recovery.auto_drive_provider_prompts": { primary: "OPENRIG_RECOVERY_AUTO_DRIVE_PROVIDER_PROMPTS" },
   "recovery.provider_auth_env_allowlist": { primary: "OPENRIG_RECOVERY_PROVIDER_AUTH_ENV_ALLOWLIST" },
+  "kernel.runtime": { primary: "OPENRIG_KERNEL_RUNTIME" },
   "agents.advisor_session": { primary: "OPENRIG_AGENTS_ADVISOR_SESSION" },
   "agents.operator_session": { primary: "OPENRIG_AGENTS_OPERATOR_SESSION" },
   "workspace.operator_seat_name": { primary: "OPENRIG_WORKSPACE_OPERATOR_SEAT_NAME" },
@@ -568,6 +577,7 @@ const KEY_TO_PATH: Record<ValidKey, string[]> = {
   "ui.preview.default_lines": ["ui", "preview", "defaultLines"],
   "recovery.auto_drive_provider_prompts": ["recovery", "autoDriveProviderPrompts"],
   "recovery.provider_auth_env_allowlist": ["recovery", "providerAuthEnvAllowlist"],
+  "kernel.runtime": ["kernel", "runtime"],
   "agents.advisor_session": ["agents", "advisorSession"],
   "agents.operator_session": ["agents", "operatorSession"],
   "workspace.operator_seat_name": ["workspace", "operatorSeatName"],
@@ -810,6 +820,11 @@ const KEY_CONSTRAINTS: Partial<Record<ValidKey, (raw: string, coerced: string | 
       throw new Error(`Invalid value for policies.idle_gate_qitem.auto_register: must be "off" or "all", got "${raw}"`);
     }
   },
+  "kernel.runtime": (raw) => {
+    if (!["auto", "claude-code", "codex", "jcode"].includes((raw ?? "").trim())) {
+      throw new Error(`Invalid value for kernel.runtime: must be "auto", "claude-code", "codex" or "jcode", got "${raw}"`);
+    }
+  },
   // Policy threshold: integer in [1, 100]. Documented contract from
   // slice 27 README §"What the operator gets" — operator can lower to
   // e.g. 50 = compact earlier; range is 1-100 inclusive. A value of 0
@@ -1045,6 +1060,9 @@ export class ConfigStore {
       recovery: {
         autoDriveProviderPrompts: v("recovery.auto_drive_provider_prompts") as boolean,
         providerAuthEnvAllowlist: v("recovery.provider_auth_env_allowlist") as string,
+      },
+      kernel: {
+        runtime: v("kernel.runtime") as string,
       },
       agents: {
         advisorSession: v("agents.advisor_session") as string,

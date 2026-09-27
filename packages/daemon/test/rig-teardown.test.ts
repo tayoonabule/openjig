@@ -563,6 +563,24 @@ describe("RigTeardownOrchestrator", () => {
     expect(fs.existsSync(agentsMd)).toBe(false);
   });
 
+  it("removes jcode AGENTS.md managed blocks during teardown", async () => {
+    const cwd = path.join(tmpDir, "jcode-project");
+    fs.mkdirSync(cwd, { recursive: true });
+    const agentsMd = path.join(cwd, "AGENTS.md");
+    fs.writeFileSync(agentsMd, [
+      "# User guidance",
+      "<!-- BEGIN OpenRig MANAGED BLOCK: role -->",
+      "managed jcode role",
+      "<!-- END OpenRig MANAGED BLOCK: role -->",
+    ].join("\n"));
+    const { rigId } = seedRigWithNode({ runtime: "jcode", cwd, sessionStatus: "exited" });
+
+    await buildTeardown().teardown(rigId);
+
+    expect(fs.readFileSync(agentsMd, "utf-8")).toContain("# User guidance");
+    expect(fs.readFileSync(agentsMd, "utf-8")).not.toContain("BEGIN OpenRig MANAGED BLOCK");
+  });
+
   // T14: Per-node cleanup is atomic (status + binding together)
   it("per-node cleanup updates status and clears binding atomically", async () => {
     const { rigId, nodeId, sessionId } = seedRig();

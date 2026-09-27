@@ -37,6 +37,9 @@ export interface ResumeTokenCaptureDeps {
   ompRunnerStateStore?: {
     readSessionFile(sessionName: string): { ok: true; sessionFile: string } | { ok: false; reason: string };
   } | null;
+  jcodeSessionReader?: {
+    captureSessionId(sessionName: string): Promise<string | undefined>;
+  } | null;
 }
 
 export type ResumeTokenDeriveResult =
@@ -76,6 +79,7 @@ export async function isClaudeSidecarFromEarlierProcess(
  *   codex       → the thread id derived from live pid-keyed logs
  *   pi          → the pi-runner state sidecar's sessionFile (a file read)
  *   omp         → the OMP runner state sidecar's sessionFile (separate root)
+ *   jcode       → the seat-scoped Jcode session reader
  * Returns a structured outcome; never throws for a missing/invalid token
  * (those are honest skips). ANY unexpected throw from a dependency is the
  * caller's to swallow (capture must never fail or block its lifecycle op).
@@ -115,6 +119,10 @@ export async function deriveResumeToken(
     }
     if (state.sessionFile.trim().length > 0) token = state.sessionFile.trim();
     else return { outcome: "skipped", reason: "missing_sidecar" };
+  } else if (runtime === "jcode") {
+    if (!deps.jcodeSessionReader) return { outcome: "noop" };
+    token = await deps.jcodeSessionReader.captureSessionId(input.sessionName);
+    if (!token) return { outcome: "skipped", reason: "probe_timeout" };
   } else {
     return { outcome: "noop" }; // resumeType set but runtime is not one we derive — defensive
   }

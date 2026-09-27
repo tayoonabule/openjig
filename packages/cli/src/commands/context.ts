@@ -43,7 +43,7 @@ import { prepareDaemonAutoStart } from "../daemon-auto-start.js";
 import { readOpenRigEnv } from "../openrig-compat.js";
 import type { StatusDeps } from "./status.js";
 
-const contextRuntimeArg = enumArg(["claude-code", "claude", "codex"]);
+const contextRuntimeArg = enumArg(["claude-code", "claude", "codex", "jcode"]);
 
 interface ContextPackEntryWire {
   id: string;
@@ -266,14 +266,14 @@ Examples:
     .option("--mission <id>", "Exact mission id under the selected project")
     .option("--slice <id>", "Exact slice id under the selected mission")
     .option("--deliver", "Include the exact content of each extant planned file")
-    .option("--runtime <runtime>", "Inspect skills for claude-code (alias: claude) or codex", contextRuntimeArg)
+    .option("--runtime <runtime>", "Inspect skills for claude-code (alias: claude), codex, or jcode", contextRuntimeArg)
     .option("--cwd <path>", "Agent working directory that receives skill projections (default: current directory)")
     .option("--topology <ids>", "Comma-separated topology/profile skill identities")
     .option("--apply-skills", "Reconcile selected skills into the runtime harness directory")
     .option("--json", "JSON output")
     .action((opts: { project?: string; mission?: string; slice?: string; deliver?: boolean; runtime?: string; cwd?: string; topology?: string; applySkills?: boolean; json?: boolean }) => {
       if (opts.applySkills && opts.runtime === undefined) {
-        console.error("invalid_runtime: --apply-skills requires --runtime claude-code (alias: claude) or codex");
+        console.error("invalid_runtime: --apply-skills requires --runtime claude-code (alias: claude), codex, or jcode");
         process.exitCode = 1;
         return;
       }
@@ -329,7 +329,7 @@ Examples:
         skillLoadout = resolvedSkills.loadout;
         skillProjection = reconcileSkillLoadout({
           loadout: skillLoadout,
-          runtime: opts.runtime === "codex" ? "codex" : "claude-code",
+          runtime: opts.runtime === "codex" || opts.runtime === "jcode" ? opts.runtime : "claude-code",
           cwd: resolve(opts.cwd ?? process.cwd()),
           apply: opts.applySkills === true,
         });
@@ -677,12 +677,12 @@ Examples:
   cmd.command("profile")
     .argument("<name-or-ref>", "Context pack name or path-like ref (its manifest must declare atoms)")
     .requiredOption("--situation <situation>", "fresh | handover | post-compaction")
-    // r1 4d obs 2: default from the seat's own environment — a codex seat that
+    // r1 4d obs 2: default from the seat's own environment: a non-Claude seat that
     // forgets the flag must not silently get a claude profile (mini-req 3 is
     // the rule that the runtimes compose DIFFERENT profiles). Flag beats env;
     // an unrecognized env value falls back to claude rather than erroring a
     // surface the env owner may not control.
-    .option("--runtime <runtime>", "claude-code (alias: claude) or codex (default: $OPENRIG_RUNTIME, else claude-code)", contextRuntimeArg)
+    .option("--runtime <runtime>", "claude-code (alias: claude), codex, or jcode (default: $OPENRIG_RUNTIME, else claude-code)", contextRuntimeArg)
     .option("--profile <profile>", "Named install profile declared by the pack (selection + ordered phases)")
     .option("--budget <tokens>", "Situation token budget — overage is REPORTED, never truncated")
     .option("--rig <rig>", "With --seat: grant read access to that seat's tree (seat: atoms)")
@@ -694,7 +694,7 @@ Examples:
       try {
         const client = await getClient();
         const entry = await resolvePack(client, nameOrRef);
-        // r1 F2: the product's runtime vocabulary is "claude-code" / "codex"
+        // r1 F2: the product's runtime vocabulary is "claude-code" / "codex" / "jcode"
         // (the adapters' values, live on real seats) — map it EXPLICITLY. A
         // genuinely unknown value falls back to claude WITH A VOICE: a future
         // third runtime must not silently get a claude profile (the exact
@@ -702,7 +702,7 @@ Examples:
         const envRuntime = process.env["OPENRIG_RUNTIME"];
         let runtime = opts.runtime;
         if (runtime === undefined) {
-          if (envRuntime === "codex") runtime = "codex";
+          if (envRuntime === "codex" || envRuntime === "jcode") runtime = envRuntime;
           else if (envRuntime === "claude-code" || envRuntime === "claude") runtime = "claude";
           else {
             if (envRuntime) console.error(`Warning: unrecognized OPENRIG_RUNTIME '${envRuntime}' — composing the claude profile; pass --runtime to override.`);

@@ -19,6 +19,9 @@ export interface ContextUsageStoreOpts {
   codexHomeDir?: string | null;
   /** Explicit CODEX_HOME. codexHomeDir above is the legacy OS-home input. */
   codexHome?: string;
+  /** The home directory ~/.jcode/sessions lives under. Defaults to os.homedir()
+   *  like codexHomeDir — a test seam so no test depends on the real home dir. */
+  jcodeHomeDir?: string | null;
   // GHOST-STAGE (c-id): resolve the LIVE occupant's boot time (atom-B tenure) for a node, so a
   // reading sampled BEFORE the current occupant booted (a prior generation) is rejected instead of
   // driving the threshold. null = UNKNOWN → the gate is inert (note-2).
@@ -83,11 +86,30 @@ interface CodexTokenCountEvent {
   };
 }
 
+/** The on-disk shape of `~/.jcode/sessions/<id>.json`, narrowed to the fields this reader
+ *  consumes (see gap-audit.md "Notes on method"). */
+interface JcodeTokenUsageRaw {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+}
+
+interface JcodeSessionMessageRaw {
+  timestamp?: string;
+  token_usage?: JcodeTokenUsageRaw;
+}
+
+interface JcodeSessionRaw {
+  messages?: JcodeSessionMessageRaw[];
+}
+
 export class ContextUsageStore {
   readonly db: Database.Database;
   private stateDir: string;
   private codexHomeDir: string | null;
   private codexHome?: string;
+  private jcodeHomeDir: string | null;
 
   private readonly resolveOccupantBootAt?: (nodeId: string) => string | null;
   constructor(db: Database.Database, opts: ContextUsageStoreOpts) {
@@ -95,6 +117,7 @@ export class ContextUsageStore {
     this.stateDir = opts.stateDir;
     this.codexHomeDir = opts.codexHomeDir ?? safeHomeDir();
     this.codexHome = opts.codexHome;
+    this.jcodeHomeDir = opts.jcodeHomeDir ?? safeHomeDir();
     this.resolveOccupantBootAt = opts.resolveOccupantBootAt;
   }
 
@@ -189,6 +212,74 @@ export class ContextUsageStore {
   /** Resolve an explicitly selected native thread, even before its first token count. */
   readCodexTranscriptPath(threadId: string): string | null {
     return this.readCodexThread(threadId)?.rollout_path ?? null;
+  }
+
+  /**
+   * Read `~/.jcode/sessions/<resumeToken>.json` and sum `messages[].token_usage` into a
+   * ContextUsage. The session file has no `context_window_size` field, so
+   * `contextWindowSize`/`usedPercentage`/`remainingPercentage` stay honest nulls; only the raw
+   * token totals are known here.
+   */
+  readJcodeAndNormalize(input: { resumeToken: string | null | undefined; sessionName: string }): ContextUsage {
+    const resumeToken = input.resumeToken?.trim();
+    if (!resumeToken) return this.unknownUsage("no_data");
+    if (!this.jcodeHomeDir) return this.unknownUsage("no_data");
+
+    const sessionPath = join(this.jcodeHomeDir, ".jcode", "sessions", `${resumeToken}.json`);
+    let raw: JcodeSessionRaw;
+    try {
+      if (!existsSync(sessionPath)) return this.unknownUsage("no_data");
+      raw = JSON.parse(readFileSync(sessionPath, "utf-8")) as JcodeSessionRaw;
+    } catch {
+      return this.unknownUsage("parse_error");
+    }
+
+    const messages = Array.isArray(raw.messages) ? [...raw.messages] : [];
+    // jcode appends new turns to `<id>.journal.jsonl` beside the snapshot and folds them into the
+    // JSON only on its next checkpoint, so recent usage lives in the journal.
+    try {
+      const journalPath = join(this.jcodeHomeDir, ".jcode", "sessions", `${resumeToken}.journal.jsonl`);
+      if (existsSync(journalPath)) {
+        for (const line of readFileSync(journalPath, "utf-8").split("\n")) {
+          if (!line.trim()) continue;
+          const entry = JSON.parse(line) as { append_messages?: unknown };
+          if (Array.isArray(entry.append_messages)) messages.push(...(entry.append_messages as typeof messages));
+        }
+      }
+    } catch {
+      // A torn final journal line is expected mid-write; the snapshot alone is still honest.
+    }
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    let sampledAt: string | null = null;
+    let sawUsage = false;
+    for (const message of messages) {
+      const usage = message?.token_usage;
+      if (usage && typeof usage === "object") {
+        sawUsage = true;
+        if (typeof usage.input_tokens === "number") totalInputTokens += usage.input_tokens;
+        if (typeof usage.output_tokens === "number") totalOutputTokens += usage.output_tokens;
+      }
+      if (typeof message?.timestamp === "string") sampledAt = message.timestamp;
+    }
+    if (!sawUsage) return this.unknownUsage("no_data");
+
+    return {
+      availability: "known",
+      reason: null,
+      source: "jcode_session_json",
+      usedPercentage: null,
+      remainingPercentage: null,
+      contextWindowSize: null,
+      totalInputTokens,
+      totalOutputTokens,
+      currentUsage: null,
+      transcriptPath: sessionPath,
+      sessionId: resumeToken,
+      sessionName: input.sessionName,
+      sampledAt,
+      fresh: sampledAt ? this.isFresh(sampledAt) : false,
+    };
   }
 
   /** Normalize raw sidecar data into a ContextUsage record. */

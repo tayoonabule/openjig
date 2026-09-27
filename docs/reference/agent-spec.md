@@ -174,7 +174,7 @@ defaults:
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `runtime` | string | no | — | Default runtime for this agent. Precedence: the rig spec member's `runtime`, then the profile's `preferences.runtime`, then this, then `claude-code`. |
+| `runtime` | string | no | — | Default runtime for this agent. Precedence: the rig spec member's `runtime`, then the profile's `preferences.runtime`, then this, then `claude-code`. Jcode is supported with `AGENTS.md` guidance and `.agents/skills/` projection. |
 | `model` | string | no | — | Default model, with the same precedence. |
 | `effort` | string | no | — | Default reasoning effort, with the same precedence. Claude gets `--effort`, Codex `-c model_reasoning_effort=…`. A blank or non-string value is ignored with an advisory. |
 | `lifecycle` | Lifecycle | no | see below | Lifecycle behavior defaults. |

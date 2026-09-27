@@ -9,6 +9,7 @@ describe("resumeTypeForRuntime", () => {
   it("maps runtimes to their resume-id type", () => {
     expect(resumeTypeForRuntime("claude-code")).toBe("claude_id");
     expect(resumeTypeForRuntime("codex")).toBe("codex_id");
+    expect(resumeTypeForRuntime("jcode")).toBe("jcode_id");
     expect(resumeTypeForRuntime("pi")).toBe("pi_session_file");
     expect(resumeTypeForRuntime("terminal")).toBeNull();
     expect(resumeTypeForRuntime(null)).toBeNull();
@@ -16,6 +17,14 @@ describe("resumeTypeForRuntime", () => {
 });
 
 describe("validateResumeToken", () => {
+  it("accepts a jcode session id but rejects malformed ids without echoing them", () => {
+    const valid = "session_evergreen_1790178908510_a18975cec608bc81";
+    expect(validateResumeToken("jcode", valid)).toEqual({ ok: true, resumeType: "jcode_id", token: valid });
+    const invalid = "session_bad; unexpected";
+    const result = validateResumeToken("jcode", invalid);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).not.toContain(invalid);
+  });
   it("accepts a well-formed claude token and returns claude_id", () => {
     const r = validateResumeToken("claude-code", "abc-123-def-456");
     expect(r.ok).toBe(true);
@@ -40,7 +49,10 @@ describe("validateResumeToken", () => {
   it("rejects an unsupported runtime without fabricating", () => {
     const r = validateResumeToken("terminal", "anything");
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toMatch(/not supported/i);
+    if (!r.ok) {
+      expect(r.error).toMatch(/not supported/i);
+      expect(r.error).toContain("claude-code, codex, jcode, and pi");
+    }
   });
 
   it("rejects an empty token", () => {

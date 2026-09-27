@@ -84,6 +84,9 @@ interface ClaimServiceDeps {
     readSessionFile(sessionName: string): { ok: true; sessionFile: string } | { ok: false; reason: string };
   };
   ompRunnerStateStore?: ResumeTokenCaptureDeps["ompRunnerStateStore"];
+  jcodeSessionReader?: {
+    captureSessionId(sessionName: string): Promise<string | undefined>;
+  };
 }
 
 interface BindOptions {
@@ -119,6 +122,7 @@ export class ClaimService {
   private resumeTokenCapturer: ClaimServiceDeps["resumeTokenCapturer"] | null;
   private piRunnerStateStore: ClaimServiceDeps["piRunnerStateStore"] | null;
   private ompRunnerStateStore: ClaimServiceDeps["ompRunnerStateStore"] | null;
+  private jcodeSessionReader: ClaimServiceDeps["jcodeSessionReader"] | null;
 
   constructor(deps: ClaimServiceDeps) {
     if (deps.db !== deps.rigRepo.db) throw new Error("ClaimService: rigRepo must share the same db handle");
@@ -138,6 +142,7 @@ export class ClaimService {
     this.resumeTokenCapturer = deps.resumeTokenCapturer ?? null;
     this.piRunnerStateStore = deps.piRunnerStateStore ?? null;
     this.ompRunnerStateStore = deps.ompRunnerStateStore ?? null;
+    this.jcodeSessionReader = deps.jcodeSessionReader ?? null;
   }
 
   private async observeBindingPane(
@@ -243,7 +248,7 @@ export class ClaimService {
       // FR-3's adoption provenance/audit semantics are unchanged.
       const derived = await deriveResumeToken(
         { runtime: input.runtime, sessionName: input.sessionName },
-        { contextUsageStore: this.contextUsageStore, claudeProcessStartedAt: this.claudeProcessStartedAt, resumeTokenCapturer: this.resumeTokenCapturer, piRunnerStateStore: this.piRunnerStateStore, ompRunnerStateStore: this.ompRunnerStateStore },
+        { contextUsageStore: this.contextUsageStore, claudeProcessStartedAt: this.claudeProcessStartedAt, resumeTokenCapturer: this.resumeTokenCapturer, piRunnerStateStore: this.piRunnerStateStore, ompRunnerStateStore: this.ompRunnerStateStore, jcodeSessionReader: this.jcodeSessionReader },
       );
       if (derived.outcome === "exempt" || derived.outcome === "noop") return;
       const runtime = input.runtime as string; // non-null past exempt

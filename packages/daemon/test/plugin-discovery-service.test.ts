@@ -347,6 +347,26 @@ describe("PluginDiscoveryService", () => {
       expect(service.listPlugins()).toEqual([]);
     });
 
+    it("marks only skill-only plugin trees as applicable to Jcode", () => {
+      const skillOnly = join(dirs.openrigPluginsDir, "skill-only");
+      writeCodexPluginManifest(skillOnly, { name: "skill-only", version: "1.0.0" });
+      mkdirSync(join(skillOnly, "skills", "useful"), { recursive: true });
+      writeFileSync(join(skillOnly, "skills", "useful", "SKILL.md"), "# useful");
+
+      const configured = join(dirs.openrigPluginsDir, "configured");
+      writeCodexPluginManifest(configured, { name: "configured", version: "1.0.0", mcpServers: {} });
+      mkdirSync(join(configured, "skills", "also-useful"), { recursive: true });
+      writeFileSync(join(configured, "skills", "also-useful", "SKILL.md"), "# also useful");
+
+      const service = new PluginDiscoveryService({
+        openrigPluginsDir: dirs.openrigPluginsDir,
+        claudeCacheDir: dirs.claudeCacheDir,
+        codexCacheDir: dirs.codexCacheDir,
+        specLibraryDir: dirs.specLibraryDir,
+      });
+      expect(service.listPlugins({ runtimeFilter: "jcode" }).map((plugin) => plugin.name)).toEqual(["skill-only"]);
+    });
+
     it("slice 3.3 fix-C — scans rig-bundled cwd plugin roots when cwdScanRoots provided", () => {
       // velocity-qa VM verify failure #3 — DESIGN §5.4 union-of-sources
       // must include rig-bundled <cwd>/.claude/plugins/* and

@@ -24,6 +24,7 @@ const SHIPPED_VARIANTS = [
   "rig.yaml",
   "rig-claude-only.yaml",
   "rig-codex-only.yaml",
+  "rig-jcode-only.yaml",
 ] as const;
 
 const KERNEL_DIR = join(__dirname, "..", "specs", "rigs", "launch", "kernel");
@@ -51,7 +52,7 @@ describe("kernel rig variants — rig spec validate", () => {
     });
   }
 
-  it("all 3 variants share the same topology shape (pods + member ids)", () => {
+  it("all 4 variants share the same topology shape (pods + member ids)", () => {
     const shapes = SHIPPED_VARIANTS.map((variant) => {
       const yaml = readFileSync(join(KERNEL_DIR, variant), "utf-8");
       // Light parse via the shared codec; structural equality on pods

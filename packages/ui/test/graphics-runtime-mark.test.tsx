@@ -14,6 +14,8 @@ describe("graphics runtime package", () => {
     expect(runtimeBrand("claude-code").label).toBe("Claude");
     expect(normalizeRuntimeBrandId("codex")).toBe("codex");
     expect(runtimeBrand("codex").label).toBe("Codex");
+    expect(normalizeRuntimeBrandId("JCODE")).toBe("jcode");
+    expect(runtimeBrand("jcode").label).toBe("Jcode");
   });
 
   it("normalizes tool brands for CMUX, tmux, VS Code, and screenshots", () => {
@@ -40,6 +42,11 @@ describe("graphics runtime package", () => {
   it("keeps standalone runtime marks named for icon-only use", () => {
     render(<RuntimeMark runtime="claude-code" />);
     expect(screen.getByRole("img", { name: "Claude" })).toBeTruthy();
+  });
+
+  it("renders the Jcode mark with its accessible runtime name", () => {
+    render(<RuntimeMark runtime="jcode" />);
+    expect(screen.getByRole("img", { name: "Jcode" })).toBeTruthy();
   });
 
   it("renders inline runtime labels without badge chrome", () => {

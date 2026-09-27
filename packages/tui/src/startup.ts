@@ -18,7 +18,7 @@ export interface StartupState {
   target: string; home: string; notice: string; detail: string; expanded: boolean;
   selected: number; scroll: number; rigs: Array<{ id: string; name: string }>;
   rig?: StartupRig; probe?: CrashCartRenderOpts; freshBlocked?: string;
-  prerequisites?: { codex: string; claudeCode: string };
+  prerequisites?: { codex: string; claudeCode: string; jcode?: string };
   consent?: { rigId: string; seat: StartupSeat };
 }
 export interface StartupDeps {
@@ -169,9 +169,9 @@ export class StartupController {
     if (s.page === "rigs" && key === "k" && !s.rigs.some((r) => r.name === "kernel")) {
       await this.run(async () => { s.prerequisites = await this.deps.client.startupRequest("/prerequisites"); s.page = "kernel"; }); return;
     }
-    if (s.page === "kernel" && ["c", "l"].includes(key)) {
+    if (s.page === "kernel" && ["c", "j", "l"].includes(key)) {
       await this.run(async () => {
-        const runtime = key === "c" ? "codex" : "claude-code";
+        const runtime = key === "c" ? "codex" : key === "j" ? "jcode" : "claude-code";
         s.notice = "Preparing kernel topology… no seats are being launched."; this.changed();
         const result = await this.deps.client.startupRequest<{ rigId: string }>("/kernel", { runtime });
         s.selected = 0; await this.readRig(result.rigId);
@@ -263,7 +263,11 @@ export function startupLines(s: StartupState): Array<{ text: string; action?: Ac
   }
   if (s.page === "kernel") {
     lines.push({ text: "Choose the runtime for this new kernel. No model or credential will be changed." });
-    lines.push(button(`c  Codex · ${s.prerequisites?.codex ?? "unavailable"}`, "c"), button(`l  Claude Code · ${s.prerequisites?.claudeCode ?? "unavailable"}`, "l"));
+    lines.push(
+      button(`c  Codex · ${s.prerequisites?.codex ?? "unavailable"}`, "c"),
+      button(`j  Jcode · ${s.prerequisites?.jcode ?? "unavailable"}`, "j"),
+      button(`l  Claude Code · ${s.prerequisites?.claudeCode ?? "unavailable"}`, "l"),
+    );
     lines.push({ text: "Unavailable means installation/authentication needs repair before setup." });
   }
   if (s.page === "seats" && s.rig) {

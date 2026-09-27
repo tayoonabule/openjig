@@ -24,7 +24,7 @@ import {
   validateRestoreSummary,
   type ValidationResult,
 } from "./schema-validator.js";
-import type { StructuredTranscript, SourceRuntime } from "./types.js";
+import type { StructuredTranscript, SourceRuntime, TargetRuntime } from "./types.js";
 
 const TRANSCRIPT_BOUND = 120;
 
@@ -38,7 +38,7 @@ export interface WritePacketOptions {
   /** Target rig name (operator-supplied). */
   targetRig: string;
   /** Target runtime kind (operator-supplied). */
-  targetRuntime: SourceRuntime;
+  targetRuntime: TargetRuntime;
   /** Target workspace root (absolute path). */
   targetWorkspaceRoot: string;
   /** Default target repo (absolute path or null). */

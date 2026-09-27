@@ -112,6 +112,7 @@ const CORE_STEP_IDS = [
   "claude_auth",
   "codex_install",
   "codex_auth",
+  "jcode_check",
   "tmux_config",
   "verify",
 ];
@@ -650,6 +651,22 @@ export async function runSetup(deps: SetupDeps, opts: { dryRun?: boolean; full?:
       status: "skipped",
       message: "Skipped: Codex is not installed.",
       reason: "Authentication cannot be checked until the Codex CLI is installed.",
+    });
+  }
+
+  // 5b. Optional Jcode runtime
+  // Jcode is optional: OpenRig can launch it when installed, but it has no
+  // package-manager installation path that setup should assume or mutate.
+  try {
+    deps.exec("jcode --version");
+    steps.push({ id: "jcode_check", status: "pass", message: "Jcode available." });
+  } catch {
+    steps.push({
+      id: "jcode_check",
+      status: "warn",
+      message: "Jcode is not installed.",
+      reason: "Jcode seats require the Jcode CLI, but it is an optional OpenRig harness.",
+      fixHint: "Install Jcode from https://github.com/1jehuang/jcode, then rerun `rig setup` or `rig doctor`.",
     });
   }
 

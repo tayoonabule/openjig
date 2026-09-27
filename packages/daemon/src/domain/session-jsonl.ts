@@ -11,6 +11,7 @@
 //   {type:"text"|"thinking"|"tool_use", text?} blocks (only "text" carries user-visible content).
 // Codex rollout lines use {payload:{type:"message", role, content}} — handled by the same reader.
 import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 export interface JsonlExchange {
   role: string;
@@ -18,8 +19,10 @@ export interface JsonlExchange {
 }
 
 /** Extract the user-visible text from a message `content` field (string, or an array of blocks —
- *  join only the `text` blocks; skip thinking/tool_use). Returns "" when there is no text. */
-function extractText(content: unknown): string {
+ *  join only the `text` blocks; skip thinking/tool_use). Returns "" when there is no text.
+ *  Reused by readJcodeSessionExchanges below: jcode's message content blocks use the same
+ *  {type:"text", text} shape as claude-projects. */
+export function extractText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
@@ -75,4 +78,35 @@ export function parseJsonlExchanges(path: string, n: number): JsonlExchange[] {
     if (ex) exchanges.push(ex);
   }
   return n >= exchanges.length ? exchanges : exchanges.slice(exchanges.length - n);
+}
+
+/**
+ * Read `~/.jcode/sessions/<resumeToken>.json` `messages[]` into {role, content} exchanges.
+ * Unlike parseJsonlExchanges above, the source is a single structured JSON document, not an
+ * append-only JSONL transcript — no line-by-line parsing needed. Honest-degraded: missing/
+ * corrupt file or malformed shape yields null; a message with no user-visible text is skipped.
+ */
+export function readJcodeSessionExchanges(
+  jcodeHomeDir: string,
+  resumeToken: string,
+): { path: string; exchanges: JsonlExchange[] } | null {
+  const path = join(jcodeHomeDir, ".jcode", "sessions", `${resumeToken}.json`);
+  if (!existsSync(path)) return null;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+  const messages = (raw as { messages?: unknown[] })?.messages;
+  if (!Array.isArray(messages)) return null;
+  const exchanges: JsonlExchange[] = [];
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    const m = message as { role?: unknown; content?: unknown };
+    if (typeof m.role !== "string") continue;
+    const content = extractText(m.content);
+    if (content.length > 0) exchanges.push({ role: m.role, content });
+  }
+  return { path, exchanges };
 }

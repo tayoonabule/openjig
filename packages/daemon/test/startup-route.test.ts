@@ -30,12 +30,33 @@ describe("startup consent and effect boundary", () => {
     const body = await first.json();
     expect(body).toMatchObject({ ok: true, rigId: expect.any(String) });
     expect(first.status).toBe(200);
+    expect(defaultProbeRuntimes).toHaveBeenCalledWith(false);
     expect(setup.rigRepo.getRig(body.rigId)!.nodes.map((node) => node.logicalId).sort())
       .toEqual(["advisor.lead", "operator.agent", "operator.human", "queue.worker"]);
     expect(setup.sessionRegistry.getSessionsForRig(body.rigId)).toEqual([]);
     expect(setup.tmuxAdapter.createSession).not.toHaveBeenCalled();
     const second = await request();
     expect(await second.json()).toMatchObject({ ok: true, rigId: body.rigId, reused: true });
+  });
+  it("prepares a Jcode-only kernel when authentication is available", async () => {
+    setup = createTestApp(db, { podInstantiatorFsOps: { exists: existsSync, readFile: (path) => readFileSync(path, "utf8") } });
+    vi.mocked(defaultProbeRuntimes).mockResolvedValue({ codex: "unavailable", claudeCode: "unavailable", jcode: "ok" });
+    const response = await setup.app.request("/api/startup/kernel", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runtime: "jcode" }) });
+    expect(response.status).toBe(200);
+    expect(defaultProbeRuntimes).toHaveBeenCalledWith(true);
+    const body = await response.json();
+    expect(body).toMatchObject({ ok: true, rigId: expect.any(String) });
+    expect(setup.rigRepo.getRig(body.rigId)!.nodes.filter((node) => node.runtime === "jcode").map((node) => node.logicalId).sort())
+      .toEqual(["advisor.lead", "operator.agent", "queue.worker"]);
+    expect(setup.tmuxAdapter.createSession).not.toHaveBeenCalled();
+  });
+
+  it("blocks a selected Jcode kernel when the provider is unavailable", async () => {
+    vi.mocked(defaultProbeRuntimes).mockResolvedValue({ codex: "ok", claudeCode: "ok", jcode: "unavailable" });
+    const response = await setup.app.request("/api/startup/kernel", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runtime: "jcode" }) });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ code: "provider_prerequisite" });
+    expect(setup.rigRepo.findRigsByName("kernel")).toEqual([]);
   });
   it("rejects a changed occupant or model before invoking fresh launch", async () => {
     const { rig, node } = seat(); const revision = startupRevision(db, node);
@@ -60,11 +81,23 @@ describe("startup consent and effect boundary", () => {
     const launch = vi.spyOn(SeatLifecycleService.prototype, "launchFresh");
     const response = await post(rig.id, startupRevision(db, node));
     expect(await response.json()).toMatchObject({ code: "provider_prerequisite", freshAllowed: false });
+    expect(defaultProbeRuntimes).toHaveBeenCalledWith(false);
     expect(launch).not.toHaveBeenCalled();
     expect(setup.rigRepo.getRig(rig.id)!.nodes[0]!.model).toBe("configured-model");
     expect(setup.sessionRegistry.getSessionsForRig(rig.id).map((s) => s.id)).toEqual([session.id]);
     const readback = await setup.app.request(`/api/startup/${rig.id}`);
     expect((await readback.json()).seats[0]).toMatchObject({ freshAllowed: false, prerequisite: expect.stringContaining("unauthenticated") });
+  });
+  it("keeps Jcode seat fresh actions gated on Jcode authentication", async () => {
+    const { rig, node } = seat();
+    db.prepare("UPDATE nodes SET runtime = ? WHERE id = ?").run("jcode", node.id);
+    vi.mocked(defaultProbeRuntimes).mockResolvedValue({ codex: "ok", claudeCode: "ok", jcode: "unavailable" });
+    const revision = startupRevision(db, { ...node, runtime: "jcode" });
+    const response = await post(rig.id, revision);
+    expect(await response.json()).toMatchObject({ code: "provider_prerequisite", freshAllowed: false });
+    expect(defaultProbeRuntimes).toHaveBeenCalledWith(true);
+    const readback = await setup.app.request(`/api/startup/${rig.id}`);
+    expect((await readback.json()).seats[0]).toMatchObject({ freshAllowed: false, prerequisite: expect.stringContaining("jcode") });
   });
   it("reports unavailable transport without authorizing fresh replacement", async () => {
     const { rig, node } = seat();

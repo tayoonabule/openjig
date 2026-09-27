@@ -168,8 +168,21 @@ function buildSessionIdentityPayload(providerPayload, env = process.env, now = (
   };
 }
 
+function jcodeHookPayload(env) {
+  // Jcode passes lifecycle data in environment variables, not on stdin.
+  const jcodeEvents = {
+    turn_start: "UserPromptSubmit", turn_end: "Stop",
+    session_start: "SessionStart", session_end: "SessionEnd",
+  };
+  const payload = parseJson(env.JCODE_HOOK_PAYLOAD);
+  return { ...payload,
+    hookEvent: jcodeEvents[env.JCODE_HOOK_EVENT] || env.JCODE_HOOK_EVENT,
+    session_id: env.JCODE_HOOK_SESSION_ID || payload.session_id };
+}
+
 async function main() {
-  const providerPayload = parseJson(await readStdin());
+  const providerPayload = process.env.JCODE_HOOK_EVENT
+    ? jcodeHookPayload(process.env) : parseJson(await readStdin());
   const payload = buildOpenRigPayload(providerPayload);
   await postHookPayload(payload);
 
@@ -186,6 +199,7 @@ if (require.main === module) {
 module.exports = {
   buildOpenRigPayload,
   buildSessionIdentityPayload,
+  jcodeHookPayload,
   parseJson,
   postHookPayload,
   resolveEndpoint,

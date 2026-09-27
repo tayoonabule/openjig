@@ -5,7 +5,7 @@
 //   POST-COMPACTION = the tagged subset of fresh + the handover material
 //
 // Every profile is CLOSED over requires (a subset profile must close — intake rule);
-// the runtime filter runs per mini-req 3 (claude and codex are never assumed to have
+// the runtime filter runs per mini-req 3 (claude, codex, and jcode are never assumed to have
 // lost the same dimensions, so they compose different profiles from the SAME graph);
 // each piece resolves through the Atom-1 address machinery and carries a per-piece
 // SOURCE LABEL (Q2-Amendment 1: composition is multi-source by contract — library /
@@ -36,7 +36,7 @@ export class ProfileComposeError extends Error {
 }
 
 export type ComposeSituation = "fresh" | "handover" | "post-compaction";
-export type ComposeRuntime = "claude" | "codex";
+export type ComposeRuntime = "claude" | "codex" | "jcode";
 export type SourceKind = "library" | "project" | "seat" | "mission";
 
 export interface ComposeInput {

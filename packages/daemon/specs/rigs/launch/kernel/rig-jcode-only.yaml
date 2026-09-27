@@ -1,0 +1,74 @@
+version: "0.2"
+name: kernel
+summary: >
+  Jcode-only kernel variant: all three agents run on Jcode, each on a
+  model sized to its role. Selected when an operator chooses Jcode in the
+  TUI or sets `rig config set kernel.runtime jcode`. Change a seat's model
+  with `rig seat set-model <seat> <model>`; `jcode model list` shows ids.
+
+culture_file: culture/CULTURE.md
+
+pods:
+  - id: advisor
+    label: Advisor
+    members:
+      - id: lead
+        agent_ref: "local:agents/advisor/lead"
+        runtime: jcode
+        # Planning and judgment: strongest reasoning model.
+        model: claude-opus-5
+        profile: default
+        cwd: "."
+
+  - id: operator
+    label: Operator
+    members:
+      - id: human
+        agent_ref: "builtin:terminal"
+        runtime: terminal
+        profile: none
+        cwd: "."
+        startup:
+          actions:
+            - type: send_text
+              value: rig tui
+              phase: after_ready
+              # A restored terminal seat is a fresh shell, so start mission control again.
+              applies_on: [fresh_start, restore]
+              idempotent: true
+      - id: agent
+        agent_ref: "local:agents/operator/agent"
+        runtime: jcode
+        # Operating the rig with the human: balanced capability and speed.
+        model: gpt-6-astra
+        profile: default
+        cwd: "."
+    edges:
+      - kind: collaborates_with
+        from: agent
+        to: human
+      - kind: escalates_to
+        from: agent
+        to: human
+
+  - id: queue
+    label: Queue
+    members:
+      - id: worker
+        agent_ref: "local:agents/queue/worker"
+        runtime: jcode
+        # High-volume queue work: fast, low-cost model.
+        model: gpt-5.6-luna
+        profile: default
+        cwd: "."
+
+edges:
+  - kind: delegates_to
+    from: advisor.lead
+    to: operator.agent
+  - kind: delegates_to
+    from: advisor.lead
+    to: queue.worker
+  - kind: escalates_to
+    from: queue.worker
+    to: advisor.lead

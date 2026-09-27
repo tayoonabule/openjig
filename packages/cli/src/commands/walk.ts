@@ -67,7 +67,7 @@ export function walkCommand(depsOverride?: WalkDeps): Command {
     // exact-comparable. NO-COPY: the bytes sent are the bytes the profile served.
     .option("--through-profile <ref>", "Walk the seat through a pack's COMPOSED PROFILE (requires --situation; the piece set comes from rig context profile, never hand-authored)")
     .option("--situation <situation>", "With --through-profile: fresh | handover | post-compaction")
-    .option("--runtime <runtime>", "With --through-profile: claude | codex (default claude)")
+    .option("--runtime <runtime>", "With --through-profile: claude | codex | jcode (default claude)")
     .option("--profile <profile>", "With --through-profile: named install profile declared by the pack")
     .option("--rig <rig>", "With --through-profile: the seat-tree grant (with --seat)")
     .option("--seat-grant <seat>", "With --through-profile: the seat whose tree seat: atoms may read (with --rig)")
@@ -89,7 +89,7 @@ Examples:
   rig walk dev-impl@my-rig --through intro.md steps.md wrapup.md --pace 10s
 
 When a generation record resolves, each complete piece and its corresponding
-Claude or Codex turn closure must appear before --pace and the next piece.
+Claude, Codex, or Jcode turn closure must appear before --pace and the next piece.
 Verification proves delivery and turn completion, not comprehension. An unavailable
 initial record is explicitly reported as unverified delivery.`)
     .action(async (seat: string, opts: { through?: string[]; throughProfile?: string; situation?: string; runtime?: string; profile?: string; rig?: string; seatGrant?: string; mission?: string; slice?: string; budget?: string; pace?: string; consumeTimeout?: string; consumePoll?: string; turnTimeout?: string; json?: boolean }) => {

@@ -318,6 +318,8 @@ describe("herdr layout plan — fresh-tab-on-relaunch (BR-5) + equal auto-grid r
     expect(planHerdrLayout(view, "l1").pages[0]!.tabLabel).toBe(first.pages[0]!.tabLabel);
     expect(first.workspaceLabel).toBe("acme-build");
     expect(second.workspaceLabel).toBe("acme-build");
+    // The sidebar label is readable; the tab label carries the reuse key.
+    expect(planHerdrLayout({ ...view, id: "rig:kernel" }, "l1").workspaceLabel).toBe("kernel");
   });
 
   it("one grid root per page (N=2 → 2×1) — pane leaves carry <agent> · <slice> AND the composed shell command via sh -c", () => {
@@ -482,16 +484,31 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
     // OPR.0.6.0.8: after the page is applied, its tab is focused (no blank-tab close here:
     // this create reply carries no default tab id).
     // #707: the applied page is followed by one pane.list read (this fake's reply has no panes, so nothing changes).
-    expect(requests.map((r) => r.method)).toEqual(["workspace.create", "layout.apply", "pane.list", "tab.focus"]);
-    expect(requests[0]!.params).toEqual({ focus: false, label: "v" });
-    expect(requests[2]!.params).toEqual({ workspace_id: "wG" });
-    expect(requests[3]!.params).toEqual({ tab_id: "wG:t2" });
-    expect(requests[1]!.params).toEqual({
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "layout.apply"]);
+    expect(requests[2]!.params).toEqual({ focus: false, label: "v" });
+    expect(requests[3]!.params).toEqual({
       workspace_id: "wG",
       tab_label: "openrig:v#tok",
       focus: true,
       root: { type: "pane", label: "pod.a · s02", command: ["sh", "-c", "tmux attach -t 'a@r'"] },
     });
+  });
+
+  it("the first page replaces the new workspace's blank default tab; later pages add tabs", async () => {
+    // Live Herdr 0.9.1 envelope: workspace.create returns its default tab.
+    const { transport, requests } = fakeSocketTransport({
+      respond: async (method) => method === "workspace.create"
+        ? { type: "workspace_created", workspace: { workspace_id: "wG" }, tab: { tab_id: "wG:t1" } }
+        : { type: "layout_apply" },
+    });
+    const adapter = new HerdrAdapter({ transportFactory: () => transport, newLaunchToken: () => "tok" });
+    const two: ComposedView = { id: "v", opened: [pane, pane], absent: [], degraded: [], pages: [[pane], [pane]] };
+    await adapter.openView(two);
+    const applies = requests.filter((r) => r.method === "layout.apply").map((r) => r.params as Record<string, unknown>);
+    expect(applies[0]).toMatchObject({ tab_id: "wG:t1" });
+    expect(applies[0]).not.toHaveProperty("workspace_id");
+    expect(applies[1]).toMatchObject({ workspace_id: "wG" });
+    expect(applies[1]).not.toHaveProperty("tab_id");
   });
 
   it("REGRESSION (the VM-RED class): only socket methods ever — the absent CLI `herdr layout apply` cannot pass again", async () => {
@@ -507,7 +524,7 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
       expect(r.method).not.toContain("--help");
       expect(r.method).not.toContain(" ");
     }
-    expect(requests.map((r) => r.method)).toEqual(["workspace.create", "layout.apply", "pane.list", "tab.focus"]);
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "layout.apply"]);
   });
 
   it("a labeled workspace.create failure falls back ONCE to a bare create (uncaptured-param defense)", async () => {
@@ -524,10 +541,92 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
     const res = await adapter.openView(view);
     expect(res.ok).toBe(true);
     expect(res.opened).toEqual(["a@r"]);
-    // OPR.0.6.0.8: before the bare fallback it checks for a same-named workspace (none here).
-    expect(requests.map((r) => r.method)).toEqual(["workspace.create", "workspace.list", "workspace.create", "layout.apply"]);
-    expect((requests[3]!.params as Record<string, unknown>)["workspace_id"]).toBe("wH");
+    // Existing workspace/tab checks run before creation; the label retry then falls back once.
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "workspace.create", "layout.apply"]);
+    expect((requests[4]!.params as Record<string, unknown>)["workspace_id"]).toBe("wH");
     expect(res.notes?.join(" ")).toContain('refused the workspace name "v"');
+  });
+
+  it("an already-open view is found by its tab key, relabelled readable, focused, not duplicated", async () => {
+    const { transport, requests } = fakeSocketTransport({
+      respond: async (method) => {
+        if (method === "tab.list") return { tabs: [{ workspace_id: "wX", label: "openrig:vv#l2" }, { workspace_id: "wOld", label: "openrig:v#l1" }] };
+        if (method === "pane.list") return { panes: [{ pane_id: "wOld:p2", label: "pod.a · s02" }] };
+        return { type: "ok" };
+      },
+    });
+    const adapter = new HerdrAdapter({ transportFactory: () => transport, newLaunchToken: () => "tok" });
+    const res = await adapter.openView(view);
+    expect(res.ok).toBe(true);
+    expect(res.opened).toEqual(["a@r"]);
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.rename", "workspace.focus", "pane.list"]);
+    expect(requests[1]!.params).toEqual({ workspace_id: "wOld", label: "v" });
+    expect(requests[2]!.params).toEqual({ workspace_id: "wOld" });
+    expect(requests[3]!.params).toEqual({ workspace_id: "wOld" });
+  });
+
+  it("REGRESSION roster growth: seats added after the workspace was made get ONE new tab; existing tiles untouched", async () => {
+    const mk = (seat: string, label: string) => ({ seat, label, paneCommand: `tmux attach -t '${seat}'`, readOnly: false });
+    const grown = [mk("lead@r", "main.lead"), mk("qa@r", "cleanup.qa"), mk("j1@r", "cleanup.junior-1"), mk("j2@r", "cleanup.junior-2")];
+    const { transport, requests } = fakeSocketTransport({
+      respond: async (method) => {
+        if (method === "tab.list") return { tabs: [{ workspace_id: "wA", label: "openrig:rig:r#l1" }] };
+        if (method === "pane.list") {
+          return { panes: [{ label: "main.lead" }, { label: "cleanup.qa" }, { label: "mission control" }] };
+        }
+        if (method === "layout.apply") return { layout: { root: { type: "split", first: { type: "pane", pane_id: "wA:p9" }, second: { type: "pane", pane_id: "wA:p10" } } } };
+        return { type: "ok" };
+      },
+    });
+    const adapter = new HerdrAdapter({ transportFactory: () => transport, newLaunchToken: () => "l7" });
+    const res = await adapter.openView({ id: "rig:r", opened: grown, absent: [], degraded: [], pages: [grown] });
+    expect(res.ok).toBe(true);
+    expect(res.degraded).toEqual([]);
+    expect(res.opened.sort()).toEqual(["j1@r", "j2@r", "lead@r", "qa@r"]);
+    // Never closes, rebuilds, or re-applies over the existing tab.
+    const methods = requests.map((r) => r.method);
+    expect(methods).not.toContain("workspace.close");
+    expect(methods).not.toContain("workspace.create");
+    expect(methods.filter((m) => m === "layout.apply")).toHaveLength(1);
+    const apply = requests.find((r) => r.method === "layout.apply")!.params as Record<string, unknown>;
+    expect(apply).toMatchObject({ workspace_id: "wA", tab_label: "openrig:rig:r#l7+2" });
+    expect(apply).not.toHaveProperty("tab_id");
+    const leaves = JSON.stringify(apply["root"]);
+    expect(leaves).toContain("cleanup.junior-1");
+    expect(leaves).toContain("cleanup.junior-2");
+    expect(leaves).not.toContain("main.lead");
+  });
+
+  it("roster growth that Herdr refuses to tile is reported degraded, not claimed opened", async () => {
+    const extra = { seat: "j1@r", label: "cleanup.junior-1", paneCommand: "tmux attach -t 'j1@r'", readOnly: false };
+    const { transport } = fakeSocketTransport({
+      respond: async (method) => {
+        if (method === "tab.list") return { tabs: [{ workspace_id: "wA", label: "openrig:v#l1" }] };
+        if (method === "pane.list") return { panes: [{ label: "pod.a · s02" }] };
+        if (method === "layout.apply") throw new Error("no room");
+        return { type: "ok" };
+      },
+    });
+    const adapter = new HerdrAdapter({ transportFactory: () => transport });
+    const res = await adapter.openView({ id: "v", opened: [pane, extra], absent: [], degraded: [], pages: [[pane, extra]] });
+    expect(res.opened).toEqual(["a@r"]);
+    expect(res.degraded.map((d) => d.seat)).toEqual(["j1@r"]);
+    expect(res.degraded[0]!.reason).toContain("adding new seats");
+  });
+
+  it("a workspace from an older build (key in its own label) is still reused and migrated", async () => {
+    const { transport, requests } = fakeSocketTransport({
+      respond: async (method) => {
+        if (method === "workspace.list") return { workspaces: [{ workspace_id: "wOld", label: "openrig:v#l1" }, { workspace_id: "wX", label: "openrig:vv#l2" }] };
+        if (method === "pane.list") return { panes: [{ label: "pod.a · s02" }] };
+        return { type: "ok" };
+      },
+    });
+    const adapter = new HerdrAdapter({ transportFactory: () => transport, newLaunchToken: () => "tok" });
+    const res = await adapter.openView(view);
+    expect(res.ok).toBe(true);
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.rename", "workspace.focus", "pane.list"]);
+    expect(requests[2]!.params).toEqual({ workspace_id: "wOld", label: "v" });
   });
 
   it("total workspace.create failure degrades EVERY pane honestly (herdr_workspace_failed)", async () => {
@@ -561,6 +660,7 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
     const { transport } = fakeSocketTransport({
       respond: async (method) => {
         if (method === "workspace.create") return { type: "workspace_created", workspace_id: "wG" };
+        if (method === "workspace.list" || method === "tab.list") return {};
         applies += 1;
         if (applies === 2) throw new Error("herdr error: bad tree");
         return { type: "layout_apply" };

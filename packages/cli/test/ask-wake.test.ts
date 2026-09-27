@@ -31,6 +31,14 @@ describe("runWake — L3 headless one-shot wake", () => {
     expect(call[1]).toContain("tok");
   });
 
+  it("builds the jcode one-shot resume command for runtime=jcode", async () => {
+    const runner: WakeRunner = vi.fn(async () => ({ stdout: "answer", stderr: "", code: 0, timedOut: false }));
+    await runWake({ runner }, { question: "q?", token: "session-jcode-123", runtime: "jcode" });
+    const call = (runner as unknown as { mock: { calls: [string, string[], unknown][] } }).mock.calls[0]!;
+    expect(call[0]).toBe("jcode");
+    expect(call[1]).toEqual(["--quiet", "run", "--resume", "session-jcode-123", expect.stringContaining("q?")]);
+  });
+
   it("reports a timeout honestly — never a silent hang", async () => {
     const runner: WakeRunner = vi.fn(async () => ({ stdout: "", stderr: "", code: null, timedOut: true }));
     const out = await runWake({ runner }, { question: "q?", token: "tok", runtime: "claude", timeoutMs: 1000 });

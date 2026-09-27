@@ -83,7 +83,8 @@ describe("terminal browser → preview → explicit Open", () => {
     const result = await client.openTerminal(open.view, open.expectedPlan);
     expect(result.opened).toEqual(preview.composed.opened.map(m => m.seat));
     expect(result.absent).toHaveLength(1); expect(result.degraded).toHaveLength(1);
-    expect(effects.map(e => e.method)).toEqual(["workspace.create", "layout.apply", "layout.apply"]);
+    // Read-only reuse lookups (tab.list / workspace.list) are not effects on Herdr.
+    expect(effects.map(e => e.method).filter(m => !m.endsWith(".list"))).toEqual(["workspace.create", "layout.apply", "layout.apply"]);
     expect(effects.filter(e => e.method === "layout.apply").map(e => e.params.root)).toEqual((preview.grids as any[]).map(g => g.root));
     view.dispatch({ type: "back" }); await refresh();
     expect(view.get().terminalView).toBe(before.terminalView);

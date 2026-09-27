@@ -472,6 +472,8 @@ export interface RestoreNodeResult {
   // continuity-restoring skip path only; `rebuilt`/`operator_recovered` sit
   // outside the five-term split.)
   status: "resumed" | "rebuilt" | "fresh" | "fresh-primed" | "awaiting-decision" | "failed" | "attention_required" | "operator_recovered";
+  /** Set for terminal seats: a fresh terminal is its normal restore, not a loss. */
+  runtime?: string;
   error?: string;
   /** Pane evidence captured when status is `attention_required` (L3, optional). */
   attentionEvidence?: string | null;
@@ -1407,7 +1409,7 @@ export type ContextUnknownReason =
 export interface ContextUsage {
   availability: ContextAvailability;
   reason: ContextUnknownReason | null;
-  source: "claude_statusline_json" | "codex_token_count_jsonl" | null;
+  source: "claude_statusline_json" | "codex_token_count_jsonl" | "jcode_session_json" | null;
   usedPercentage: number | null;
   remainingPercentage: number | null;
   contextWindowSize: number | null;

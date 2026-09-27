@@ -9,6 +9,7 @@ import { deriveSessionName, validateSessionName, validateSessionComponents, VIRT
 const RUNTIME_COMMANDS: Record<string, string> = {
   "claude-code": "claude --version",
   "codex": "codex --version",
+  "jcode": "jcode --version",
   "pi": "pi --version",
 };
 
@@ -141,7 +142,7 @@ import {
 
 // Slice 51-01 (OPR.0.5.1.1): `stub` is a first-class runtime (the deterministic node-script fake harness
 // through the real orchestrator) — admitted at the modern-pod preflight gate alongside the real runtimes.
-const SUPPORTED_RUNTIMES = new Set(["claude-code", "codex", "pi", "terminal", "stub"]);
+const SUPPORTED_RUNTIMES = new Set(["claude-code", "codex", "jcode", "pi", "terminal", "stub"]);
 
 // Default daemon-shipped asset paths for the managed Claude activity hooks — the SAME files the
 // ClaudeCodeAdapter is wired with in startup.ts (validation is the shared module either way).

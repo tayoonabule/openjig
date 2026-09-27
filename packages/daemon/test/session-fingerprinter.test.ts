@@ -35,6 +35,18 @@ function mockTmux(paneContent?: string): TmuxAdapter {
 }
 
 describe("SessionFingerprinter", () => {
+  it("recognizes jcode by process and numbered prompt", async () => {
+    const fp = new SessionFingerprinter({ cmuxAdapter: mockCmux(), tmuxAdapter: mockTmux("Jcode\n1> "), fsExists: () => false });
+    expect((await fp.fingerprint(makePane({ activeCommand: "jcode" }))).runtimeHint).toBe("jcode");
+    expect((await fp.fingerprint(makePane())).runtimeHint).toBe("jcode");
+  });
+  it("does not infer Jcode from a bare numbered shell prompt or shared config", async () => {
+    const fp = new SessionFingerprinter({ cmuxAdapter: mockCmux(), tmuxAdapter: mockTmux("1> "),
+      fsExists: (p) => p === "/projects/.agents" || p === "/projects/.jcode" });
+    expect((await fp.fingerprint(makePane({ cwd: "/projects" }))).runtimeHint).toBe("codex");
+    const noConfig = new SessionFingerprinter({ cmuxAdapter: mockCmux(), tmuxAdapter: mockTmux("1> "), fsExists: () => false });
+    expect((await noConfig.fingerprint(makePane())).runtimeHint).toBe("unknown");
+  });
   // T1: cmux reports claude_code PID -> claude-code, highest
   it("cmux claude_code PID -> claude-code, highest confidence", async () => {
     const fp = new SessionFingerprinter({

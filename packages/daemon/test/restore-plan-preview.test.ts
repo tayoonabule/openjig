@@ -99,6 +99,12 @@ describe("FR-6 restore-plan token state", () => {
     expect(p.nodes[0]!.runtimePrompt).toMatch(/Codex auth/);
   });
 
+  it("jcode runtime prompt surfaced for a resumable jcode seat", () => {
+    const rig = rigWith([{ id: "n1", logicalId: "a", runtime: "jcode" }]);
+    const p = buildRestorePlanPreview(rig, null, [row("n1", { resumeType: "jcode_id", resumeLastProbeStatus: "resumable", resumeLastVerified: FRESH })], undefined, NOW);
+    expect(p.nodes[0]!.runtimePrompt).toMatch(/jcode/);
+  });
+
   it("read-only: mutated stays false across all seat states", () => {
     const rig = rigWith([
       { id: "n1", logicalId: "a", runtime: "claude-code" },

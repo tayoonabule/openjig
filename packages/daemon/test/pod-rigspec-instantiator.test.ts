@@ -298,6 +298,40 @@ profiles:
     }
   });
 
+  // Mirrors the codex "refuses to start a harness when managed skill projection fails" case
+  // above, proving skillReconciler is consulted (and its failure blocks the launch) for jcode.
+  it("consults skillReconciler for a jcode member and refuses the harness on projection failure", async () => {
+    const skillReconciler = vi.fn(() => ({
+      ok: false,
+      applied: false,
+      freshLaunchRequired: false,
+      runtime: "jcode",
+      targetRoot: "/project/.agents/skills",
+      manifestPath: "/project/.openrig/skill-loadouts/jcode.json",
+      receipts: [],
+      removed: [],
+      errors: [{ code: "target_conflict", message: "operator-owned skill differs" }],
+    }));
+    const jcodeAdapter = mockAdapter("jcode");
+    const { db, inst } = setup(undefined, { jcode: jcodeAdapter }, undefined, undefined, undefined, { skillReconciler });
+
+    const spec = makeRigSpec({
+      pods: [{
+        id: "dev", label: "Dev",
+        members: [{ id: "impl", agentRef: "local:agents/impl", profile: "default", runtime: "jcode", cwd: "." }],
+        edges: [],
+      }],
+    });
+    const result = await inst.instantiate(RigSpecCodec.serialize(spec), RIG_ROOT);
+
+    expect(result.ok).toBe(false);
+    expect(skillReconciler).toHaveBeenCalledOnce();
+    expect(skillReconciler.mock.calls[0]?.[0].runtime).toBe("jcode");
+    expect(jcodeAdapter.project).not.toHaveBeenCalled();
+    if (!result.ok && "message" in result) expect(result.message).toContain("target_conflict: operator-owned skill differs");
+    db.close();
+  });
+
   it("dedupes role guidance when the same file is referenced by resources.guidance and startup.files", async () => {
     const db = createFullTestDb();
     const rigRepo = new RigRepository(db);

@@ -9,9 +9,11 @@ import { SeatHandoverService } from "../domain/seat-handover-service.js";
 import { SeatSwitchClientService } from "../domain/seat-switch-client-service.js";
 import { SeatLifecycleService, type SeatRefusal } from "../domain/seat-lifecycle-service.js";
 import { makePredecessorRecapResolver } from "../domain/predecessor-recap-resolver.js";
+import { readJcodeSessionExchanges } from "../domain/session-jsonl.js";
 import type { ContextUsageStore } from "../domain/context-usage-store.js";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import os from "node:os";
 import { resolveAuthoredRecapPointer } from "../domain/context-packs/seat-recap-store.js";
 import { buildRebuildPrimingChain } from "../domain/rebuild-priming-chain.js";
 import { OPENRIG_HOME } from "../openrig-compat.js";
@@ -80,6 +82,8 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
             .get(nodeId, sessionName) as { resume_token: string | null } | undefined;
           return row?.resume_token ?? null;
         },
+        // jcode's session JSON is read directly (no JSONL transcript, no name-keyed sidecar).
+        readJcodeExchanges: (resumeToken) => readJcodeSessionExchanges(os.homedir(), resumeToken),
       });
     })(),
     // OPR.0.5.3.5 mini-req 7 — the AUTHORED recap pointer for the successor
@@ -106,6 +110,13 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
       const pi = adapters?.["pi"] as { readSessionFile?: (sessionName: string) => { ok: true; sessionFile: string } | { ok: false; reason: string } } | undefined;
       return typeof pi?.readSessionFile === "function"
         ? { readSessionFile: pi.readSessionFile.bind(pi) as (sessionName: string) => { ok: true; sessionFile: string } | { ok: false; reason: string } }
+        : undefined;
+    })(),
+    jcodeSessionReader: (() => {
+      const adapters = c.get("runtimeAdapters" as never) as Record<string, unknown> | undefined;
+      const jcode = adapters?.["jcode"] as { captureSessionId?: (sessionName: string) => Promise<string | undefined> } | undefined;
+      return typeof jcode?.captureSessionId === "function"
+        ? { captureSessionId: jcode.captureSessionId.bind(jcode) }
         : undefined;
     })(),
     // GHOST-STAGE (e/Class-B) — the canonical OccupantInvalidator so commit()'s re-key call fires

@@ -31,6 +31,9 @@ export interface ResumeTokenCaptureDeps {
   piRunnerStateStore?: {
     readSessionFile(sessionName: string): { ok: true; sessionFile: string } | { ok: false; reason: string };
   } | null;
+  jcodeSessionReader?: {
+    captureSessionId(sessionName: string): Promise<string | undefined>;
+  } | null;
 }
 
 export type ResumeTokenDeriveResult =
@@ -83,6 +86,10 @@ export async function deriveResumeToken(
     }
     if (state.sessionFile.trim().length > 0) token = state.sessionFile.trim();
     else return { outcome: "skipped", reason: "missing_sidecar" };
+  } else if (runtime === "jcode") {
+    if (!deps.jcodeSessionReader) return { outcome: "noop" };
+    token = await deps.jcodeSessionReader.captureSessionId(input.sessionName);
+    if (!token) return { outcome: "skipped", reason: "probe_timeout" };
   } else {
     return { outcome: "noop" }; // resumeType set but runtime is not one we derive — defensive
   }

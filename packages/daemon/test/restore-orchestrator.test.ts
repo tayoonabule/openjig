@@ -2052,6 +2052,29 @@ describe("RestoreOrchestrator", () => {
     }
   });
 
+  it("a terminal seat with no token restarts instead of stopping to ask: it holds no conversation", async () => {
+    // Live: every kernel restore left operator.human (mission control) dark
+    // until someone knew to re-run with --fresh.
+    const rig = rigRepo.createRig("test-rig");
+    db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-t", rig.id, "Operator");
+    const node = rigRepo.addNode(rig.id, "operator.human", { runtime: "terminal", podId: "pod-t" });
+    const session = sessionRegistry.registerSession(node.id, "operator-human@test-rig");
+    sessionRegistry.updateStatus(session.id, "running");
+    db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, ?, ?, ?)").run(node.id, "[]", "[]", "[]", "terminal");
+    const snap = snapshotCapture.captureSnapshot(rig.id, "test");
+    sessionRegistry.updateStatus(session.id, "exited");
+    db.prepare("DELETE FROM bindings WHERE node_id = ?").run(node.id);
+
+    const orch = createOrchestrator();
+    const result = await orch.restore(snap.id);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const nodeResult = result.result.nodes.find((n) => n.nodeId === node.id);
+      expect(nodeResult!.status).not.toBe("awaiting-decision");
+    }
+  });
+
   it("FR-7 Gap 2b: a pod-aware resume seat whose runtime adapter is unavailable fail-closes to awaiting-decision (not fresh-primed)", async () => {
     const rig = rigRepo.createRig("test-rig");
     db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-2b", rig.id, "Dev");
@@ -2820,7 +2843,7 @@ describe("RestoreOrchestrator", () => {
     function seedFailedAttempt(opts: {
       rigName?: string;
       logicalId?: string;
-      runtime?: "claude-code" | "codex";
+      runtime?: "claude-code" | "codex" | "jcode";
       restoreOutcome: "failed" | "attention_required";
       withResumeToken?: boolean;
       withBinding?: boolean;
@@ -2843,7 +2866,7 @@ describe("RestoreOrchestrator", () => {
       const sess = sessionRegistry.registerSession(node.id, sessionName);
       if (opts.withResumeToken) {
         db.prepare("UPDATE sessions SET resume_type = ?, resume_token = ? WHERE id = ?")
-          .run(runtime === "claude-code" ? "claude_id" : "codex_id", "tok-abc-123", sess.id);
+          .run(runtime === "claude-code" ? "claude_id" : runtime === "codex" ? "codex_id" : "jcode_id", "tok-abc-123", sess.id);
       }
 
       // Seed restore.started + restore.completed events with this node's outcome.
@@ -2945,6 +2968,23 @@ describe("RestoreOrchestrator", () => {
         expect(result.from).toBe("attention_required");
         expect(result.to).toBe("operator_recovered");
       }
+    });
+
+    it("upgrades a resumed jcode seat -> operator_recovered when all preconditions hold", async () => {
+      const tmux = mockTmuxForReconciler();
+      (tmux.hasSession as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+      (tmux.getPaneCommand as ReturnType<typeof vi.fn>).mockResolvedValue("jcode");
+      (tmux.capturePaneContent as ReturnType<typeof vi.fn>).mockResolvedValue("1> ");
+      const seeded = seedFailedAttempt({ runtime: "jcode", restoreOutcome: "attention_required", withResumeToken: true });
+
+      const result = await createOrchestrator({ tmux }).reconcileNodeRuntimeTruth(seeded.rig.id, seeded.nodeId);
+
+      expect(result).toMatchObject({
+        ok: true,
+        from: "attention_required",
+        to: "operator_recovered",
+        evidence: { fgProcess: "jcode", resumeTokenUsed: true, paneState: "usable" },
+      });
     });
 
     it("audit-trail: original restore.completed event with status=failed remains queryable after upgrade", async () => {
@@ -3363,6 +3403,14 @@ describe("RestoreOrchestrator", () => {
       const result = rollupRestoreRigResult(nodes);
       expect(result).toBe("partially_restored");
       expect(result).not.toBe("failed");
+    });
+
+    it("a fresh terminal seat beside resumed agents -> fully_restored; a fresh agent stays partial", () => {
+      const resumed = { nodeId: "n1", logicalId: "a", status: "resumed" as const };
+      expect(rollupRestoreRigResult([resumed, { nodeId: "n2", logicalId: "op", status: "fresh-primed", runtime: "terminal" }]))
+        .toBe("fully_restored");
+      expect(rollupRestoreRigResult([resumed, { nodeId: "n2", logicalId: "b", status: "fresh-primed" }]))
+        .toBe("partially_restored");
     });
 
     it("attention_required alone -> partially_restored (NEVER collapsed to failed)", () => {

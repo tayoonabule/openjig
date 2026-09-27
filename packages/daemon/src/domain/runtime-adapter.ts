@@ -108,7 +108,7 @@ export function resolveConcreteHint(
  * the rigspec member's `sessionSource` field. v1 narrow MVP: kind="native_id"
  * only; other shapes are rejected at schema validation today.
  *
- * Adapters that support fork (claude-code, codex) build their respective
+ * Adapters that support fork (claude-code, codex, jcode) build their respective
  * fork command from this input and capture the NEW post-fork token, never
  * the parent. Adapters that don't support fork (terminal) refuse with a
  * clear runtime-mismatch error.

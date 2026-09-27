@@ -10,7 +10,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 
-export type PluginRuntime = "claude" | "codex";
+export type PluginRuntime = "claude" | "codex" | "jcode";
 export type PluginSourceKind = "vendored" | "claude-cache" | "codex-cache";
 
 export interface PluginEntry {

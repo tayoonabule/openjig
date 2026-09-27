@@ -1901,7 +1901,9 @@ export class PodRigInstantiator {
     if (
       configResult.config.skillLoadout
       && this.deps.skillReconciler
-      && (configResult.config.runtime === "claude-code" || configResult.config.runtime === "codex")
+      // Jcode's skill_loadout reconciles the same way: targetRootFor maps jcode ->
+      // <cwd>/.agents/skills, matching JcodeRuntimeAdapter.projectSkill.
+      && (configResult.config.runtime === "claude-code" || configResult.config.runtime === "codex" || configResult.config.runtime === "jcode")
     ) {
       const projection = this.deps.skillReconciler({
         loadout: configResult.config.skillLoadout,

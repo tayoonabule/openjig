@@ -56,7 +56,7 @@ export function packageCommand(depsOverride?: StatusDeps): Command {
     .command("plan <path>")
     .description("Preview install plan (dry run)")
     .option("--target <dir>", "Target repository root", ".")
-    .option("--runtime <runtime>", "Runtime (claude-code or codex)", "claude-code")
+    .option("--runtime <runtime>", "Runtime (claude-code, codex, or jcode)", "claude-code")
     .option("--role <name>", "Role to install")
     .action(async (sourcePath: string, opts: { target: string; runtime: string; role?: string }) => {
       const deps = getDeps();
@@ -118,7 +118,7 @@ export function packageCommand(depsOverride?: StatusDeps): Command {
     .command("install <path>")
     .description("Install a package")
     .option("--target <dir>", "Target repository root", ".")
-    .option("--runtime <runtime>", "Runtime (claude-code or codex)", "claude-code")
+    .option("--runtime <runtime>", "Runtime (claude-code, codex, or jcode)", "claude-code")
     .option("--role <name>", "Role to install")
     .option("--allow-merge", "Allow managed block merges into existing files")
     .action(async (sourcePath: string, opts: { target: string; runtime: string; role?: string; allowMerge?: boolean }) => {

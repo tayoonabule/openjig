@@ -44,6 +44,12 @@ interface ResumeMetadataRefresherDeps {
   contextUsageStore?: {
     readSidecar(sessionName: string): { ok: true; data: { session_id?: string } } | { ok: false; reason: string };
   };
+  // The jcode session reader (JcodeRuntimeAdapter, reused from seat-handover-service.ts and
+  // claim-service.ts). Its reads are pure/lightweight, so unlike Claude/Codex it is consulted
+  // on every refresh() call, not gated behind fillNullOnly.
+  jcodeSessionReader?: {
+    captureSessionId(sessionName: string): Promise<string | undefined>;
+  };
 }
 
 export class ResumeMetadataRefresher {
@@ -56,6 +62,7 @@ export class ResumeMetadataRefresher {
   private sleep: (ms: number) => Promise<void>;
   private homeDir: string;
   private contextUsageStore: ResumeMetadataRefresherDeps["contextUsageStore"] | null;
+  private jcodeSessionReader: ResumeMetadataRefresherDeps["jcodeSessionReader"] | null;
 
   constructor(deps: ResumeMetadataRefresherDeps) {
     this.sessionRegistry = deps.sessionRegistry;
@@ -78,6 +85,7 @@ export class ResumeMetadataRefresher {
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.homeDir = deps.homeDir ?? os.homedir();
     this.contextUsageStore = deps.contextUsageStore ?? null;
+    this.jcodeSessionReader = deps.jcodeSessionReader ?? null;
   }
 
   /**
@@ -190,6 +198,25 @@ export class ResumeMetadataRefresher {
         // token stays put — a rolled-but-present token is no longer silently
         // nulled; FR-7's rollback catches an actually-unresumable token at restore.
         this.sessionRegistry.markResumeProbeResult(session.sessionId, probe);
+      }
+
+      // jcode: captureSessionId is a pure read (debug socket, then a ~/.jcode/sessions scan) —
+      // no heavyweight launch/probe exists or is needed, so unlike Claude/Codex this runs on
+      // every refresh() call, not gated behind fillNullOnly.
+      if (session.runtime === "jcode") {
+        if (!session.resumeToken) {
+          const token = await this.jcodeSessionReader?.captureSessionId(session.sessionName);
+          if (token) {
+            this.sessionRegistry.updateResumeToken(session.sessionId, "jcode_id", token, "scrape");
+          }
+          continue;
+        }
+        // Present token: re-derive via the same pure read and re-stamp freshness only on an
+        // exact match — never clobber, never clear (same shape as Claude/Codex above).
+        const derived = await this.jcodeSessionReader?.captureSessionId(session.sessionName);
+        if (derived && derived === session.resumeToken) {
+          this.sessionRegistry.markResumeProbeResult(session.sessionId, "resumable");
+        }
       }
     }
   }

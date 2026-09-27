@@ -62,7 +62,7 @@ function getService(c: { get: ContextGetter }): PluginDiscoveryService | undefin
 }
 
 function parseRuntimeFilter(value: string | undefined): PluginRuntime | undefined {
-  if (value === "claude" || value === "codex") return value;
+  if (value === "claude" || value === "codex" || value === "jcode") return value;
   return undefined;
 }
 

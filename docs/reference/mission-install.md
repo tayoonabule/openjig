@@ -191,7 +191,7 @@ The layers compose from surfaces that already exist; no new mechanism is require
   walk separately selectable. Both select from the same source graph.
 - Position: the `--rig`/`--seat` grant serves the seat's lessons and recap.
 - Runtime: `context profile` and `context work-install` both accept
-  `--runtime claude-code` (alias `claude`) or `--runtime codex`. Profile
+  `--runtime claude-code` (alias `claude`), `--runtime codex`, or `--runtime jcode`. Profile
   composition retains the `claude` manifest/output key; skill projection
   retains `claude-code`. Profile defaults from `OPENRIG_RUNTIME`, otherwise
   Claude; work-install requires the flag to inspect or apply skills.

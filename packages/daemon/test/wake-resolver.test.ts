@@ -29,6 +29,11 @@ describe("resolveWakeTarget — L3b seat[@gen] -> token (ruling A: resolve on ex
     if (res.resolved) expect(res.token).toBe("gen2");
   });
 
+  it("preserves jcode runtime for a captured jcode session", () => {
+    const res = resolveWakeTarget(rows({ runtime: "jcode", resumeToken: "session-jcode-123" }), { seat: "dev-qa@my-rig" });
+    expect(res).toMatchObject({ resolved: true, token: "session-jcode-123", runtime: "jcode" });
+  });
+
   it("REFUSES an unknown seat (no rows) and lists nothing — never a guessed wake", () => {
     const res = resolveWakeTarget([], { seat: "ghost@my-rig" });
     expect(res.resolved).toBe(false);

@@ -114,6 +114,7 @@ function tableRow(columns: AgentColumn[], cells: Partial<Record<AgentColumnKey, 
 function runtimeShort(runtime: string): string {
   if (/claude/i.test(runtime)) return "cl";
   if (/codex/i.test(runtime)) return "cx";
+  if (/jcode/i.test(runtime)) return "jc";
   if (/terminal/i.test(runtime)) return ">_";
   if (/human/i.test(runtime)) return "hu";
   return runtime.slice(0, 2) || "—";

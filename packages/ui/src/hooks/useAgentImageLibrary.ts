@@ -9,7 +9,7 @@ export interface AgentImageEntry {
   kind: "agent-image";
   name: string;
   version: string;
-  runtime: "claude-code" | "codex";
+  runtime: "claude-code" | "codex" | "jcode";
   sourceSeat: string;
   sourceSessionId: string;
   /** Source seat's cwd at snapshot time. null when the manifest predates
@@ -48,7 +48,7 @@ export interface AgentImagePreview {
   id: string;
   name: string;
   version: string;
-  runtime: "claude-code" | "codex";
+  runtime: "claude-code" | "codex" | "jcode";
   sourceSeat: string;
   manifestEstimatedTokens: number | null;
   derivedEstimatedTokens: number;

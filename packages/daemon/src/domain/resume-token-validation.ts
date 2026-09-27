@@ -10,7 +10,7 @@
 // actually resume" probe is intentionally out of scope (heavy + must not
 // mutate live state); format validation is the safe, side-effect-free floor.
 
-export type ResumeType = "claude_id" | "codex_id" | "pi_session_file";
+export type ResumeType = "claude_id" | "codex_id" | "jcode_id" | "pi_session_file";
 
 export interface ResumeTokenValidationOk {
   ok: true;
@@ -26,6 +26,7 @@ export interface ResumeTokenValidationErr {
 
 const SAFE_TOKEN_RE = /^[A-Za-z0-9._-]+$/;
 const MAX_TOKEN_LEN = 200;
+const JCODE_SESSION_RE = /^session_[a-z0-9-]+_\d{10,}_[0-9a-f]{8,}$/;
 
 // pi_session_file floor: absolute path, no ".." segment (checked on the raw
 // operand — normalization collapses "..", so a post-normalize check would be
@@ -49,6 +50,7 @@ const PI_SESSION_FILE_SUFFIX = ".jsonl";
 export function resumeTypeForRuntime(runtime: string | null): ResumeType | null {
   if (runtime === "claude-code") return "claude_id";
   if (runtime === "codex") return "codex_id";
+  if (runtime === "jcode") return "jcode_id";
   if (runtime === "pi") return "pi_session_file";
   return null;
 }
@@ -96,7 +98,7 @@ export function validateResumeToken(
   if (!resumeType) {
     return {
       ok: false,
-      error: `set-resume-token is not supported for runtime "${runtime ?? "unknown"}" (only claude-code, codex, and pi have resume tokens).`,
+      error: `set-resume-token is not supported for runtime "${runtime ?? "unknown"}" (only claude-code, codex, jcode, and pi have resume tokens).`,
     };
   }
   if (typeof rawToken !== "string") {
@@ -108,6 +110,9 @@ export function validateResumeToken(
   }
   if (resumeType === "pi_session_file") {
     return validatePiSessionFileToken(token);
+  }
+  if (resumeType === "jcode_id" && !JCODE_SESSION_RE.test(token)) {
+    return { ok: false, error: "Jcode resume token must be a valid session id." };
   }
   return validateIdShapedToken(resumeType, token);
 }

@@ -171,7 +171,7 @@ defaults:
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `runtime` | string | no | — | Default runtime for this agent. Can be overridden by the rig spec member's `runtime` field. |
+| `runtime` | string | no | — | Default runtime for this agent. Can be overridden by the rig spec member's `runtime` field. Jcode is supported with `AGENTS.md` guidance and `.agents/skills/` projection. |
 | `model` | string | no | — | Default model. Can be overridden by the rig spec member's `model` field. |
 | `lifecycle` | Lifecycle | no | see below | Lifecycle behavior defaults. |
 

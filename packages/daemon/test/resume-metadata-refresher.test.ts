@@ -478,6 +478,91 @@ describe("ResumeMetadataRefresher", () => {
     expect(sessionRegistry.updateResumeToken).toHaveBeenCalledWith("sess-x", "codex_id", "019d45c3-e909-7152-b52e-34edab4070ed", "scrape");
   });
 
+  // captureSessionId is a pure read; unlike Claude/Codex it is not gated behind fillNullOnly.
+  describe("jcode resume-token null-fill + freshness re-stamp", () => {
+    it("null-fills a missing jcode token from captureSessionId (scrape provenance)", async () => {
+      const sessionRegistry = { updateResumeToken: vi.fn() } as unknown as SessionRegistry;
+      const captureSessionId = vi.fn(async () => "sess-jcode-abc");
+      const refresher = new ResumeMetadataRefresher({
+        sessionRegistry,
+        tmuxAdapter: mockTmux(),
+        jcodeSessionReader: { captureSessionId },
+      });
+      await refresher.refresh([
+        { sessionId: "sess-j", sessionName: "dev-impl@rig", runtime: "jcode", resumeType: null, resumeToken: null },
+      ]);
+      expect(captureSessionId).toHaveBeenCalledWith("dev-impl@rig");
+      expect(sessionRegistry.updateResumeToken).toHaveBeenCalledWith("sess-j", "jcode_id", "sess-jcode-abc", "scrape");
+    });
+
+    it("no jcodeSessionReader wired -> null-fill is a silent no-op (back-compat, mirrors FR-4)", async () => {
+      const sessionRegistry = { updateResumeToken: vi.fn() } as unknown as SessionRegistry;
+      const refresher = new ResumeMetadataRefresher({ sessionRegistry, tmuxAdapter: mockTmux() });
+      await refresher.refresh([
+        { sessionId: "sess-j", sessionName: "dev-impl@rig", runtime: "jcode", resumeType: null, resumeToken: null },
+      ]);
+      expect(sessionRegistry.updateResumeToken).not.toHaveBeenCalled();
+    });
+
+    it("captureSessionId derives nothing -> no write (honest null, never fabricated)", async () => {
+      const sessionRegistry = { updateResumeToken: vi.fn() } as unknown as SessionRegistry;
+      const refresher = new ResumeMetadataRefresher({
+        sessionRegistry,
+        tmuxAdapter: mockTmux(),
+        jcodeSessionReader: { captureSessionId: async () => undefined },
+      });
+      await refresher.refresh([
+        { sessionId: "sess-j", sessionName: "dev-impl@rig", runtime: "jcode", resumeType: null, resumeToken: null },
+      ]);
+      expect(sessionRegistry.updateResumeToken).not.toHaveBeenCalled();
+    });
+
+    it("present + equal derive -> re-stamps freshness via markResumeProbeResult('resumable'), no clobber", async () => {
+      const sessionRegistry = { updateResumeToken: vi.fn(), markResumeProbeResult: vi.fn() } as unknown as SessionRegistry;
+      const refresher = new ResumeMetadataRefresher({
+        sessionRegistry,
+        tmuxAdapter: mockTmux(),
+        jcodeSessionReader: { captureSessionId: async () => "present-tok" },
+      });
+      await refresher.refresh([
+        { sessionId: "sess-j", sessionName: "dev-impl@rig", runtime: "jcode", resumeType: "jcode_id", resumeToken: "present-tok" },
+      ]);
+      expect(sessionRegistry.markResumeProbeResult).toHaveBeenCalledWith("sess-j", "resumable");
+      expect(sessionRegistry.updateResumeToken).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["DIFFERENT derive", "rolled-tok"],
+      ["ABSENT derive (no reader signal)", undefined],
+    ] as const)("present + %s -> no re-stamp, no clobber (left honest for the next tick)", async (_label, derived) => {
+      const sessionRegistry = { updateResumeToken: vi.fn(), markResumeProbeResult: vi.fn() } as unknown as SessionRegistry;
+      const refresher = new ResumeMetadataRefresher({
+        sessionRegistry,
+        tmuxAdapter: mockTmux(),
+        jcodeSessionReader: { captureSessionId: async () => derived },
+      });
+      await refresher.refresh([
+        { sessionId: "sess-j", sessionName: "dev-impl@rig", runtime: "jcode", resumeType: "jcode_id", resumeToken: "present-tok" },
+      ]);
+      expect(sessionRegistry.markResumeProbeResult).not.toHaveBeenCalled();
+      expect(sessionRegistry.updateResumeToken).not.toHaveBeenCalled();
+    });
+
+    it("runs identically under fillNullOnly (jcode is not gated behind it — no heavyweight probe exists)", async () => {
+      const sessionRegistry = { updateResumeToken: vi.fn() } as unknown as SessionRegistry;
+      const captureSessionId = vi.fn(async () => "sess-jcode-abc");
+      const refresher = new ResumeMetadataRefresher({
+        sessionRegistry,
+        tmuxAdapter: mockTmux(),
+        jcodeSessionReader: { captureSessionId },
+      });
+      await refresher.refresh([
+        { sessionId: "sess-j", sessionName: "dev-impl@rig", runtime: "jcode", resumeType: null, resumeToken: null },
+      ], { fillNullOnly: true });
+      expect(sessionRegistry.updateResumeToken).toHaveBeenCalledWith("sess-j", "jcode_id", "sess-jcode-abc", "scrape");
+    });
+  });
+
   // OPR.0.4.3.20 FR-6.1 — periodic freshness re-stamp for present-and-valid tokens.
   // Equal-value pure-read derive → markResumeProbeResult("resumable"); different/absent →
   // no-op (no re-stamp, no clobber); no probe/spawn on the fillNullOnly path.

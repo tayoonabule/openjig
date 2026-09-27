@@ -57,7 +57,7 @@ import type { StatusDeps } from "./status.js";
 // (packages/daemon/src/routes/plugins.ts L37-58). CLI-side validation
 // gives operators clear errors instead of silent pass-through where the
 // daemon ignores unknown values.
-const VALID_RUNTIMES = ["claude", "codex"] as const;
+const VALID_RUNTIMES = ["claude", "codex", "jcode"] as const;
 const VALID_SOURCES = ["vendored", "claude-cache", "codex-cache"] as const;
 
 // ============================================================
@@ -65,7 +65,7 @@ const VALID_SOURCES = ["vendored", "claude-cache", "codex-cache"] as const;
 // (packages/daemon/src/domain/plugin-discovery-service.ts L41-132)
 // ============================================================
 
-type PluginRuntime = "claude" | "codex";
+type PluginRuntime = "claude" | "codex" | "jcode";
 type PluginSourceKind = "vendored" | "claude-cache" | "codex-cache" | "rig-cwd";
 
 interface PluginEntryWire {
@@ -146,7 +146,7 @@ export function pluginCommand(depsOverride?: StatusDeps): Command {
   // -- rig plugin list --
   cmd.command("list")
     .description("List discoverable plugins (aggregated across vendored + runtime caches)")
-    .option("--runtime <runtime>", "Filter by runtime support: claude | codex (omit for all)")
+    .option("--runtime <runtime>", "Filter by runtime support: claude | codex | jcode (omit for all)")
     .option("--source <source>", "Filter by source: vendored | claude-cache | codex-cache")
     .option("--json", "JSON output")
     .action(async (opts: { runtime?: string; source?: string; json?: boolean }) => {

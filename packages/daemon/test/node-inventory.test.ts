@@ -199,6 +199,17 @@ describe("Node Inventory Projection", () => {
     expect(detail?.recoveryGuidance?.notes).toContain("If the identity anchor was captured, the picker may include: dev-qa@test-rig");
   });
 
+  it("recoveryGuidance for jcode supplies its native resume command and server note", () => {
+    seedPodAwareRig(db);
+    db.prepare("UPDATE nodes SET runtime = ? WHERE id = ?").run("jcode", "node-1");
+    seedSession(db, "node-1", "dev-impl@test-rig", { resumeType: "jcode_id", resumeToken: "session-jcode-123" });
+
+    const detail = getNodeDetail(db, "rig-1", "dev.impl");
+    expect(detail?.resumeCommand).toBe("jcode --resume 'session-jcode-123'");
+    expect(detail?.recoveryGuidance?.commands).toEqual(["jcode --resume 'session-jcode-123'", "cd /project"]);
+    expect(detail?.recoveryGuidance?.notes).toContain("The seat's own jcode server lives under $OPENRIG_HOME/state/jcode/<seat>/runtime.");
+  });
+
   it("resumeCommand and recoveryGuidance preserve Codex config profile", () => {
     db.prepare("INSERT INTO rigs (id, name) VALUES (?, ?)").run("rig-2", "test-rig");
     db.prepare("INSERT INTO pods (id, rig_id, namespace, label) VALUES (?, ?, ?, ?)").run("pod-2", "rig-2", "platform", "Platform");

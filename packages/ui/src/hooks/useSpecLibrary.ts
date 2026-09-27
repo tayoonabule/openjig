@@ -64,7 +64,7 @@ export interface LibraryWorkflowReview {
       // WITHOUT these keys (byte-identical). Shapes mirror the daemon exactly
       // (spec-library-workflow-scanner.ts / workflow-types.ts): harness =
       // WorkflowAgentHarness, gate = WorkflowGateSpec {target,summary?,evidence_ref?}.
-      harness?: "claude-code" | "codex";
+      harness?: "claude-code" | "codex" | "jcode";
       host?: string;
       gate?: { target: string; summary?: string; evidence_ref?: string };
     }>;

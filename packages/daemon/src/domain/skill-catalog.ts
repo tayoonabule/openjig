@@ -23,7 +23,8 @@ const SAFE_TOPOLOGY_OWNER = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 
 export type SkillSelectionSource = "system" | "topology" | "project";
-export type SkillRuntime = "claude-code" | "codex";
+// Jcode discovers the same .agents/skills layout as Codex.
+export type SkillRuntime = "claude-code" | "codex" | "jcode";
 
 export interface CatalogSkill {
   id: string;
@@ -527,7 +528,7 @@ function planGitIgnoreFile(input: {
   const originalExists = existsSync(input.path);
   const originalContent = originalExists ? readFileSync(input.path, "utf8") : "";
   const hasManagedBlock = originalContent.includes(input.begin) || originalContent.includes(input.end);
-  const hasOtherManagedBlock = (["claude-code", "codex"] as const).some((runtime) =>
+  const hasOtherManagedBlock = (["claude-code", "codex", "jcode"] as const).some((runtime) =>
     originalContent.includes(`# BEGIN OpenRig managed skill loadout ${runtime}`)
     && originalContent.includes(`# END OpenRig managed skill loadout ${runtime}`));
   if (!hasManagedBlock && !hasOtherManagedBlock) {

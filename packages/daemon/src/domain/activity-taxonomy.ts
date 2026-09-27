@@ -104,7 +104,7 @@ export interface RungDeclaration {
  *  never inherits its predecessor's rung authority. */
 export interface AdapterRungInventory {
   adapterId: string;
-  runtime: "claude-code" | "codex" | "tmux-generic";
+  runtime: "claude-code" | "codex" | "jcode" | "tmux-generic";
   rungs: RungDeclaration[];
 }
 
@@ -187,10 +187,23 @@ export const TMUX_GENERIC_RUNG_INVENTORY: AdapterRungInventory = {
   rungs: [{ rung: "window-sampling", lifecycleCoverage: "full", initialTrust: "authoritative" }],
 };
 
+/** Jcode's activity-relay.cjs hooks (turn_start/turn_end/session_start/session_end) give the
+ *  same four-event lifecycle coverage as Codex, so this inventory mirrors CODEX's exactly:
+ *  hooks enter at TRIAL, sampling stays the authoritative floor. */
+export const JCODE_ACTIVITY_RUNG_INVENTORY: AdapterRungInventory = {
+  adapterId: "jcode-runtime-adapter",
+  runtime: "jcode",
+  rungs: [
+    { rung: "lifecycle-hooks", lifecycleCoverage: "full", initialTrust: "trial" },
+    { rung: "window-sampling", lifecycleCoverage: "full", initialTrust: "authoritative" },
+  ],
+};
+
 /** Resolve a runtime string to its rung inventory (the ingest auto-declaration path).
  *  Unknown runtimes get the generic floor — partial-coverage honesty by default. */
 export function runtimeRungInventory(runtime: string | null): AdapterRungInventory {
   if (runtime === "claude-code") return CLAUDE_ACTIVITY_RUNG_INVENTORY;
   if (runtime === "codex") return CODEX_ACTIVITY_RUNG_INVENTORY;
+  if (runtime === "jcode") return JCODE_ACTIVITY_RUNG_INVENTORY;
   return TMUX_GENERIC_RUNG_INVENTORY;
 }

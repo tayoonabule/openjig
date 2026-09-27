@@ -1,4 +1,4 @@
-export type RuntimeBrandId = "claude-code" | "codex" | "pi" | "terminal" | "unknown";
+export type RuntimeBrandId = "claude-code" | "codex" | "jcode" | "pi" | "terminal" | "unknown";
 
 export interface RuntimeBrand {
   id: RuntimeBrandId;
@@ -19,6 +19,12 @@ const RUNTIME_BRANDS: Record<RuntimeBrandId, RuntimeBrand> = {
     label: "Codex",
     shortLabel: "Codex",
     tone: "green",
+  },
+  jcode: {
+    id: "jcode",
+    label: "Jcode",
+    shortLabel: "Jcode",
+    tone: "slate",
   },
   // OPR.0.4.6.PI1 — the Pi coding agent (earendil-works/pi), RPC-first runtime.
   pi: {
@@ -45,6 +51,7 @@ export function normalizeRuntimeBrandId(runtime: string | null | undefined): Run
   const normalized = runtime?.toLowerCase().trim() ?? "";
   if (normalized === "claude" || normalized === "claude-code" || normalized.includes("claude")) return "claude-code";
   if (normalized === "codex" || normalized.includes("codex") || normalized.includes("openai")) return "codex";
+  if (normalized === "jcode" || normalized.startsWith("jcode-")) return "jcode";
   // Exact/prefixed match only — never a bare `includes("pi")` (api/pilot/…).
   if (normalized === "pi" || normalized.startsWith("pi-")) return "pi";
   if (normalized === "terminal" || normalized === "tmux" || normalized === "shell") return "terminal";

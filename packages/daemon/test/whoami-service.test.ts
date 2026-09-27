@@ -211,6 +211,15 @@ describe("WhoamiService", () => {
     }
   });
 
+  it("jcode seat surfaces its jcode session id as runtimeContext.resumeToken", () => {
+    const rig = rigRepo.createRig("jcode-rig");
+    const node = rigRepo.addNode(rig.id, "dev.impl", { role: "worker", runtime: "jcode" });
+    const sess = sessionRegistry.registerSession(node.id, "dev-impl@jcode-rig");
+    db.prepare("UPDATE sessions SET resume_token = ? WHERE id = ?").run("session_fox_1790178908510_a18975cec608bc81", sess.id);
+    const result = svc.resolve({ nodeId: node.id });
+    expect(result!.runtimeContext).toMatchObject({ runtime: "jcode", resumeToken: "session_fox_1790178908510_a18975cec608bc81" });
+  });
+
   it("PL-012: codex seat surfaces runtimeContext with runtime=codex (threadId null at v0)", () => {
     const { nodeB } = seedRig();
     const result = svc.resolve({ nodeId: nodeB.id });

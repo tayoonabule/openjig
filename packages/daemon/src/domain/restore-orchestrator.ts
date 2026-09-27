@@ -12,6 +12,7 @@ import type { NodeLauncher } from "./node-launcher.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { ClaudeResumeAdapter } from "../adapters/claude-resume.js";
 import type { CodexResumeAdapter } from "../adapters/codex-resume.js";
+import type { JcodeResumeAdapter } from "../adapters/jcode-resume.js";
 import type { PiResumeAdapter } from "../adapters/pi-resume.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import { assessNativeResumeProbe } from "./native-resume-probe.js";
@@ -79,7 +80,9 @@ export function rollupRestoreRigResult(nodes: RestoreNodeResult[]): RestoreRigRe
   // is a clean post-reconciliation outcome and rolls up like `resumed`.
   const allFailed = nodes.every((node) => node.status === "failed");
   if (allFailed) return "failed";
-  if (nodes.some((node) => node.status === "fresh" || node.status === "fresh-primed" || node.status === "awaiting-decision" || node.status === "failed" || node.status === "attention_required")) {
+  // A plain terminal has no conversation to resume, so starting it fresh is a full restore.
+  const expectedFresh = (node: RestoreNodeResult) => node.runtime === "terminal" && node.status === "fresh-primed";
+  if (nodes.some((node) => !expectedFresh(node) && (node.status === "fresh" || node.status === "fresh-primed" || node.status === "awaiting-decision" || node.status === "failed" || node.status === "attention_required"))) {
     return "partially_restored";
   }
   return "fully_restored";
@@ -133,6 +136,7 @@ interface RestoreOrchestratorDeps {
   tmuxAdapter: TmuxAdapter;
   claudeResume: ClaudeResumeAdapter;
   codexResume: CodexResumeAdapter;
+  jcodeResume?: JcodeResumeAdapter;
   /** OPR.0.4.6.PI1 FR-6 — optional so older wiring/tests keep working; a Pi
    *  resume without the adapter falls through to the honest no-adapter error. */
   piResume?: PiResumeAdapter;
@@ -153,6 +157,7 @@ export class RestoreOrchestrator {
   private tmuxAdapter: TmuxAdapter;
   private claudeResume: ClaudeResumeAdapter;
   private codexResume: CodexResumeAdapter;
+  private jcodeResume: JcodeResumeAdapter | null;
   private piResume: PiResumeAdapter | null;
   private transcriptStore: TranscriptStore | null;
   private serviceOrchestrator: import("./service-orchestrator.js").ServiceOrchestrator | null;
@@ -192,6 +197,7 @@ export class RestoreOrchestrator {
     this.tmuxAdapter = deps.tmuxAdapter;
     this.claudeResume = deps.claudeResume;
     this.codexResume = deps.codexResume;
+    this.jcodeResume = deps.jcodeResume ?? null;
     this.piResume = deps.piResume ?? null;
     this.transcriptStore = deps.transcriptStore ?? null;
     this.serviceOrchestrator = deps.serviceOrchestrator ?? null;
@@ -340,7 +346,7 @@ export class RestoreOrchestrator {
       const restoreWarnings: string[] = [...validation.warnings];
       for (const entry of plan) {
         const result = await this.restoreNodeWithCompensation(entry, rigId, snapshotId, snapshot.data, opts, restoreWarnings);
-        nodeResults.push(result);
+        nodeResults.push(entry.node.runtime === "terminal" ? { ...result, runtime: "terminal" } : result);
       }
 
       const restoreResult: RestoreResult = {
@@ -493,7 +499,7 @@ export class RestoreOrchestrator {
       const result = await this.restoreNodeWithCompensation(
         planEntry, rigId, snapshot.id, snapshot.data, { adapters: opts?.adapters, fsOps: opts?.fsOps }, subsetWarnings,
       );
-      launched.push(result);
+      launched.push(node.runtime === "terminal" ? { ...result, runtime: "terminal" } : result);
     }
 
     // Emit restore.subset_completed for launched targets only
@@ -993,7 +999,10 @@ export class RestoreOrchestrator {
       const policy = snapSession?.restorePolicy ?? "resume_if_possible";
       const freshRequested = opts?.freshLogicalIds?.includes(node.logicalId) ?? false;
       const resumeSourceRecorded = !!snapSession?.resumeType && snapSession.resumeType !== "none";
-      if (policy === "resume_if_possible" && snapSession && !snapSession.resumeToken && !freshRequested) {
+      // A plain terminal seat holds no conversation, so there is nothing to lose
+      // by starting it fresh: stopping to ask would only leave mission control dark.
+      if (policy === "resume_if_possible" && snapSession && !snapSession.resumeToken && !freshRequested
+        && node.runtime !== "terminal") {
         const sourceNote = resumeSourceRecorded
           ? `resume source '${snapSession?.resumeType}' recorded but no token available`
           : `no resume token was captured for this seat`;
@@ -1628,9 +1637,18 @@ export class RestoreOrchestrator {
       return { kind: "failed", message: result.message };
     }
 
-    // OPR.0.4.6.PI1 FR-6 — honest session-file continuation. A missing
-    // session file returns retry_fresh, which the caller maps to the
-    // awaiting-decision stop-and-ask — never a silent fresh start (BR-6).
+    if (this.jcodeResume?.canResume(resumeType, resumeToken)) {
+      const result = await this.jcodeResume.resume(sessionName, resumeType, resumeToken, cwd, model);
+      if (result.ok) {
+        if (result.appliedLaunch && launchGeneration) this.appliedLaunchStore.recordGeneration(launchGeneration, result.appliedLaunch);
+        return { kind: "resumed" };
+      }
+      if (result.code === "retry_fresh") return { kind: "retry_fresh" };
+      if (result.code === "attention_required") return { kind: "attention_required", message: result.message, evidence: "evidence" in result ? result.evidence : undefined };
+      return { kind: "failed", message: result.message };
+    }
+
+    // Pi's missing session file returns retry_fresh for operator decision.
     if (this.piResume?.canResume(resumeType, resumeToken)) {
       const result = await this.piResume.resume(sessionName, resumeType, resumeToken, cwd, model, resolvedPosture);
       if (result.ok) {
@@ -1775,9 +1793,9 @@ export class RestoreOrchestrator {
     const paneCommand = await this.tmuxAdapter.getPaneCommand(identity.pane);
     const paneContent = (await this.tmuxAdapter.capturePaneContent(identity.pane, 40)) ?? "";
     const probe = assessNativeResumeProbe({ runtime, paneCommand, paneContent });
-    const fgProcess = runtime === "claude-code" ? "claude" as const : runtime === "codex" ? "codex" as const : null;
+    const fgProcess = runtime === "claude-code" ? "claude" as const : runtime === "codex" ? "codex" as const : runtime === "jcode" ? "jcode" as const : null;
     if (!fgProcess) {
-      return { ok: false, code: "fg_process_not_runtime", detail: `Node runtime is ${runtime ?? "unknown"}, not claude/codex.` };
+      return { ok: false, code: "fg_process_not_runtime", detail: `Node runtime is ${runtime ?? "unknown"}, not claude/codex/jcode.` };
     }
 
     // Precondition #4: pane is at a usable/idle state — explicitly NOT a

@@ -62,6 +62,7 @@ want that full environment. Its overall failure can include an optional
 component for this starter: read the individual result and verify the three
 prerequisites above rather than treating a missing Claude login as broken
 Codex. A missing Codex login remains a real launch blocker.
+It also checks the optional Jcode harness without installing it; a missing Jcode is a warning.
 
 ```sh
 cd <your-repository>

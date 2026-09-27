@@ -32,7 +32,7 @@ import { existsSync, readdirSync, readFileSync, renameSync, statSync, writeFileS
 import { join, basename } from "node:path";
 import { parse as parseYaml } from "yaml";
 
-export type PluginRuntime = "claude" | "codex";
+export type PluginRuntime = "claude" | "codex" | "jcode";
 // Slice 3.3 fix-C — `rig-cwd` source per DESIGN §5.4 union (4th category):
 // rig-bundled `<cwd>/.claude/plugins/*` + `<cwd>/.codex/plugins/*` (the
 // projection target from IMPL-PRD §1.2). velocity-qa VM verify failure #3.
@@ -56,7 +56,8 @@ export interface PluginEntry {
    *   - `codex-cache:<marketplace>/<plugin>/<version>`
    */
   sourceLabel: string;
-  /** Which runtimes this plugin supports (presence of manifest dirs). */
+  /** Which runtimes this plugin supports. Jcode is present only for a
+   *  skill-only tree because it has no compatible plugin loader. */
   runtimes: PluginRuntime[];
   /** Filesystem path to the plugin root. */
   path: string;
@@ -508,6 +509,19 @@ export class PluginDiscoveryService {
       for (const entry of safeReaddir(skillsDir)) {
         if (isDir(join(skillsDir, entry))) skillCount += 1;
       }
+    }
+
+    // Jcode discovers .agents/skills but does not load Claude/Codex plugin
+    // manifests. A plugin can therefore apply to Jcode only when its usable
+    // payload is exclusively skills, with no hooks or MCP configuration to
+    // silently discard.
+    const claudeManifest = readManifest(claudeManifestPath);
+    const codexManifest = readManifest(codexManifestPath);
+    const hasRuntimeConfig = [claudeManifest, codexManifest].some((candidate) =>
+      candidate && (candidate.raw["hooks"] !== undefined || candidate.raw["mcpServers"] !== undefined),
+    );
+    if (skillCount > 0 && !existsSync(join(pluginPath, "hooks")) && !hasRuntimeConfig) {
+      runtimes.push("jcode");
     }
 
     return {

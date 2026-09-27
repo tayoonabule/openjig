@@ -80,6 +80,9 @@ interface ClaimServiceDeps {
   piRunnerStateStore?: {
     readSessionFile(sessionName: string): { ok: true; sessionFile: string } | { ok: false; reason: string };
   };
+  jcodeSessionReader?: {
+    captureSessionId(sessionName: string): Promise<string | undefined>;
+  };
 }
 
 interface BindOptions {
@@ -113,6 +116,7 @@ export class ClaimService {
   private contextUsageStore: ClaimServiceDeps["contextUsageStore"] | null;
   private resumeTokenCapturer: ClaimServiceDeps["resumeTokenCapturer"] | null;
   private piRunnerStateStore: ClaimServiceDeps["piRunnerStateStore"] | null;
+  private jcodeSessionReader: ClaimServiceDeps["jcodeSessionReader"] | null;
 
   constructor(deps: ClaimServiceDeps) {
     if (deps.db !== deps.rigRepo.db) throw new Error("ClaimService: rigRepo must share the same db handle");
@@ -130,6 +134,7 @@ export class ClaimService {
     this.contextUsageStore = deps.contextUsageStore ?? null;
     this.resumeTokenCapturer = deps.resumeTokenCapturer ?? null;
     this.piRunnerStateStore = deps.piRunnerStateStore ?? null;
+    this.jcodeSessionReader = deps.jcodeSessionReader ?? null;
   }
 
   private async observeBindingPane(
@@ -227,7 +232,7 @@ export class ClaimService {
       // FR-3's adoption provenance/audit semantics are unchanged.
       const derived = await deriveResumeToken(
         { runtime: input.runtime, sessionName: input.sessionName },
-        { contextUsageStore: this.contextUsageStore, resumeTokenCapturer: this.resumeTokenCapturer, piRunnerStateStore: this.piRunnerStateStore },
+        { contextUsageStore: this.contextUsageStore, resumeTokenCapturer: this.resumeTokenCapturer, piRunnerStateStore: this.piRunnerStateStore, jcodeSessionReader: this.jcodeSessionReader },
       );
       if (derived.outcome === "exempt" || derived.outcome === "noop") return;
       const runtime = input.runtime as string; // non-null past exempt

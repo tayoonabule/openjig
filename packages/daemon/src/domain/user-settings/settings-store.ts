@@ -118,6 +118,8 @@ export const SETTINGS_VALID_KEYS = [
   "ui.terminal.max_live_terminals",
   "recovery.auto_drive_provider_prompts",
   "recovery.provider_auth_env_allowlist",
+  // openjig: which runtime the auto-booted kernel rig uses ("auto" keeps upstream's probe order).
+  "kernel.runtime",
   // V1 attempt-3 Phase 4 - Advisor / Operator rail icon V1 placeholders
   // per universal-shell.md L82–L84. SC-29 EXCEPTION declared in
   // dispatch ACK §4: allowlist-only edit; no migrations / new
@@ -239,6 +241,7 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "ui.terminal.max_live_terminals": { primary: "OPENRIG_UI_TERMINAL_MAX_LIVE_TERMINALS" },
   "recovery.auto_drive_provider_prompts": { primary: "OPENRIG_RECOVERY_AUTO_DRIVE_PROVIDER_PROMPTS" },
   "recovery.provider_auth_env_allowlist": { primary: "OPENRIG_RECOVERY_PROVIDER_AUTH_ENV_ALLOWLIST" },
+  "kernel.runtime": { primary: "OPENRIG_KERNEL_RUNTIME" },
   "agents.advisor_session": { primary: "OPENRIG_AGENTS_ADVISOR_SESSION" },
   "host.selected": { primary: "OPENRIG_HOST_SELECTED" },
   "host.name": { primary: "OPENRIG_HOST_NAME" },
@@ -320,6 +323,7 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "ui.terminal.max_live_terminals": ["ui", "terminal", "maxLiveTerminals"],
   "recovery.auto_drive_provider_prompts": ["recovery", "autoDriveProviderPrompts"],
   "recovery.provider_auth_env_allowlist": ["recovery", "providerAuthEnvAllowlist"],
+  "kernel.runtime": ["kernel", "runtime"],
   "agents.advisor_session": ["agents", "advisorSession"],
   "host.selected": ["host", "selected"],
   "host.name": ["host", "name"],
@@ -574,6 +578,7 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     case "ui.timezone": return "America/Los_Angeles";
     case "recovery.auto_drive_provider_prompts": return false;
     case "recovery.provider_auth_env_allowlist": return "";
+    case "kernel.runtime": return "auto";
     // V1 Phase 4 — Advisor default per universal-shell.md L83;
     // Operator default empty per L84 ("not configured").
     case "agents.advisor_session": return "advisor-lead@openrig-velocity";
@@ -690,6 +695,11 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: s
     const v = (raw ?? "").trim();
     if (v !== "off" && v !== "all") {
       throw new Error(`Invalid value for policies.idle_gate_qitem.auto_register: must be "off" or "all", got "${raw}"`);
+    }
+  },
+  "kernel.runtime": (raw) => {
+    if (!["auto", "claude-code", "codex", "jcode"].includes((raw ?? "").trim())) {
+      throw new Error(`Invalid value for kernel.runtime: must be "auto", "claude-code", "codex" or "jcode", got "${raw}"`);
     }
   },
   // Policy threshold: integer in [1, 100]. Documented contract from
@@ -842,6 +852,7 @@ export interface ResolvedConfig {
   uiPreviewDefaultLines: number;
   recoveryAutoDriveProviderPrompts: boolean;
   recoveryProviderAuthEnvAllowlistRaw: string;
+  kernelRuntime: string;
 }
 
 export class SettingsStore {
@@ -953,6 +964,7 @@ export class SettingsStore {
       uiPreviewDefaultLines: this.resolveOne("ui.preview.default_lines", fc, wr).value as number,
       recoveryAutoDriveProviderPrompts: this.resolveOne("recovery.auto_drive_provider_prompts", fc, wr).value as boolean,
       recoveryProviderAuthEnvAllowlistRaw: this.resolveOne("recovery.provider_auth_env_allowlist", fc, wr).value as string,
+      kernelRuntime: this.resolveOne("kernel.runtime", fc, wr).value as string,
     };
   }
 

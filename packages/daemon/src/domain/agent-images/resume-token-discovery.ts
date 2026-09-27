@@ -11,7 +11,7 @@
 
 import type Database from "better-sqlite3";
 
-export type DiscoveryRuntime = "claude-code" | "codex";
+export type DiscoveryRuntime = "claude-code" | "codex" | "jcode";
 
 export interface DiscoveryResult {
   runtime: DiscoveryRuntime;
@@ -52,14 +52,18 @@ export function discoverResumeToken(db: Database.Database, sourceSession: string
     .get(sessionRow.node_id) as { runtime: string | null; cwd: string | null } | undefined;
   const runtime = nodeRow?.runtime ?? null;
   const nodeCwd = nodeRow?.cwd ?? null;
-  if (runtime !== "claude-code" && runtime !== "codex") {
+  if (runtime !== "claude-code" && runtime !== "codex" && runtime !== "jcode") {
     return {
       ok: false,
       failure: {
         code: "runtime_unsupported",
-        message: `Source session '${sourceSession}' has runtime '${runtime ?? "(unknown)"}' which has no native fork primitive. Only claude-code and codex sessions can be forked.`,
+        message: `Source session '${sourceSession}' has runtime '${runtime ?? "(unknown)"}' which has no native fork primitive. Only claude-code, codex and jcode sessions can be forked.`,
       },
     };
+  }
+  // Jcode seats persist the captured jcode session id as the resume token.
+  if (runtime === "jcode") {
+    return { ok: true, result: { runtime, nativeId: sessionRow.resume_token ?? null, nodeCwd } };
   }
   if (runtime === "claude-code") {
     const contextSessionId = discoverClaudeContextSessionId(db, sessionRow.node_id, sourceSession);

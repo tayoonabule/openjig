@@ -46,8 +46,8 @@ export function skillCommand(depsOverride?: StatusDeps): Command {
 
   cmd
     .command("loadout")
-    .description("Inspect or reconcile the composed managed skill loadout for one Claude/Codex working directory")
-    .requiredOption("--runtime <runtime>", "Target runtime: claude-code or codex")
+    .description("Inspect or reconcile the composed managed skill loadout for one Claude, Codex, or Jcode working directory")
+    .requiredOption("--runtime <runtime>", "Target runtime: claude-code, codex, or jcode")
     .option("--cwd <path>", "Target working directory (default: current directory)")
     .option("--project-root <path>", "Project root whose project.yaml supplies install.skills (default: cwd)")
     .option("--topology <ids>", "Comma-separated topology/profile skill identities")
@@ -61,8 +61,8 @@ export function skillCommand(depsOverride?: StatusDeps): Command {
       apply?: boolean;
       json?: boolean;
     }) => {
-      if (opts.runtime !== "claude-code" && opts.runtime !== "codex") {
-        console.error("invalid_runtime: --runtime must be claude-code or codex");
+      if (opts.runtime !== "claude-code" && opts.runtime !== "codex" && opts.runtime !== "jcode") {
+        console.error("invalid_runtime: --runtime must be claude-code, codex, or jcode");
         process.exitCode = 1;
         return;
       }

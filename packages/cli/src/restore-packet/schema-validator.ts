@@ -74,13 +74,13 @@ export const RESTORE_SUMMARY_SCHEMA: Record<string, unknown> = {
     source_rig: { type: "string", minLength: 1 },
     source_runtime: {
       type: "string",
-      enum: ["claude-code", "codex", "terminal", "external"],
+      enum: ["claude-code", "codex", "jcode", "terminal", "external"],
     },
     source_cwd: { type: "string", pattern: "^/" },
     target_rig: { type: "string", minLength: 1 },
     target_runtime: {
       type: "string",
-      enum: ["claude-code", "codex", "terminal", "external"],
+      enum: ["claude-code", "codex", "jcode", "terminal", "external"],
     },
     target_workspace_root: { type: "string", pattern: "^/" },
     default_target_repo: { type: ["string", "null"] },

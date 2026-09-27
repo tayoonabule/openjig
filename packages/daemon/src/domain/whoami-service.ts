@@ -78,7 +78,7 @@ export type RuntimeContext =
       lastSampledAt: string | null;
     }
   | {
-      runtime: "claude-code";
+      runtime: "claude-code" | "jcode";
       resumeToken: string | null;
       estimatedTokens: number | null;
       lastSampledAt: string | null;
@@ -383,9 +383,10 @@ export class WhoamiService {
         lastSampledAt,
       };
     }
-    if (runtime === "claude-code") {
+    if (runtime === "claude-code" || runtime === "jcode") {
       // resumeToken lives on sessions.resume_token (migration 006).
-      // Read the most-recent session for this node.
+      // Read the most-recent session for this node. For jcode it is the
+      // jcode session id, which an agent needs to fork or hand over itself.
       let resumeToken: string | null = null;
       try {
         const row = this.db
@@ -397,7 +398,7 @@ export class WhoamiService {
         resumeToken = null;
       }
       return {
-        runtime: "claude-code",
+        runtime,
         resumeToken,
         estimatedTokens,
         lastSampledAt,

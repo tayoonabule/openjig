@@ -217,7 +217,7 @@ export class RigTeardownOrchestrator {
     // #25: clean only the rig's selected Claude file; the other file is never touched.
     const targetPath = runtime === "claude-code"
       ? nodePath.join(cwd, this.deps.rigRepo.getRigClaudeManagedBlockFile(rigId) ?? DEFAULT_CLAUDE_MANAGED_BLOCK_FILE)
-      : runtime === "codex"
+      : runtime === "codex" || runtime === "jcode"
         ? nodePath.join(cwd, "AGENTS.md")
         : null;
     if (!targetPath) {

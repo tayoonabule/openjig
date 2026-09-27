@@ -119,6 +119,8 @@ async function run(): Promise<void> {
     ? createLiveRefresh({ scopeKey: () => pageReadKey(view.get()), hydrate: (page, signal) => hydrateSnapshot(client.forPage(page, signal), reviewCache, view.get().scopesMission, selectedSliceDirectory(), selectedRigName(), view.get()), onFrame: () => draw(), now: () => Date.now() })
     : null;
   let motionTimer: NodeJS.Timeout | null = null;
+  let paintedLines: string[] = [];
+  let paintedSize = "";
   // S19 AM-R18 — the open view updates ITSELF: oracle pushes drive the refresh owner.
   // Notification-only; the refresh rehydrates the same ps projection through the
   // daemon client (one oracle, with the owner's bounded quiet fallback; HTTP stays
@@ -176,7 +178,15 @@ async function run(): Promise<void> {
     // hitMap coordinates always match what is on screen
     // The renderer owns line breaks. Wide pasted characters must not wrap a
     // padded row and scroll the entire frame; restore normal wrapping after paint.
-    process.stdout.write("\x1b[?7l\x1b[H" + stylizeLines(lastScreen, style).map((l) => "\x1b[2K" + l).join("\r\n") + "\x1b[?7h");
+    // openjig: repaint only changed lines inside synchronized output, so the
+    // blinking command cursor does not erase and flash every static line.
+    const paint = stylizeLines(lastScreen, style);
+    const size = `${process.stdout.columns}x${process.stdout.rows}`;
+    const full = paint.length !== paintedLines.length || size !== paintedSize;
+    paintedSize = size;
+    const out = paint.map((l, i) => (full || l !== paintedLines[i] ? `\x1b[${i + 1};1H\x1b[2K${l}` : "")).join("");
+    paintedLines = paint;
+    if (out) process.stdout.write("\x1b[?2026h\x1b[?7l" + out + "\x1b[?7h\x1b[?2026l");
     if (motionTimer) clearTimeout(motionTimer);
     motionTimer = lastScreen.motionActive || lastScreen.commandMotionActive ? setTimeout(draw, MOTION_FRAME_MS) : null;
   }
@@ -222,6 +232,7 @@ async function run(): Promise<void> {
         if (process.stdin.isTTY) process.stdin.setRawMode(true);
         process.stdin.resume();
         process.stdout.write(ALT_SCREEN_ON + MOUSE_ENABLE + PASTE_ENABLE);
+        paintedLines = [];
         nativeAttached = false;
       }
     },

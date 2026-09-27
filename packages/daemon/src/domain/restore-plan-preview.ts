@@ -125,6 +125,7 @@ function runtimePromptFor(runtime: string | null, tokenState: ResumeTokenState):
   if (tokenState === "missing") return undefined;
   if (runtime === "claude-code") return "expect the Claude session picker (full-session resume)";
   if (runtime === "codex") return "expect a Codex auth/update check before resume";
+  if (runtime === "jcode") return "expect jcode to reopen the saved session at its numbered prompt";
   return undefined;
 }
 

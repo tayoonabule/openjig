@@ -39,6 +39,9 @@ export function buildNativeResumeCommand(
   if (runtime === "codex") {
     return buildCodexResumeCore(resumeToken, codexConfigProfile);
   }
+  if (runtime === "jcode") {
+    return `jcode --resume ${shellQuote(resumeToken)}`;
+  }
   return null;
 }
 
@@ -212,6 +215,29 @@ export function assessNativeResumeProbe(
       code: "awaiting_runtime",
       detail: "Codex did not report an explicit failure, but an interactive conversation has not been observed.",
     };
+  }
+
+  if (runtime === "jcode") {
+    if (/no (saved )?session (found|with (the )?id)|session not found|could not (load|resume) session/i.test(paneContent)) {
+      return { status: "failed", code: "no_saved_session", detail: "Jcode reported that the requested session does not exist." };
+    }
+    // A numbered prompt in scrollback, or in a returned shell, is not a live TUI.
+    if (paneCommand !== "jcode" && !paneCommand.endsWith("/jcode")) {
+      return SHELL_COMMANDS.has(paneCommand)
+        ? { status: "failed", code: "returned_to_shell", detail: "The probe pane returned to a shell instead of staying inside the runtime." }
+        : { status: "inconclusive", code: "awaiting_runtime", detail: "Jcode is not the foreground pane process." };
+    }
+    const lines = paneContent.split("\n").map((line) => line.trim()).filter(Boolean);
+    const last = lines.at(-1) ?? "";
+    const prompt = /^\d+>\s*$/.test(last) || (/\d+(?:\.\d+)?[kKmM]?\/\d+(?:\.\d+)?[kKmM]?/.test(last)
+      && /^\d+>\s*$/.test(lines.at(-2) ?? ""));
+    if (/\b(sign in|log in|login required|authenticate to continue|onboarding)\b/i.test(paneContent) && !prompt) {
+      return { status: "attention_required", code: "login_required", detail: "Jcode needs login or onboarding before the session can become interactive." };
+    }
+    if (prompt) {
+      return { status: "resumed", code: "active_runtime", detail: "Jcode has an interactive prompt in the probe pane." };
+    }
+    return { status: "inconclusive", code: "awaiting_runtime", detail: "Jcode has not yet reached an interactive prompt." };
   }
 
   return {

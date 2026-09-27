@@ -12,7 +12,9 @@
 // MVP single-host context: filesystem-canonical; NO new SQLite tables;
 // library cache is in-memory at the daemon scope.
 
-export type AgentImageRuntime = "claude-code" | "codex";
+// Jcode images can be discovered and represented. Consumption still follows
+// the native fork capability gate, where Jcode is deliberately unsupported.
+export type AgentImageRuntime = "claude-code" | "codex" | "jcode";
 
 export interface AgentImageManifest {
   name: string;

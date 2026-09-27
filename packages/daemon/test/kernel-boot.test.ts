@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import {
   bootKernelIfNeeded,
   selectVariant,
+  parseJcodeAuthStatus,
   kernelAlreadyManaged,
   authBlockMessage,
   type KernelBootDeps,
@@ -96,6 +97,7 @@ beforeEach(() => {
   writeFileSync(join(kernelDir, "rig.yaml"), "name: kernel\n");
   writeFileSync(join(kernelDir, "rig-claude-only.yaml"), "name: kernel\n");
   writeFileSync(join(kernelDir, "rig-codex-only.yaml"), "name: kernel\n");
+  writeFileSync(join(kernelDir, "rig-jcode-only.yaml"), "name: kernel\n");
 });
 
 afterEach(() => {
@@ -104,6 +106,24 @@ afterEach(() => {
 });
 
 describe("selectVariant — auth-state → variant mapping", () => {
+  it("accepts only a true any_available from Jcode auth JSON", () => {
+    expect(parseJcodeAuthStatus('{"any_available":true}')).toBe("ok");
+    expect(parseJcodeAuthStatus('{"any_available":false}')).toBe("unavailable");
+    expect(parseJcodeAuthStatus("not-json")).toBe("unavailable");
+  });
+  it("falls back to the jcode-only kernel when jcode is the only authenticated runtime", () => {
+    expect(selectVariant({ claudeCode: "unavailable", codex: "unavailable", jcode: "ok" })).toBe("rig-jcode-only.yaml");
+  });
+  it("honours an authenticated kernel.runtime preference over the upstream order", () => {
+    const all = { claudeCode: "ok", codex: "ok", jcode: "ok" } as const;
+    expect(selectVariant(all, "jcode")).toBe("rig-jcode-only.yaml");
+    expect(selectVariant(all, "codex")).toBe("rig-codex-only.yaml");
+    expect(selectVariant(all, "claude-code")).toBe("rig-claude-only.yaml");
+    expect(selectVariant(all, "auto")).toBe("rig.yaml");
+  });
+  it("ignores an unauthenticated preference and keeps the upstream order", () => {
+    expect(selectVariant({ claudeCode: "ok", codex: "ok", jcode: "unavailable" }, "jcode")).toBe("rig.yaml");
+  });
   it("picks rig.yaml when both runtimes available", () => {
     expect(selectVariant({ claudeCode: "ok", codex: "ok" })).toBe("rig.yaml");
   });
@@ -241,6 +261,30 @@ describe("bootKernelIfNeeded — fire-and-forget bootstrap", () => {
       probeRuntimes: async () => ({ claudeCode: "unavailable", codex: "ok" }),
     }, tmpSpecsDir));
     expect(tracker.getStatus().variant).toBe("rig-codex-only.yaml");
+    tracker.stop();
+  });
+
+  it("boots the jcode-only variant when kernel.runtime=jcode and probes jcode only then", async () => {
+    const includeJcode: Array<boolean | undefined> = [];
+    const tracker = await bootKernelIfNeeded(makeBaseDeps({
+      preferredRuntime: "jcode",
+      probeRuntimes: async (withJcode) => { includeJcode.push(withJcode); return { claudeCode: "ok", codex: "ok", jcode: "ok" }; },
+    }, tmpSpecsDir));
+    expect(tracker.getStatus().variant).toBe("rig-jcode-only.yaml");
+    expect(includeJcode).toEqual([true]);
+    tracker.stop();
+  });
+
+  it("does not auth-block when jcode is the only authenticated runtime", async () => {
+    const includeJcode: Array<boolean | undefined> = [];
+    const tracker = await bootKernelIfNeeded(makeBaseDeps({
+      probeRuntimes: async (withJcode) => {
+        includeJcode.push(withJcode);
+        return { claudeCode: "unavailable", codex: "unavailable", ...(withJcode ? { jcode: "ok" as const } : {}) };
+      },
+    }, tmpSpecsDir));
+    expect(tracker.getStatus().variant).toBe("rig-jcode-only.yaml");
+    expect(includeJcode).toEqual([false, true]);
     tracker.stop();
   });
 });

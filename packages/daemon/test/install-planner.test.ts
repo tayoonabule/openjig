@@ -8,7 +8,7 @@ name: test-pkg
 version: 1.0.0
 summary: Test package
 compatibility:
-  runtimes: [claude-code, codex]
+  runtimes: [claude-code, codex, jcode]
 exports:
   skills:
     - source: skills/foo
@@ -179,6 +179,13 @@ exports:
     const cxPlan = planner.plan(resolved, "/repo", "codex");
     const cxSkill = cxPlan.entries.find((e) => e.exportType === "skill");
     expect(cxSkill!.targetPath).toContain(".agents/skills/foo");
+
+    // Jcode deliberately projects into Codex's .agents layout and AGENTS.md.
+    const jcodePlan = planner.plan(resolved, "/repo", "jcode");
+    const jcodeSkill = jcodePlan.entries.find((e) => e.exportType === "skill");
+    const jcodeGuidance = jcodePlan.entries.find((e) => e.exportType === "guidance" && !e.deferred);
+    expect(jcodeSkill!.targetPath).toContain(".agents/skills/foo");
+    expect(jcodeGuidance!.targetPath).toBe("/repo/AGENTS.md");
   });
 
   // Test 8: Plan separates actionable vs deferred vs conflicts

@@ -92,6 +92,12 @@ describe("M2 restore-packet schema-validator", () => {
     expect(result.errors).toEqual([]);
   });
 
+  it("accepts jcode as a restore packet target runtime", () => {
+    const summary = validSummary();
+    summary["target_runtime"] = "jcode";
+    expect(validateRestoreSummary(summary)).toMatchObject({ valid: true, errors: [] });
+  });
+
   it("rejects when source_session_id is missing", () => {
     const summary = validSummary();
     delete (summary as Record<string, unknown>)["source_session_id"];
@@ -886,6 +892,21 @@ describe("M2c-CLI packet-writer atomic emission", () => {
     const summary = JSON.parse(fs.readFileSync(path.join(targetDir, "restore-summary.json"), "utf-8"));
     const validation = validateRestoreSummary(summary);
     expect(validation.valid, JSON.stringify(validation.errors)).toBe(true);
+  });
+
+  it("writes a codex transcript packet targeting jcode without a jcode transcript parser", async () => {
+    const { writePacket } = await import("../src/restore-packet/packet-writer.js");
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const targetDir = path.join(tmpRoot, "packet-jcode");
+    const opts = buildBaselineOpts(targetDir) as Record<string, unknown>;
+    opts["targetRuntime"] = "jcode";
+
+    await writePacket(opts as Parameters<typeof writePacket>[0]);
+
+    const summary = JSON.parse(fs.readFileSync(path.join(targetDir, "restore-summary.json"), "utf-8"));
+    expect(summary).toMatchObject({ source_runtime: "codex", target_runtime: "jcode" });
+    expect(validateRestoreSummary(summary)).toMatchObject({ valid: true, errors: [] });
   });
 
   it("emits transcript.md when includeFullTranscript=true; full_transcript key present in summary", async () => {

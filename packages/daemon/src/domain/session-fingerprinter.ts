@@ -23,6 +23,7 @@ const SHELL_NAMES = new Set(["bash", "zsh", "fish", "sh", "dash", "tcsh", "csh"]
 
 const CLAUDE_PROCESS_PATTERNS = ["claude", "claude-code"];
 const CODEX_PROCESS_PATTERNS = ["codex"];
+const JCODE_PROCESS_PATTERNS = ["jcode"];
 
 const CLAUDE_PANE_PATTERNS = [
   { label: "Claude Code", test: (line: string) => /^\s*Claude Code\b/i.test(line) },
@@ -34,6 +35,10 @@ const CODEX_PANE_PATTERNS = [
   { label: "Codex CLI", test: (line: string) => /^\s*Codex CLI\b/i.test(line) },
   { label: "codex>", test: (line: string) => /^\s*codex>\s*/i.test(line) },
   { label: "╭─ Codex", test: (line: string) => /^\s*╭─ Codex\b/i.test(line) },
+];
+
+const JCODE_PANE_PATTERNS = [
+  { label: "Jcode", test: (line: string) => /^\s*Jcode\b/i.test(line) },
 ];
 
 /**
@@ -77,6 +82,7 @@ export class SessionFingerprinter {
         evidence.cmuxSignal = cmuxMatch;
         const hint = cmuxMatch.runtime.includes("claude") ? "claude-code" as RuntimeHint
           : cmuxMatch.runtime.includes("codex") ? "codex" as RuntimeHint
+          : cmuxMatch.runtime.includes("jcode") ? "jcode" as RuntimeHint
           : "unknown" as RuntimeHint;
         return { runtimeHint: hint, confidence: "highest", evidence };
       }
@@ -99,6 +105,14 @@ export class SessionFingerprinter {
           evidence.layerUsed = 1;
           evidence.processSignal = { command: pane.activeCommand, matched: pattern };
           return { runtimeHint: "codex", confidence: "high", evidence };
+        }
+      }
+
+      for (const pattern of JCODE_PROCESS_PATTERNS) {
+        if (cmd === pattern || cmd.endsWith(`/${pattern}`)) {
+          evidence.layerUsed = 1;
+          evidence.processSignal = { command: pane.activeCommand, matched: pattern };
+          return { runtimeHint: "jcode", confidence: "high", evidence };
         }
       }
 
@@ -130,6 +144,13 @@ export class SessionFingerprinter {
             return { runtimeHint: "codex", confidence: "medium", evidence };
           }
         }
+        for (const pattern of JCODE_PANE_PATTERNS) {
+          if (pattern.test(line)) {
+            evidence.layerUsed = 2;
+            evidence.paneContentSignal = { pattern: pattern.label, matchedLine: line.trim() };
+            return { runtimeHint: "jcode", confidence: "medium", evidence };
+          }
+        }
       }
     }
 
@@ -140,6 +161,7 @@ export class SessionFingerprinter {
       const hasAgentsDir = this.fsExists(`${pane.cwd}/.agents`);
       evidence.configSignal = { claudeDir: hasClaudeDir, agentsDir: hasAgentsDir };
 
+      // Jcode also reads .agents, so config-only evidence cannot distinguish it from Codex.
       if (hasClaudeDir && !hasAgentsDir) configBoost = "claude-code";
       else if (hasAgentsDir && !hasClaudeDir) configBoost = "codex";
     }

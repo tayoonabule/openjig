@@ -617,7 +617,7 @@ export async function runSeatHandover(seat: string, opts: HandoverActionOpts, de
     reason: opts.reason,
     operator: opts.operator,
     dryRun: opts.dryRun === true,
-  });
+  }, { timeoutMs: 120_000 }); // a real handover launches a successor, like `rig create`/`rig grow`
 
   if (opts.json) {
     console.log(JSON.stringify(res.data, null, 2));

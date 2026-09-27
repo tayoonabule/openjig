@@ -24,6 +24,7 @@ function runtimeColor(runtime: string): string {
   switch (runtime) {
     case "claude-code": return "#d4c4a8";
     case "codex": return "#b8c9d4";
+    case "jcode": return "#b7ddd8";
     case "terminal": return "#c4c4c4";
     default: return "#e0ddd4";
   }

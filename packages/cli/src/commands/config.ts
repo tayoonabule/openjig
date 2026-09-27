@@ -79,6 +79,7 @@ Keys:
   ui.timezone            TUI IANA timezone (default America/Los_Angeles; reopen TUI after changing)
   ui.preview.*           refresh_interval_seconds, max_pins, default_lines
   recovery.*             auto_drive_provider_prompts, provider_auth_env_allowlist
+  kernel.*               runtime (auto | claude-code | codex | jcode)
   agents.*               advisor_session, operator_session
   feed.subscriptions.*   action_required, approvals, shipped, progress, audit_log
   runtime.codex.*        hooks_enabled

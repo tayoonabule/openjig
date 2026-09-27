@@ -134,6 +134,7 @@ describe("ConfigStore — extended namespaces (User Settings v0)", () => {
       "ui.preview.refresh_interval_seconds", "ui.preview.max_pins", "ui.preview.default_lines", "ui.timezone",
       "recovery.auto_drive_provider_prompts",
       "recovery.provider_auth_env_allowlist",
+      "kernel.runtime",
       // V1 attempt-3 Phase 4 — Advisor/Operator placeholders.
       "agents.advisor_session", "agents.operator_session",
       // V0.3.1 slice 05 kernel-rig-as-default — operator seat name

@@ -50,7 +50,7 @@ install:
 contains stable skill identities only. Skill source bytes live in the single
 configured managed catalog (`skills.root`, default `$OPENRIG_HOME/skills`),
 never under the project or workspace. `rig context work-install --runtime
-<claude-code|codex>` resolves both parts; add `--apply-skills` to reconcile the
+<claude-code|codex|jcode>` resolves both parts; add `--apply-skills` to reconcile the
 selected exact bytes into `.claude/skills/` or `.agents/skills/` under the
 caller's current working directory. Use `--cwd` when the receiving agent works
 somewhere else; the project-world metadata root is never assumed to be its code

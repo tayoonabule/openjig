@@ -3,7 +3,7 @@
 // declared in `agent.yaml`'s `resources.skills` + imports, not skills
 // dropped at user-library or rig-bundled paths.
 //
-// The validator's question is now "would Claude Code or Codex actually
+// The validator's question is now "would Claude Code, Codex, or Jcode actually
 // load this when it sees the directory?" — i.e., is there a SKILL.md
 // with a name + description + body. The daemon's hardcoded shared
 // bundle is no longer the gate.
@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { SkillResource } from "./types.js";
 
-export type SkillRuntime = "claude-code" | "codex";
+export type SkillRuntime = "claude-code" | "codex" | "jcode";
 
 export interface SkillDiscoveryPaths {
   runtime: SkillRuntime;
@@ -23,7 +23,8 @@ export interface SkillDiscoveryPaths {
    *  here via os.homedir() so tests can inject a fixture root). */
   homedir: string;
   /** The agent's resolved working directory — rig-bundled skills live
-   *  under <cwd>/.claude/skills/ or <cwd>/.agents/skills/. */
+   *  under <cwd>/.claude/skills/ or <cwd>/.agents/skills/. Jcode uses
+   *  the Codex-compatible .agents layout. */
   cwd: string;
   /** The rig-spec install dir — bundled domain skills live under
    *  <specInstallDir>/skills/<name>/. Optional: undefined means the
@@ -183,12 +184,21 @@ export function discoverSkillsForRuntime(paths: SkillDiscoveryPaths): SkillDisco
   return { skills, rejected };
 }
 
+/** Jcode discovers all three native project/user roots: OpenRig installs into .agents, but
+ *  discovery must not hide an operator's .jcode or .claude skills from a Jcode seat. Other
+ *  runtimes get their single runtimeDir root. */
+function runtimeSkillRoots(base: string, runtime: SkillRuntime, runtimeDir: string): string[] {
+  return runtime === "jcode"
+    ? [join(base, ".jcode", "skills"), join(base, ".agents", "skills"), join(base, ".claude", "skills")]
+    : [join(base, runtimeDir, "skills")];
+}
+
 /** Build the precedence-ordered list of scan roots for a runtime.
  *  Earlier entries win on collision (most-specific-wins): rig-bundled
  *  at cwd > spec-install-dir > user libraries. Within user libraries,
  *  the runtime-specific dir is preferred over the shared
  *  ~/.openrig/skills/ pool so an operator who explicitly installed a
- *  Claude-only or Codex-only version takes precedence over the
+ *  Claude-only or .agents-layout version takes precedence over the
  *  cross-runtime one. */
 function listScanRoots(paths: SkillDiscoveryPaths): string[] {
   const { runtime, homedir, cwd, specInstallDir } = paths;
@@ -196,15 +206,15 @@ function listScanRoots(paths: SkillDiscoveryPaths): string[] {
   const roots: string[] = [];
 
   // 1. Rig-bundled at cwd (most-specific; ships with the rig source).
-  roots.push(join(cwd, runtimeDir, "skills"));
+  roots.push(...runtimeSkillRoots(cwd, runtime, runtimeDir));
 
   // 2. Spec-install-dir bundled (bundled-with-rig but installed at a
   // separate path; e.g., from `rig up <bundle>` extraction).
   if (specInstallDir) roots.push(join(specInstallDir, "skills"));
 
-  // 3. Runtime-specific user library (Claude-only or Codex-only
-  // operator install).
-  roots.push(join(homedir, runtimeDir, "skills"));
+  // 3. Runtime-specific user library (Claude-only or Codex-only operator install; Jcode
+  // additionally discovers its own and Claude roots, matching its native skill search contract).
+  roots.push(...runtimeSkillRoots(homedir, runtime, runtimeDir));
 
   // 4. Shared user-spec library (cross-runtime operator install via
   // `rig specs add`).
@@ -215,11 +225,9 @@ function listScanRoots(paths: SkillDiscoveryPaths): string[] {
 
 function rootToSourceKind(root: string, paths: SkillDiscoveryPaths): SourceKind {
   const runtimeDir = paths.runtime === "claude-code" ? ".claude" : ".agents";
-  const rigBundled = join(paths.cwd, runtimeDir, "skills");
-  if (root === rigBundled) return "rig_bundled";
+  if (runtimeSkillRoots(paths.cwd, paths.runtime, runtimeDir).includes(root)) return "rig_bundled";
   if (paths.specInstallDir && root === join(paths.specInstallDir, "skills")) return "spec_install";
-  const runtimeUser = join(paths.homedir, runtimeDir, "skills");
-  if (root === runtimeUser) return "runtime_user";
+  if (runtimeSkillRoots(paths.homedir, paths.runtime, runtimeDir).includes(root)) return "runtime_user";
   return "shared_user";
 }
 

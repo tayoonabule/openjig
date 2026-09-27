@@ -199,7 +199,7 @@ export type AgentsScope = `slice:${string}` | `mission:${string}` | "rig";
 
 export interface AgentRow {
   agentName: string;
-  runtime: "claude-code" | "codex" | "terminal" | "unknown";
+  runtime: "claude-code" | "codex" | "jcode" | "terminal" | "unknown";
   /** Honest-unknown when telemetry is down — never guessed. Parked is queue-proven. */
   stateGlyph: "active" | "parked" | "idle" | "unknown";
   /** The C6 plain-language "doing" line. */

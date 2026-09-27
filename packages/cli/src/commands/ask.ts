@@ -39,7 +39,7 @@ interface CliKnownTenure {
 }
 
 type WakeResolution =
-  | { resolved: true; token: string; runtime: "claude" | "codex"; sessionId: number }
+  | { resolved: true; token: string; runtime: "claude" | "codex" | "jcode"; sessionId: number }
   | { resolved: false; reason: string; known: CliKnownTenure[] };
 
 /** Parse a --wake seat target with an optional trailing @<generation>. A seat is
@@ -86,7 +86,7 @@ export function askCommand(depsOverride?: StatusDeps): Command {
     .option("--seat <session-name>", "Scope the search to ONE seat's transcript across every generation that sat in it (cross-generation archaeology)")
     .option("--session <token>", "Search ONE specific session's JSONL by its session token (read-only)")
     .option("--wake <target>", "EXECUTES: wake member@rig[@N], or pass a session ID or title to the runtime — ask one question, get a snapshot answer, back to cold (runtime cost; explicit, never an implicit escalation from a search)")
-    .option("--runtime <runtime>", "runtime for --wake: claude (default) or codex")
+    .option("--runtime <runtime>", "runtime for --wake: claude (default), codex, or jcode")
     .option("--wake-timeout <seconds>", "bounded wake timeout in seconds (default 180)")
     .addHelpText("after", `
 rig ask is one verb for information about the PAST, three ways to reach it:
@@ -148,7 +148,7 @@ Exit codes:
       }
 
       let token = target;
-      let runtime = opts.runtime ?? "claude";
+      let runtime: string = opts.runtime ?? "claude";
 
       if (target.includes("@")) {
         const status = await getDaemonStatus(deps.lifecycleDeps);
@@ -183,8 +183,8 @@ Exit codes:
       }
 
       if (runtime === "claude-code") runtime = "claude";
-      if (runtime !== "claude" && runtime !== "codex") {
-        console.error(`Wake runtime '${runtime || "unknown"}' is not supported. Supported runtimes are claude and codex.`);
+      if (runtime !== "claude" && runtime !== "codex" && runtime !== "jcode") {
+        console.error(`Wake runtime '${runtime || "unknown"}' is not supported. Supported runtimes are claude, codex, and jcode.`);
         process.exitCode = 1;
         return;
       }

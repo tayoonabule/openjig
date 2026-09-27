@@ -35,6 +35,18 @@ describe("System World", () => {
     expect(DEFAULT_SYSTEM_WORLD_MANIFEST).not.toContain("SKILL.md");
   });
 
+  it("accepts an explicit Jcode context profile without changing the pinned default", () => {
+    const manifest = DEFAULT_SYSTEM_WORLD_MANIFEST.replace(
+      "      codex: codex-coverage\n",
+      "      codex: codex-coverage\n      jcode: codex-coverage\n",
+    );
+
+    expect(parseSystemWorldManifest(manifest).context[1]).toEqual({
+      ref: "world-public",
+      profiles: { claude: "guided", codex: "codex-coverage", jcode: "codex-coverage" },
+    });
+  });
+
   it("resolves default, replacement, and disabled as distinct explicit states with provenance", () => {
     const contextRoot = freshRoot();
     mkdirSync(join(contextRoot, "system"));

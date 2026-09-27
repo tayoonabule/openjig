@@ -112,7 +112,7 @@ interface WorkflowStepData {
   preferredTarget: string | null;
   isEntry: boolean;
   isTerminal: boolean;
-  harness?: "claude-code" | "codex";
+  harness?: "claude-code" | "codex" | "jcode";
   host?: string;
   gate?: { target: string; summary?: string; evidence_ref?: string };
   isCurrent: boolean;

@@ -111,7 +111,7 @@ export interface RungDeclaration {
  *  never inherits its predecessor's rung authority. */
 export interface AdapterRungInventory {
   adapterId: string;
-  runtime: "claude-code" | "codex" | "pi" | "omp" | "tmux-generic" | "community-harness" | "community-runner";
+  runtime: "claude-code" | "codex" | "jcode" | "pi" | "omp" | "tmux-generic" | "community-harness" | "community-runner";
   rungs: RungDeclaration[];
 }
 
@@ -249,6 +249,18 @@ export const COMMUNITY_RUNNER_RUNG_INVENTORY: AdapterRungInventory = {
   rungs: RUNNER_ACTIVITY_RUNGS,
 };
 
+/** Jcode's activity-relay.cjs hooks (turn_start/turn_end/session_start/session_end) give the
+ *  same four-event lifecycle coverage as Codex, so this inventory mirrors CODEX's exactly:
+ *  hooks enter at TRIAL, sampling stays the authoritative floor. */
+export const JCODE_ACTIVITY_RUNG_INVENTORY: AdapterRungInventory = {
+  adapterId: "jcode-runtime-adapter",
+  runtime: "jcode",
+  rungs: [
+    { rung: "lifecycle-hooks", lifecycleCoverage: "full", initialTrust: "trial" },
+    { rung: "window-sampling", lifecycleCoverage: "full", initialTrust: "authoritative" },
+  ],
+};
+
 /** Resolve a runtime string to its rung inventory (the ingest auto-declaration path).
  *  Unknown runtimes get the generic floor — partial-coverage honesty by default. A seat launched for a community
  *  community harness (its session's recorded selection, still the node's runtime) gets that app's inventory. */
@@ -258,5 +270,6 @@ export function runtimeRungInventory(runtime: string | null, communityHarness?: 
   if (runtime === "pi") return PI_ACTIVITY_RUNG_INVENTORY;
   if (runtime === "omp") return OMP_ACTIVITY_RUNG_INVENTORY;
   if (communityHarnessOf(communityHarness, runtime)) return communityRunner === true ? COMMUNITY_RUNNER_RUNG_INVENTORY : COMMUNITY_HARNESS_RUNG_INVENTORY;
+  if (runtime === "jcode") return JCODE_ACTIVITY_RUNG_INVENTORY;
   return TMUX_GENERIC_RUNG_INVENTORY;
 }

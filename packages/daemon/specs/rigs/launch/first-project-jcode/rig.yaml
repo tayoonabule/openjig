@@ -1,0 +1,31 @@
+# openjig: copy of ../first-project/rig.yaml with every seat on jcode. Keep in sync by hand
+# when upstream changes it.
+version: "0.2"
+name: first-project-jcode
+summary: >-
+  jcode variant of first-project: every agent seat runs on jcode with a model sized to its role. Two jcode seats in your repository: an outcome owner and an independent checker. Give the owner one bounded change; follow the durable result and continue at the same address. See docs/reference/getting-started.md.
+
+culture_file: CULTURE.md
+
+pods:
+  - id: dev
+    label: Project
+    members:
+      - id: owner
+        agent_ref: "local:../../../agents/development/implementer"
+        runtime: jcode
+        model: gpt-6-astra
+        profile: default
+        cwd: "."
+      - id: check
+        agent_ref: "local:../../../agents/development/qa"
+        runtime: jcode
+        model: gpt-6-astra
+        profile: default
+        cwd: "."
+    edges:
+      - kind: delegates_to
+        from: owner
+        to: check
+
+edges: []

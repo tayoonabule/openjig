@@ -604,6 +604,12 @@ show it alongside the team and launch command before proceeding. Confirm account
 ask for a supported model choice rather than silently substituting a model or
 provider. After launch, confirm the actual native model before assigning work.
 
+Set `starter` to the chosen name from the table; the existing Codex route remains.
+`rig setup` also checks the optional Jcode harness without installing it; a
+missing Jcode is a warning. Its overall result can include optional components,
+so read the individual selected-provider results rather than treating an unused
+provider's absence as a blocker.
+
 ### Launch the starter team
 
 ```sh

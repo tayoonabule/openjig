@@ -75,8 +75,8 @@ export function skillCommand(depsOverride?: StatusDeps): Command {
 
   cmd
     .command("loadout")
-    .description("Inspect or reconcile the composed managed skill loadout for one Claude/Codex working directory, or (with --seat) one seat's own skills")
-    .option("--runtime <runtime>", "Target runtime: claude-code or codex (folder mode; required there)")
+    .description("Inspect or reconcile the composed managed skill loadout for one Claude, Codex, or Jcode working directory, or (with --seat) one seat's own skills")
+    .option("--runtime <runtime>", "Target runtime: claude-code, codex, or jcode (folder mode; required there)")
     .option("--seat <session>", "Seat mode: a seat's own skills, kept outside the project. `self` is this seat (its OPENRIG_SESSION_NAME)")
     .option("--wait-for-idle <ms>", "Seat mode with --apply: wait up to this long for the seat to be idle before telling it")
     .option("--resend", "Seat mode with --apply: send this list again after an earlier attempt that failed or wasn't confirmed, once you've checked the seat")
@@ -105,8 +105,8 @@ export function skillCommand(depsOverride?: StatusDeps): Command {
         process.exitCode = 1;
         return;
       }
-      if (opts.runtime !== "claude-code" && opts.runtime !== "codex") {
-        console.error("invalid_runtime: --runtime must be claude-code or codex");
+      if (opts.runtime !== "claude-code" && opts.runtime !== "codex" && opts.runtime !== "jcode") {
+        console.error("invalid_runtime: --runtime must be claude-code, codex, or jcode");
         process.exitCode = 1;
         return;
       }

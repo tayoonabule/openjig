@@ -34,6 +34,8 @@ export type RuntimeAuthStatus = "ok" | "unavailable";
 export interface RuntimeProbeResult {
   claudeCode: RuntimeAuthStatus;
   codex: RuntimeAuthStatus;
+  /** TUI-selected Jcode kernel; auto-boot still selects only existing variants. */
+  jcode?: RuntimeAuthStatus;
 }
 
 export interface KernelBootDeps {
@@ -53,9 +55,11 @@ export interface KernelBootDeps {
    *  a fixture path. */
   cwdOverride: string;
   /** Runtime auth probe — defaults to live shellouts; tests inject. */
-  probeRuntimes?: () => Promise<RuntimeProbeResult>;
+  probeRuntimes?: (includeJcode?: boolean) => Promise<RuntimeProbeResult>;
   /** The providers the person chose at `rig setup --providers` (`provider.selected`); defaults to the setting. */
   selectedProviders?: () => string;
+  /** openjig: `kernel.runtime` setting. "auto" (default) keeps the upstream probe order. */
+  preferredRuntime?: string;
   /** Logger sink; defaults to console.log/warn so daemon stdout/stderr
    *  carry the boot trace. */
   log?: (level: "info" | "warn" | "error", message: string) => void;
@@ -124,18 +128,27 @@ export async function bootKernelIfNeeded(deps: KernelBootDeps): Promise<KernelBo
     return tracker;
   }
 
-  // 3. Probe runtime auth state to pick a variant. A provider the person didn't choose at setup counts as unavailable.
+  // 3. Probe runtime auth state to pick a variant. A Claude/Codex provider the
+  // person did not choose at setup counts as unavailable. Jcode remains an
+  // explicit kernel-runtime choice and is probed lazily unless selected.
   const selected = (deps.selectedProviders ?? readSelectedProviders)();
-  const probe = chosenRuntimes(await (deps.probeRuntimes ?? defaultProbeRuntimes)(), selected);
+  const preferred = deps.preferredRuntime ?? "auto";
+  const probeRuntimes = deps.probeRuntimes ?? defaultProbeRuntimes;
+  let probe = chosenRuntimes(await probeRuntimes(preferred === "jcode"), selected);
+  // Jcode is probed lazily so Claude/Codex kernels never wait on its CLI.
+  if (probe.claudeCode === "unavailable" && probe.codex === "unavailable" && probe.jcode === undefined) {
+    probe = { ...probe, ...await probeRuntimes(true) };
+    probe = chosenRuntimes(probe, selected);
+  }
 
-  if (probe.claudeCode === "unavailable" && probe.codex === "unavailable") {
+  if (probe.claudeCode === "unavailable" && probe.codex === "unavailable" && probe.jcode !== "ok") {
     const msg = authBlockMessage(selected);
     log("error", msg);
     tracker.setAuthBlocked(msg);
     return tracker;
   }
 
-  const variant = selectVariant(probe);
+  const variant = selectVariant(probe, preferred);
   const specPath = nodePath.join(deps.specsDir, "rigs/launch/kernel", variant);
 
   if (!existsSync(specPath)) {
@@ -250,21 +263,35 @@ export function chosenRuntimes(probe: RuntimeProbeResult, selected: string): Run
   return {
     claudeCode: chosen.includes("claude") ? probe.claudeCode : "unavailable",
     codex: chosen.includes("codex") ? probe.codex : "unavailable",
+    ...(probe.jcode === undefined ? {} : { jcode: probe.jcode }),
   };
 }
 
-/** Choose a rig variant from the auth probe. */
-export function selectVariant(probe: RuntimeProbeResult): string {
+/** Choose a rig variant from the auth probe. An authenticated preferred
+ *  runtime wins; otherwise the upstream order applies. */
+export function selectVariant(probe: RuntimeProbeResult, preferred = "auto"): string {
+  if (preferred === "jcode" && probe.jcode === "ok") return "rig-jcode-only.yaml";
+  if (preferred === "codex" && probe.codex === "ok") return "rig-codex-only.yaml";
+  if (preferred === "claude-code" && probe.claudeCode === "ok") return "rig-claude-only.yaml";
   if (probe.claudeCode === "ok" && probe.codex === "ok") return "rig.yaml";
   if (probe.claudeCode === "ok") return "rig-claude-only.yaml";
   if (probe.codex === "ok") return "rig-codex-only.yaml";
+  if (probe.jcode === "ok") return "rig-jcode-only.yaml";
   // Caller is expected to short-circuit before reaching here on the
   // both-unavailable path; defensive default keeps the type narrow.
   return "rig.yaml";
 }
 
 /** Default auth probe — shells out to the runtime CLIs. */
-export async function defaultProbeRuntimes(): Promise<RuntimeProbeResult> {
+export function parseJcodeAuthStatus(output: string): RuntimeAuthStatus {
+  try {
+    return JSON.parse(output).any_available === true ? "ok" : "unavailable";
+  } catch {
+    return "unavailable";
+  }
+}
+
+export async function defaultProbeRuntimes(includeJcode = false): Promise<RuntimeProbeResult> {
   const { exec } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const execAsync = promisify(exec);
@@ -286,7 +313,16 @@ export async function defaultProbeRuntimes(): Promise<RuntimeProbeResult> {
   }
 
   const codexHome = process.env.CODEX_HOME || nodePath.join(os.homedir(), ".codex");
-  const [claudeCode, codex] = await Promise.all([
+  async function probeJcode(): Promise<RuntimeAuthStatus> {
+    try {
+      const { stdout } = await execAsync("jcode --quiet auth status --json", { timeout: 5000 });
+      return parseJcodeAuthStatus(stdout);
+    } catch {
+      return "unavailable";
+    }
+  }
+
+  const [claudeCode, codex, jcode] = await Promise.all([
     tryProbe("claude auth status"),
     probeCodexReadiness({
       run: tryProbe,
@@ -295,9 +331,11 @@ export async function defaultProbeRuntimes(): Promise<RuntimeProbeResult> {
       },
       env: process.env,
     }),
+    // The Jcode CLI may take five seconds; unrelated kernel paths must not wait for it.
+    includeJcode ? probeJcode() : Promise.resolve(undefined),
   ]);
 
-  return { claudeCode, codex };
+  return jcode === undefined ? { claudeCode, codex } : { claudeCode, codex, jcode };
 }
 
 /** Issue #194 — how the Codex provider selected in `$CODEX_HOME/config.toml`

@@ -86,11 +86,12 @@ describe("composeProfile — the situation algebra over ONE atom graph (mini-req
 });
 
 describe("composeProfile — runtime split (mini-req 3)", () => {
-  it("claude and codex compose measurably different profiles from the same graph", () => {
+  it("claude, codex, and jcode compose measurably different profiles from the same graph", () => {
     const graph = [
       ...GRAPH,
       atom({ id: "claude-only", address: "walk.md", order: 4, runtime: "claude", situations: ["fresh"] }),
       atom({ id: "codex-only", address: "walk.md", order: 5, runtime: "codex", situations: ["fresh"] }),
+      atom({ id: "jcode-only", address: "walk.md", order: 6, runtime: "jcode", situations: ["fresh"] }),
     ];
     const claude = composeProfile({ atoms: graph, situation: "fresh", runtime: "claude", readFile });
     const codex = composeProfile({ atoms: graph, situation: "fresh", runtime: "codex", readFile });
@@ -98,6 +99,11 @@ describe("composeProfile — runtime split (mini-req 3)", () => {
     expect(claude.pieces.map((p) => p.atomId)).not.toContain("codex-only");
     expect(codex.pieces.map((p) => p.atomId)).toContain("codex-only");
     expect(codex.pieces.map((p) => p.atomId)).not.toContain("claude-only");
+    expect(codex.pieces.map((p) => p.atomId)).not.toContain("jcode-only");
+    const jcode = composeProfile({ atoms: graph, situation: "fresh", runtime: "jcode", readFile });
+    expect(jcode.pieces.map((p) => p.atomId)).toContain("jcode-only");
+    expect(jcode.pieces.map((p) => p.atomId)).not.toContain("claude-only");
+    expect(jcode.pieces.map((p) => p.atomId)).not.toContain("codex-only");
   });
 
   it("a requires-closure that crosses the runtime filter FAILS LOUD (never a thinned walk)", () => {

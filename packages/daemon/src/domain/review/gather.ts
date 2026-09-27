@@ -741,7 +741,7 @@ export class ReviewGatherer {
         }
       }
       const normalizedRuntime =
-        runtime === "claude-code" || runtime === "codex" || runtime === "terminal" ? runtime : ("unknown" as const);
+        runtime === "claude-code" || runtime === "codex" || runtime === "jcode" || runtime === "terminal" ? runtime : ("unknown" as const);
       return { ...a, runtime: normalizedRuntime, idle, idleSinceIso };
     });
   }

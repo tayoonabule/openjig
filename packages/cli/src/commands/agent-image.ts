@@ -26,7 +26,7 @@ interface AgentImageEntryWire {
   kind: "agent-image";
   name: string;
   version: string;
-  runtime: "claude-code" | "codex";
+  runtime: "claude-code" | "codex" | "jcode";
   sourceSeat: string;
   sourceSessionId: string;
   notes: string | null;
@@ -126,7 +126,7 @@ Examples:
 
   cmd.command("list")
     .description("List all agent images in the library")
-    .option("--runtime <runtime>", "Filter by runtime (claude-code | codex)")
+    .option("--runtime <runtime>", "Filter by runtime (claude-code | codex | jcode)")
     .option("--json", "JSON output")
     .action(async (opts: { runtime?: string; json?: boolean }) => {
       try {

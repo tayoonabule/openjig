@@ -142,7 +142,7 @@ export function DiscoveryPanel({
   const panelIsRemote = useSelectedHostId() !== LOCAL_HOST_ID;
   const { data: sessions = [] } = useDiscoveredSessions({
     status: "active",
-    runtimeHint: ["claude-code", "codex"],
+    runtimeHint: ["claude-code", "codex", "jcode"],
     minConfidence: "medium",
   });
   const scanMutation = useDiscoveryScan();

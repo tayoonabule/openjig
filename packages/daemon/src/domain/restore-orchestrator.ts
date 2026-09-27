@@ -25,6 +25,7 @@ import type { ClaudeResumeAdapter } from "../adapters/claude-resume.js";
 import type { CodexResumeAdapter } from "../adapters/codex-resume.js";
 import { seatRuntimeHome } from "./seat-runtime-home.js";
 import { readFreshOccupantRelations } from "./fresh-occupant-relation.js";
+import type { JcodeResumeAdapter } from "../adapters/jcode-resume.js";
 import type { PiResumeAdapter } from "../adapters/pi-resume.js";
 import type { OmpResumeAdapter } from "../adapters/omp-resume.js";
 import type { TranscriptStore } from "./transcript-store.js";
@@ -123,8 +124,10 @@ export function rollupRestoreRigResult(nodes: RestoreNodeResult[]): RestoreRigRe
   if (allFailed) return "failed";
   // A seat running without part of its guidance keeps its own status; the rig isn't fully restored.
   if (nodes.some((node) => (node.guidanceGaps?.length ?? 0) > 0)) return "partially_restored";
-  // A fresh launch loses a seat's conversation, except for a terminal seat, which has none.
-  const lostConversation = (node: RestoreNodeResult) => (node.status === "fresh" || node.status === "fresh-primed") && !node.noConversation;
+  // A fresh launch loses a conversation unless this is an explicitly no-conversation terminal seat.
+  const lostConversation = (node: RestoreNodeResult) =>
+    (node.status === "fresh" || node.status === "fresh-primed") && !node.noConversation
+      && !(node.runtime === "terminal" && node.status === "fresh-primed");
   if (nodes.some((node) => lostConversation(node) || node.status === "awaiting-decision" || node.status === "failed" || node.status === "attention_required")) {
     return "partially_restored";
   }
@@ -230,6 +233,7 @@ interface RestoreOrchestratorDeps {
   tmuxAdapter: TmuxAdapter;
   claudeResume: ClaudeResumeAdapter;
   codexResume: CodexResumeAdapter;
+  jcodeResume?: JcodeResumeAdapter;
   /** OPR.0.4.6.PI1 FR-6 — optional so older wiring/tests keep working; a Pi
    *  resume without the adapter falls through to the honest no-adapter error. */
   piResume?: PiResumeAdapter;
@@ -261,6 +265,7 @@ export class RestoreOrchestrator {
   private tmuxAdapter: TmuxAdapter;
   private claudeResume: ClaudeResumeAdapter;
   private codexResume: CodexResumeAdapter;
+  private jcodeResume: JcodeResumeAdapter | null;
   private piResume: PiResumeAdapter | null;
   private ompResume: OmpResumeAdapter | null;
   private transcriptStore: TranscriptStore | null;
@@ -304,6 +309,7 @@ export class RestoreOrchestrator {
     this.tmuxAdapter = deps.tmuxAdapter;
     this.claudeResume = deps.claudeResume;
     this.codexResume = deps.codexResume;
+    this.jcodeResume = deps.jcodeResume ?? null;
     this.piResume = deps.piResume ?? null;
     this.ompResume = deps.ompResume ?? null;
     this.transcriptStore = deps.transcriptStore ?? null;
@@ -523,7 +529,8 @@ export class RestoreOrchestrator {
         }
         const replacement = replacements.find(target => target.nodeId === entry.node.id);
         const result = await this.restoreNodeWithCompensation(entry, rigId, snapshotId, snapshot.data, opts, restoreWarnings, stoppedNodeIds.has(entry.node.id));
-        nodeResults.push(result);
+        const taggedResult = entry.node.runtime === "terminal" ? { ...result, runtime: "terminal" as const } : result;
+        nodeResults.push(taggedResult);
         if (replacement && (this.db.prepare("SELECT status FROM sessions WHERE id = ?").get(replacement.sessionId) as { status: string } | undefined)?.status === "exited") {
           restoreWarnings.push(`Stopped ${entry.node.logicalId}'s startup occupant for explicit replacement; replacement outcome: ${result.status}.`);
         }
@@ -775,7 +782,7 @@ export class RestoreOrchestrator {
       const result = await this.restoreNodeWithCompensation(
         planEntry, rigId, snapshot.id, snapshot.data, { adapters: opts?.adapters, fsOps: opts?.fsOps, selectedHistory: opts.selectedHistory, resumePeriodicCarry }, subsetWarnings,
       );
-      launched.push(result);
+      launched.push(node.runtime === "terminal" ? { ...result, runtime: "terminal" } : result);
     }
 
     // Emit restore.subset_completed for launched targets only
@@ -1175,8 +1182,9 @@ export class RestoreOrchestrator {
       const snapSession = resumeSession;
       const policy = effectiveRestorePolicy(seatFacts(data, nodeId, node.runtime, liveNode ? liveNode.runtime : node.runtime), snapSession?.restorePolicy);
       const resumeSourceRecorded = !!snapSession?.resumeType && snapSession.resumeType !== "none";
-      // A community harness that can't resume this seat's token (launch-only, or a former runtime's id) stops here; a seat
-      // with no token goes on to the "no resume token" stop below.
+      // A community harness that can't resume this seat's token stops here; a seat
+      // with no token goes on to the no-token stop below. Plain terminals have no
+      // conversation, so their missing resume token does not block a fresh start.
       if (policy === "resume_if_possible" && snapSession && !freshRequested && communityHarnessOf(snapSession.communityHarness, node.runtime)
         && communityHarnessStopsRestore(node.runtime, snapSession.resumeType, snapSession.resumeToken)) {
         return {
@@ -1186,7 +1194,8 @@ export class RestoreOrchestrator {
           error: communityLaunchOnlyRestoreReason(node.runtime, node.logicalId, this.rigRepo.getRig(rigId)?.rig.name ?? data.rig.name),
         };
       }
-      if (policy === "resume_if_possible" && snapSession && !snapSession.resumeToken && !freshRequested) {
+      if (policy === "resume_if_possible" && snapSession && !snapSession.resumeToken && !freshRequested
+        && node.runtime !== "terminal") {
         const sourceNote = resumeSourceRecorded
           ? `resume source '${snapSession?.resumeType}' recorded but no token available`
           : `no resume token was captured for this seat`;
@@ -2327,9 +2336,18 @@ export class RestoreOrchestrator {
       return { kind: "failed", message: result.message };
     }
 
-    // OPR.0.4.6.PI1 FR-6 — honest session-file continuation. A missing
-    // session file returns retry_fresh, which the caller maps to the
-    // awaiting-decision stop-and-ask — never a silent fresh start (BR-6).
+    if (this.jcodeResume?.canResume(resumeType, resumeToken)) {
+      const result = await this.jcodeResume.resume(sessionName, resumeType, resumeToken, cwd, model);
+      if (result.ok) {
+        if (result.appliedLaunch && launchGeneration) this.appliedLaunchStore.recordGeneration(launchGeneration, result.appliedLaunch);
+        return { kind: "resumed" };
+      }
+      if (result.code === "retry_fresh") return { kind: "retry_fresh" };
+      if (result.code === "attention_required") return { kind: "attention_required", message: result.message, evidence: "evidence" in result ? result.evidence : undefined };
+      return { kind: "failed", message: result.message };
+    }
+
+    // Pi's missing session file returns retry_fresh for operator decision.
     if (this.piResume?.canResume(resumeType, resumeToken)) {
       const result = await this.piResume.resume(sessionName, resumeType, resumeToken, cwd, model, resolvedPosture, effort);
       if (result.ok) {
@@ -2509,9 +2527,9 @@ export class RestoreOrchestrator {
       ...(runtime === "claude-code" ? { claudeResumeIdentityVerified } : {}),
       ...(runtime === "codex" ? { codexProcessVerified: true } : {}),
     });
-    const fgProcess = runtime === "claude-code" ? "claude" as const : runtime === "codex" ? "codex" as const : null;
+    const fgProcess = runtime === "claude-code" ? "claude" as const : runtime === "codex" ? "codex" as const : runtime === "jcode" ? "jcode" as const : null;
     if (!fgProcess) {
-      return { ok: false, code: "fg_process_not_runtime", detail: `Node runtime is ${runtime ?? "unknown"}, not claude/codex.` };
+      return { ok: false, code: "fg_process_not_runtime", detail: `Node runtime is ${runtime ?? "unknown"}, not claude/codex/jcode.` };
     }
 
     // Precondition #4: pane is at a usable/idle state — explicitly NOT a

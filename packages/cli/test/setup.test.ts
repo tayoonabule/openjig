@@ -21,6 +21,7 @@ function makeDeps(overrides?: Partial<SetupDeps>): SetupDeps {
       if (cmd === "claude auth status") return "Authenticated\n";
       if (cmd === "codex --version") return "codex-cli 0.118.0\n";
       if (cmd === "codex login status") return "Logged in\n";
+      if (cmd === "jcode --version") return "jcode v0.88.97\n";
       if (cmd === "jq --version") return "jq-1.7\n";
       if (cmd === "gh --version") return "gh 2.0\n";
       return "";
@@ -134,6 +135,7 @@ describe("rig setup", () => {
     expect(stepIds).toContain("claude_auth");
     expect(stepIds).toContain("codex_install");
     expect(stepIds).toContain("codex_auth");
+    expect(stepIds).toContain("jcode_check");
     expect(stepIds).toContain("tmux_config");
     expect(stepIds).toContain("verify");
     // No full-profile extras
@@ -164,6 +166,7 @@ describe("rig setup", () => {
     expect(stepIds).toContain("claude_auth");
     expect(stepIds).toContain("codex_install");
     expect(stepIds).toContain("codex_auth");
+    expect(stepIds).toContain("jcode_check");
     expect(stepIds).toContain("tmux_config");
     expect(stepIds).toContain("verify");
     // Full extras added
@@ -212,6 +215,25 @@ describe("rig setup", () => {
     expect(dry.steps.find((s) => s.id === "herdr_install")).toEqual({ id: "herdr_install", status: "skipped", message: "Dry run: herdr_install would be attempted." });
   });
 
+  it("reports missing Jcode as optional and does not install it", async () => {
+    const seen: string[] = [];
+    const baseDeps = makeDeps();
+    const deps = makeDeps({
+      exec: (cmd: string) => {
+        seen.push(cmd);
+        if (cmd === "jcode --version") throw new Error("command not found: jcode");
+        return baseDeps.exec(cmd);
+      },
+    });
+
+    const result = await runSetup(deps, {});
+    const jcode = result.steps.find((step) => step.id === "jcode_check");
+
+    expect(jcode?.status).toBe("warn");
+    expect(jcode?.fixHint).toContain("https://github.com/1jehuang/jcode");
+    expect(seen.filter((cmd) => cmd.includes("jcode"))).toEqual(["jcode --version"]);
+  });
+
   it("core profile execution with all tools present returns pass/applied steps and ready=true", async () => {
     const writeSpy = vi.fn();
     const deps = makeDeps({ writeFile: writeSpy });
@@ -240,6 +262,9 @@ describe("rig setup", () => {
 
     const codexAuth = result.steps.find((s) => s.id === "codex_auth");
     expect(codexAuth?.status).toBe("pass");
+
+    const jcode = result.steps.find((s) => s.id === "jcode_check");
+    expect(jcode?.status).toBe("pass");
 
     const tmuxConfig = result.steps.find((s) => s.id === "tmux_config");
     expect(tmuxConfig?.status).toBe("applied");

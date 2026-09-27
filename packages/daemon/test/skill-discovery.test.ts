@@ -55,7 +55,7 @@ afterEach(() => {
   rmSync(tmpRoot, { recursive: true, force: true });
 });
 
-function pathsFor(runtime: "claude-code" | "codex"): SkillDiscoveryPaths {
+function pathsFor(runtime: "claude-code" | "codex" | "jcode"): SkillDiscoveryPaths {
   return { runtime, homedir, cwd, specInstallDir };
 }
 
@@ -185,6 +185,23 @@ describe("discoverSkillsForRuntime — Codex-runtime path scanning", () => {
     const result = discoverSkillsForRuntime(pathsFor("codex"));
     const ids = result.skills.map((s) => s.id);
     expect(ids).not.toContain("claude-only");
+  });
+});
+
+describe("discoverSkillsForRuntime — Jcode-runtime path scanning", () => {
+  it("discovers Jcode, Codex-layout, and Claude-layout project and user skills", () => {
+    writeSkill(join(cwd, ".jcode/skills/jcode-project"), { name: "jcode-project", description: "Jcode project skill" });
+    writeSkill(join(cwd, ".agents/skills/agents-project"), { name: "agents-project", description: "Shared agents project skill" });
+    writeSkill(join(cwd, ".claude/skills/claude-project"), { name: "claude-project", description: "Claude-compatible project skill" });
+    writeSkill(join(homedir, ".jcode/skills/jcode-user"), { name: "jcode-user", description: "Jcode user skill" });
+    writeSkill(join(homedir, ".agents/skills/agents-user"), { name: "agents-user", description: "Shared agents user skill" });
+    writeSkill(join(homedir, ".claude/skills/claude-user"), { name: "claude-user", description: "Claude-compatible user skill" });
+
+    const ids = discoverSkillsForRuntime(pathsFor("jcode")).skills.map((skill) => skill.id);
+    expect(ids).toEqual(expect.arrayContaining([
+      "jcode-project", "agents-project", "claude-project",
+      "jcode-user", "agents-user", "claude-user",
+    ]));
   });
 });
 

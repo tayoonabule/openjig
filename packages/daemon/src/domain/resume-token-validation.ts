@@ -9,7 +9,7 @@
 // actually resume" probe is intentionally out of scope (heavy + must not
 // mutate live state); format validation is the safe, side-effect-free floor.
 
-export type ResumeType = "claude_id" | "codex_id" | "pi_session_file" | "omp_session_file";
+export type ResumeType = "claude_id" | "codex_id" | "jcode_id" | "pi_session_file" | "omp_session_file";
 
 export interface ResumeTokenValidationOk {
   ok: true;
@@ -25,6 +25,7 @@ export interface ResumeTokenValidationErr {
 
 const SAFE_TOKEN_RE = /^[A-Za-z0-9._-]+$/;
 const MAX_TOKEN_LEN = 200;
+const JCODE_SESSION_RE = /^session_[a-z0-9-]+_\d{10,}_[0-9a-f]{8,}$/;
 
 // Pi/OMP session files: absolute path, no ".." segment (checked on the raw
 // operand before normalization), shell-inert charset, 1024-char cap, and
@@ -46,6 +47,7 @@ const SESSION_FILE_SUFFIX = ".jsonl";
 export function resumeTypeForRuntime(runtime: string | null): ResumeType | null {
   if (runtime === "claude-code") return "claude_id";
   if (runtime === "codex") return "codex_id";
+  if (runtime === "jcode") return "jcode_id";
   if (runtime === "pi") return "pi_session_file";
   if (runtime === "omp") return "omp_session_file";
   return null;
@@ -95,7 +97,7 @@ export function validateResumeToken(
   if (!resumeType) {
     return {
       ok: false,
-      error: `set-resume-token is not supported for runtime "${runtime ?? "unknown"}" (only claude-code, codex, pi, and omp have resume tokens).`,
+      error: `set-resume-token is not supported for runtime "${runtime ?? "unknown"}" (only claude-code, codex, jcode, pi, and omp have resume tokens).`,
     };
   }
   if (typeof rawToken !== "string") {
@@ -107,6 +109,9 @@ export function validateResumeToken(
   }
   if (resumeType === "pi_session_file" || resumeType === "omp_session_file") {
     return validateSessionFileToken(resumeType, token);
+  }
+  if (resumeType === "jcode_id" && !JCODE_SESSION_RE.test(token)) {
+    return { ok: false, error: "Jcode resume token must be a valid session id." };
   }
   return validateIdShapedToken(resumeType, token);
 }

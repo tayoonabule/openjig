@@ -70,6 +70,11 @@ files: []
     expect(() => parseAgentImageManifest("name: x\nversion: 1\nruntime: bash\nsource_seat: x\nsource_session_id: s\nsource_resume_token: t\nfiles: []", "/x.yaml")).toThrow(/runtime/);
   });
 
+  it("accepts a Jcode image manifest for discovery and display", () => {
+    const manifest = parseAgentImageManifest(validManifest.replace("runtime: claude-code", "runtime: jcode"), "/jcode.yaml");
+    expect(manifest.runtime).toBe("jcode");
+  });
+
   it("rejects missing source_seat", () => {
     expect(() => parseAgentImageManifest("name: x\nversion: 1\nruntime: claude-code\nsource_session_id: s\nsource_resume_token: t\nfiles: []", "/x.yaml")).toThrow(/source_seat/);
   });

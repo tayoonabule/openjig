@@ -57,6 +57,9 @@ import type { FollowControls } from "./terminal-follow-policy.js";
 // the starting tab. Otherwise the starting tab is kept and the result says so. Both methods are in
 // herdr 0.7.1's socket API (`herdr tab focus|close <tab_id>`); a refusal of either
 // is reported as a note, never as a failed seat.
+// The create's default tab (a blank pane) is replaced by the first page via
+// `layout.apply {tab_id}` when the create reply exposes that id. This avoids a
+// stray blank tab; when unavailable, retain the workspace-based fallback.
 
 import type {
   AbsentSeat,
@@ -74,6 +77,7 @@ import type {
   HerdrTransportFactory,
 } from "./herdr-transport.js";
 import { buildTileGrid, planTileLabels, type TileGrid, type TileNodes } from "./tile-layout.js";
+import type { HerdrAgentBridge } from "./jcode-herdr-agent-bridge.js";
 
 /** Sentinel host for herdr-surface degrades (a pane herdr itself failed to render). */
 const HERDR_SURFACE_HOST = "herdr";
@@ -248,9 +252,17 @@ export interface HerdrPagePlan {
 }
 
 export interface HerdrLayoutPlan {
-  /** The label for the fresh per-open workspace (same token discipline as tabs). */
+  /**
+   * The human-readable sidebar label for the workspace (`kernel` for `rig:kernel`).
+   * Reuse never keys on it: the tab label carries the stable `<prefix>:<view.id>#` key.
+   */
   workspaceLabel: string;
   pages: HerdrPagePlan[];
+}
+
+/** Sidebar name for a view: the rig name for `rig:<name>`, the view id otherwise. */
+export function readableWorkspaceLabel(viewId: string): string {
+  return viewId.startsWith("rig:") ? viewId.slice("rig:".length) : viewId;
 }
 
 /**
@@ -299,6 +311,7 @@ export function extractWorkspaceId(result: HerdrResult): string | null {
   return null;
 }
 
+/** The default tab `workspace.create` makes (`result.tab.tab_id`), or null on older builds. */
 export interface HerdrAdapterDeps {
   following?: HerdrFollowView;
   viewer?: HerdrViewer;
@@ -314,6 +327,8 @@ export interface HerdrAdapterDeps {
   tabPrefix?: string;
   /** The wait between restart-command report rounds. Injectable for tests. */
   sleep?: (ms: number) => Promise<void>;
+  /** Optional best-effort external agent reporter for panes created by this adapter. */
+  agentBridge?: Pick<HerdrAgentBridge, "registerLayout">;
 }
 
 /** The applied pane ids of a page, in its leaf order, when Herdr's reply echoes exactly the requested tree. */
@@ -513,6 +528,38 @@ export class HerdrAdapter implements TerminalProvider {
       };
     }
 
+    // An existing workspace is reused only to fill roster growth. A relaunch with
+    // the same complete roster continues to the fresh-workspace path below, so it
+    // cannot replace or silently reuse the prior launch's tiles.
+    try {
+      const prefix = `${this.tabPrefix}:${view.id}#`;
+      const keyed = (rows: unknown) =>
+        ((rows as Array<{ workspace_id?: string; label?: string }> | undefined) ?? []).find(
+          (r) => typeof r.label === "string" && r.label.startsWith(prefix) && r.workspace_id,
+        );
+      const tabs = await this.transport.request("tab.list", {}).catch(() => ({}) as HerdrResult);
+      const existingId =
+        keyed(tabs["tabs"])?.workspace_id ??
+        keyed((await this.transport.request("workspace.list", {}))["workspaces"])?.workspace_id;
+      if (existingId) {
+        const panes = await this.transport.request("pane.list", { workspace_id: existingId });
+        const labels = new Set(
+          ((panes["panes"] as Array<{ label?: unknown }> | undefined) ?? [])
+            .map((pane) => pane.label)
+            .filter((label): label is string => typeof label === "string"),
+        );
+        if (view.opened.some((pane) => !labels.has(pane.label))) {
+          await this.transport
+            .request("workspace.rename", { workspace_id: existingId, label: plan.workspaceLabel })
+            .catch(() => undefined);
+          await this.transport.request("workspace.focus", { workspace_id: existingId });
+          return this.fillExisting(existingId, view, launchToken, { absent, degraded });
+        }
+      }
+    } catch {
+      // An older Herdr without workspace.list keeps the open-fresh behaviour.
+    }
+
     // A fresh workspace per open (BR-5 fresh-on-relaunch, strongest form).
     // Herdr accepts a duplicate label, so a re-open would otherwise sit beside the earlier
     // view under the same name. The existing labels are read first: when this rig's view is
@@ -523,6 +570,8 @@ export class HerdrAdapter implements TerminalProvider {
     // otherwise fall back ONCE to a bare create before degrading.
     const notes: string[] = [];
     let workspaceId: string | null = null;
+    // The created workspace's own default tab: the first page replaces it, so
+    // the user never lands on a stray blank shell tab beside the view.
     let defaultTabId: string | null = null;
     let createErr: unknown = null;
     let label = plan.workspaceLabel;
@@ -613,13 +662,17 @@ export class HerdrAdapter implements TerminalProvider {
       const pagePanes = view.pages[pageIndex]!;
       try {
         // ONE atomic layout.apply for the whole page (capture-verified shape).
-        const applied = await this.transport.request("layout.apply", {
-          workspace_id: workspaceId,
+        // Herdr takes either tab_id (replace that tab) or workspace_id (new tab).
+        const target = pageIndex === 0 && defaultTabId
+          ? { tab_id: defaultTabId }
+          : { workspace_id: workspaceId };
+        const layoutResult = await this.transport.request("layout.apply", {
+          ...target,
           tab_label: pagePlan.tabLabel,
           focus: true,
           root: pagePlan.root,
         });
-        const tabId = extractTabId(applied);
+        const tabId = extractTabId(layoutResult);
         // Without a tab id the page's panes can't be told apart from other tabs, so no check runs.
         const uncertain = new Set<string>();
         const gone = tabId
@@ -629,7 +682,7 @@ export class HerdrAdapter implements TerminalProvider {
           for (const pane of pagePanes) uncertain.add(pane.seat);
           if (!notes.includes(HERDR_PANES_UNCONFIRMED_NOTE)) notes.push(HERDR_PANES_UNCONFIRMED_NOTE);
         }
-        resumeReports.push(...pageResumeReports(applied, pagePlan.root, pagePanes, new Set([...gone, ...uncertain]), unmatchedResume));
+        resumeReports.push(...pageResumeReports(layoutResult, pagePlan.root, pagePanes, new Set([...gone, ...uncertain]), unmatchedResume));
         if (tabId) {
           appliedTabIds.push(tabId);
           if (pagePanes.some((pane) => !gone.has(pane.seat) && !uncertain.has(pane.seat))) firstPopulatedTabId ??= tabId;
@@ -638,6 +691,14 @@ export class HerdrAdapter implements TerminalProvider {
           if (gone.has(pane.seat)) degraded.push({ seat: pane.seat, host: HERDR_SURFACE_HOST, reason: HERDR_PANE_EXITED_REASON });
           else if (uncertain.has(pane.seat)) degraded.push({ seat: pane.seat, host: HERDR_SURFACE_HOST, code: "pane_unconfirmed", reason: HERDR_PANES_UNCONFIRMED_NOTE });
           else opened.push(pane.seat);
+        }
+        // Reporting is deliberately out-of-band from rendering. A reporter
+        // rejection must never turn a successfully created terminal view into
+        // an open failure.
+        try {
+          this.deps.agentBridge?.registerLayout(pagePanes, layoutResult);
+        } catch {
+          // Best effort only. The bridge also isolates its asynchronous errors.
         }
       } catch (err) {
         everyPageKnown = false;
@@ -682,6 +743,69 @@ export class HerdrAdapter implements TerminalProvider {
       degraded,
       pages: plan.pages.length,
       ...(notes.length ? { notes } : {}),
+    };
+  }
+
+  /**
+   * Reuse an open workspace without touching its existing tiles or tabs. Seats that
+   * already have a tile (matched by pane label) count as opened. Seats added since the
+   * workspace was made are tiled into ONE new tab in that workspace, so a grown roster
+   * becomes visible while the user's layout (and mission control) stays exactly as it was.
+   * If Herdr cannot list the panes or apply the tab, the seats are reported degraded,
+   * never claimed as opened.
+   */
+  private async fillExisting(
+    workspaceId: string,
+    view: ComposedView,
+    launchToken: string,
+    carry: { absent: AbsentSeat[]; degraded: DegradedSeat[] },
+  ): Promise<OpenViewResult> {
+    const { absent, degraded } = carry;
+    const degradeAll = (panes: ComposedPane[], reason: string) =>
+      panes.forEach((pane) => degraded.push({ seat: pane.seat, host: HERDR_SURFACE_HOST, reason }));
+    let tiled: Set<string>;
+    try {
+      const listed = await this.transport.request("pane.list", { workspace_id: workspaceId });
+      const panes = (listed["panes"] as Array<{ label?: string }> | undefined) ?? [];
+      tiled = new Set(panes.map((p) => p.label).filter((l): l is string => typeof l === "string"));
+    } catch (err) {
+      degradeAll(view.opened, `herdr pane.list failed on reuse: ${err instanceof Error ? err.message : String(err)}`);
+      return { provider: this.name, ok: false, opened: [], absent, degraded, pages: 0, code: "herdr_workspace_failed" };
+    }
+    const opened = view.opened.filter((p) => tiled.has(p.label)).map((p) => p.seat);
+    const missing = view.opened.filter((p) => !tiled.has(p.label));
+    let pages = 0;
+    if (missing.length > 0) {
+      const addition = planHerdrLayout(
+        { ...view, opened: missing, pages: [missing] },
+        `${launchToken}+${missing.length}`,
+        this.tabPrefix,
+      ).pages[0]!;
+      try {
+        const layoutResult = await this.transport.request("layout.apply", {
+          workspace_id: workspaceId,
+          tab_label: addition.tabLabel,
+          focus: true,
+          root: addition.root,
+        });
+        opened.push(...missing.map((p) => p.seat));
+        pages = 1;
+        try {
+          this.deps.agentBridge?.registerLayout(missing, layoutResult);
+        } catch {
+          // Best effort only, as for a fresh open.
+        }
+      } catch (err) {
+        degradeAll(missing, `herdr layout.apply failed adding new seats: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    return {
+      provider: this.name,
+      ok: opened.length > 0 || view.opened.length === 0,
+      opened,
+      absent,
+      degraded,
+      pages,
     };
   }
 }

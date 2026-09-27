@@ -140,6 +140,102 @@ describe("ContextUsageStore", () => {
     rmSync(codexHome, { recursive: true, force: true });
   });
 
+  it("jcode usage includes turns still in the journal and survives a torn last line", () => {
+    const jcodeHome = join(tmpdir(), `jcode-journal-${Date.now()}`);
+    const sessionsDir = join(jcodeHome, ".jcode", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    // A fresh jcode session checkpoints only its opening messages into the JSON snapshot.
+    writeFileSync(join(sessionsDir, "sess-j.json"), JSON.stringify({ id: "sess-j", messages: [
+      { role: "user", content: "hi", timestamp: "2026-01-01T00:00:00Z" },
+    ] }));
+    const sampledAt = new Date().toISOString();
+    writeFileSync(join(sessionsDir, "sess-j.journal.jsonl"), [
+      JSON.stringify({ meta: {}, append_messages: [{ role: "assistant", timestamp: "2026-01-01T00:00:05Z",
+        token_usage: { input_tokens: 662, output_tokens: 34 } }] }),
+      JSON.stringify({ meta: {}, append_messages: [{ role: "assistant", timestamp: sampledAt,
+        token_usage: { input_tokens: 100, output_tokens: 6 } }] }),
+      '{"meta":{},"append_mes',
+    ].join("\n"));
+
+    const store = new ContextUsageStore(db, { stateDir: "/tmp/openrig-test", jcodeHomeDir: jcodeHome });
+    const usage = store.readJcodeAndNormalize({ resumeToken: "sess-j", sessionName: "dev-impl@test-rig" });
+
+    expect(usage.availability).toBe("known");
+    expect(usage.totalInputTokens).toBe(762);
+    expect(usage.totalOutputTokens).toBe(40);
+    expect(usage.sampledAt).toBe(sampledAt);
+    rmSync(jcodeHome, { recursive: true, force: true });
+  });
+
+  // readJcodeAndNormalize sums messages[].token_usage from ~/.jcode/sessions/<resumeToken>.json.
+  // jcodeHomeDir is an injected tmp dir, mirroring the codexHomeDir seam above.
+  it("jcode session JSON normalizes into known ContextUsage with summed token totals", () => {
+    const jcodeHome = join(tmpdir(), `jcode-context-${Date.now()}`);
+    const sessionsDir = join(jcodeHome, ".jcode", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    const sampledAt = new Date().toISOString();
+    writeFileSync(join(sessionsDir, "sess-jcode-1.json"), JSON.stringify({
+      id: "sess-jcode-1",
+      working_dir: "/project",
+      messages: [
+        { role: "user", content: "hi", timestamp: "2026-01-01T00:00:00Z" },
+        { role: "assistant", content: "hello", timestamp: "2026-01-01T00:00:05Z",
+          token_usage: { input_tokens: 1000, output_tokens: 50, cache_read_input_tokens: 200 } },
+        { role: "user", content: "more", timestamp: "2026-01-01T00:01:00Z" },
+        { role: "assistant", content: "done", timestamp: sampledAt,
+          token_usage: { input_tokens: 1500, output_tokens: 75, cache_read_input_tokens: 900 } },
+      ],
+    }));
+
+    const jcodeStore = new ContextUsageStore(db, { stateDir: "/tmp/openrig-test", jcodeHomeDir: jcodeHome });
+    const usage = jcodeStore.readJcodeAndNormalize({
+      resumeToken: "sess-jcode-1",
+      sessionName: "dev-impl@test-rig",
+    });
+
+    expect(usage.availability).toBe("known");
+    expect(usage.reason).toBeNull();
+    expect(usage.source).toBe("jcode_session_json");
+    expect(usage.totalInputTokens).toBe(2500);
+    expect(usage.totalOutputTokens).toBe(125);
+    expect(usage.sessionId).toBe("sess-jcode-1");
+    expect(usage.sessionName).toBe("dev-impl@test-rig");
+    expect(usage.sampledAt).toBe(sampledAt);
+    expect(usage.fresh).toBe(true);
+    // No context_window_size field exists in a jcode session file, so these stay honest nulls.
+    expect(usage.usedPercentage).toBeNull();
+    expect(usage.remainingPercentage).toBeNull();
+    expect(usage.contextWindowSize).toBeNull();
+
+    rmSync(jcodeHome, { recursive: true, force: true });
+  });
+
+  it("jcode: a null/empty resume token returns unknown (no_data), never a fabricated read", () => {
+    const jcodeStore = new ContextUsageStore(db, { stateDir: "/tmp/openrig-test", jcodeHomeDir: "/nonexistent" });
+    expect(jcodeStore.readJcodeAndNormalize({ resumeToken: null, sessionName: "s" }).reason).toBe("no_data");
+    expect(jcodeStore.readJcodeAndNormalize({ resumeToken: "   ", sessionName: "s" }).reason).toBe("no_data");
+  });
+
+  it.each([
+    ["missing session file", null, "no_data"],
+    ["malformed (corrupt JSON) session file", "{ not json", "parse_error"],
+    ["session with no token_usage on any message", JSON.stringify({ id: "sess", messages: [
+      { role: "user", content: "hi", timestamp: "2026-01-01T00:00:00Z" },
+    ] }), "no_data"],
+  ])("jcode: a %s returns unknown (%s), never throws", (_label, fileContent, reason) => {
+    const jcodeHome = join(tmpdir(), `jcode-context-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    if (fileContent !== null) {
+      const sessionsDir = join(jcodeHome, ".jcode", "sessions");
+      mkdirSync(sessionsDir, { recursive: true });
+      writeFileSync(join(sessionsDir, "sess.json"), fileContent);
+    }
+    const jcodeStore = new ContextUsageStore(db, { stateDir: "/tmp/openrig-test", jcodeHomeDir: jcodeHome });
+    const usage = jcodeStore.readJcodeAndNormalize({ resumeToken: "sess", sessionName: "s" });
+    expect(usage.availability).toBe("unknown");
+    expect(usage.reason).toBe(reason);
+    rmSync(jcodeHome, { recursive: true, force: true });
+  });
+
   // T2: Missing sidecar -> unknown with reason
   it("null raw produces unknown with missing_sidecar reason", () => {
     const usage = store.normalizeSample(null);

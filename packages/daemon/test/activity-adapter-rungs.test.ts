@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import {
   CLAUDE_ACTIVITY_RUNG_INVENTORY,
   CODEX_ACTIVITY_RUNG_INVENTORY,
+  JCODE_ACTIVITY_RUNG_INVENTORY,
   TMUX_GENERIC_RUNG_INVENTORY,
   PI_ACTIVITY_RUNG_INVENTORY,
   runtimeRungInventory,
@@ -32,11 +33,20 @@ describe("S19 A5 — per-harness rung inventories (one data source)", () => {
     expect(rungs.has("self-report")).toBe(false); // absent rung — rendered honestly, never manufactured
   });
 
-  it("runtime resolution: claude/codex map to their inventories; anything else gets the generic floor", () => {
+  // Mirrors the codex inventory exactly: hooks TRIAL, sampling authoritative floor, no self-report rung.
+  it("jcode: hooks enter at TRIAL (AM-2), sampling authoritative, and NO self-report rung (mirrors codex)", () => {
+    const rungs = new Map(JCODE_ACTIVITY_RUNG_INVENTORY.rungs.map((r) => [r.rung, r]));
+    expect(rungs.get("lifecycle-hooks")!.initialTrust).toBe("trial");
+    expect(rungs.get("window-sampling")!.initialTrust).toBe("authoritative");
+    expect(rungs.has("self-report")).toBe(false);
+  });
+
+  it("runtime resolution: claude/codex/jcode map to their inventories; anything else gets the generic floor", () => {
     expect(runtimeRungInventory("claude-code")).toBe(CLAUDE_ACTIVITY_RUNG_INVENTORY);
     expect(runtimeRungInventory("codex")).toBe(CODEX_ACTIVITY_RUNG_INVENTORY);
     expect(runtimeRungInventory("pi")).toBe(PI_ACTIVITY_RUNG_INVENTORY);
     expect(runtimeRungInventory("terminal")).toBe(TMUX_GENERIC_RUNG_INVENTORY);
+    expect(runtimeRungInventory("jcode")).toBe(JCODE_ACTIVITY_RUNG_INVENTORY);
     expect(runtimeRungInventory(null)).toBe(TMUX_GENERIC_RUNG_INVENTORY);
   });
 });
@@ -131,6 +141,17 @@ describe("S19 A5 — production wiring: the sweep auto-declares, consults self-r
     const s = svc.getSeatState(SEAT)!;
     expect(s.decidedBy).toBe("window-sampling");
     expect(s.rungs.some((r) => r.rung === "self-report")).toBe(false); // absent, not guessed
+    expect(s.rungs.find((r) => r.rung === "lifecycle-hooks")!.trust).toBe("trial");
+  });
+
+  // Mirrors the codex wiring assertion: hooks appear at trial, sampling still decides.
+  it("a jcode seat is auto-declared with the jcode inventory: hooks appear at trial, sampling still decides", async () => {
+    const { svc, db } = harness({ runtime: "jcode" });
+    await svc.pollAllRunningTmuxSeats(db);
+    expect(svc.hasRungInventory(SEAT)).toBe(true);
+    const s = svc.getSeatState(SEAT)!;
+    expect(s.decidedBy).toBe("window-sampling");
+    expect(s.rungs.some((r) => r.rung === "self-report")).toBe(false);
     expect(s.rungs.find((r) => r.rung === "lifecycle-hooks")!.trust).toBe("trial");
   });
 });

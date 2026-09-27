@@ -277,6 +277,15 @@ export class ContextMonitor {
               OR s.startup_status IN ('failed', 'attention_required')
             )
           )
+          OR (
+            -- jcode: eligible with a resume token (context usage) OR a failed/attention_required
+            -- startup status (self-heal only, no usage read needed). Mirrors the codex clause.
+            n.runtime = 'jcode'
+            AND (
+              s.resume_token IS NOT NULL
+              OR s.startup_status IN ('failed', 'attention_required')
+            )
+          )
         )
         AND (r.archived_at IS NULL OR s.status = 'running')
         AND COALESCE(b.attachment_type, 'tmux') = 'tmux'
@@ -289,6 +298,15 @@ export class ContextMonitor {
     if (session.runtime === "codex") {
       return this.store.readCodexAndNormalize({
         threadId: session.resume_token,
+        sessionName: session.session_name,
+      });
+    }
+
+    // jcode has no name-keyed sidecar (it never writes one); its resume token IS the session
+    // id, so the read is direct: ~/.jcode/sessions/<token>.json.
+    if (session.runtime === "jcode") {
+      return this.store.readJcodeAndNormalize({
+        resumeToken: session.resume_token,
         sessionName: session.session_name,
       });
     }

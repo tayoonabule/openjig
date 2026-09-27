@@ -62,6 +62,8 @@ import { claudeAuthStatusReader } from "./domain/provider/claude-auth-status-rea
 import { ClaudeUsageWindows, latestClaudeWindowSamples } from "./domain/provider/claude-usage-windows.js";
 import { prepareCodexSeatFolder, prepareCodexTeamWorkspace } from "./domain/codex-team-workspace.js";
 import { resolveCodexGitAddDirs } from "./domain/codex-git-add-dirs.js";
+import { JcodeResumeAdapter } from "./adapters/jcode-resume.js";
+import { JcodeRuntimeAdapter } from "./adapters/jcode-runtime-adapter.js";
 import { PiResumeAdapter } from "./adapters/pi-resume.js";
 import { OmpResumeAdapter } from "./adapters/omp-resume.js";
 import { OMP_PROVIDER_ENV_VARS, OMP_PROVIDER_EXTRA_ENV_VARS } from "./adapters/pi-runner-protocol.js";
@@ -733,6 +735,23 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const prepareSeatFolder = (sessionName: string) => prepareCodexSeatFolder(sessionName,
     String(new ContextPackSettingsStore().resolveOne("topology.root").value));
   const codexResume = new CodexResumeAdapter(tmuxAdapter, { ensureManagedConfig: async (home?: string) => { await codexAdapter.ensureManagedConfig(home); }, prepareTeamWorkspace, prepareSeatFolder, resolveGitAddDirs: resolveCodexGitAddDirs, seatLaunchEnvironment, codexHome: configuredCodexHome, launchPath: process.env.PATH, detectDaemonSupport: codexDaemonSupportProbe(process.env.PATH, undefined, configuredCodexHome), readNetworkDefault: readCodexNetworkDefault });
+  const jcodeStateRoot = nodePath.join(OPENRIG_HOME, "state", "jcode");
+  const jcodeAdapter = new JcodeRuntimeAdapter({
+    tmux: tmuxAdapter,
+    fsOps: {
+      readFile: (p: string) => fs.readFileSync(p, "utf-8"),
+      writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"),
+      exists: (p: string) => fs.existsSync(p),
+      mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }),
+      listFiles: (dir: string) => fs.readdirSync(dir, { recursive: true }).map(String).filter((p) => fs.statSync(nodePath.join(dir, p)).isFile()),
+      statMode: (p: string) => fs.statSync(p).mode,
+      chmod: (p: string, mode: number) => fs.chmodSync(p, mode),
+    },
+    stateRoot: jcodeStateRoot,
+    launchPath: process.env.PATH,
+    activityRelayPath: nodePath.resolve(import.meta.dirname, "../assets/plugins/openrig-core/hooks/scripts/activity-relay.cjs"),
+  });
+  const jcodeResume = new JcodeResumeAdapter(jcodeAdapter);
   // OPR.0.4.6.PI1 — the Pi seat-state root + the compiled runner entry (daemon
   // dist). Shared by the Pi runtime adapter, the resume adapter, and the
   // resume-token capture sidecar reader.
@@ -778,7 +797,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
 
   const restoreOrchestrator = new RestoreOrchestrator({
     db, rigRepo, sessionRegistry, eventBus, snapshotRepo, snapshotCapture,
-    checkpointStore, nodeLauncher, tmuxAdapter, claudeResume, codexResume, piResume, ompResume,
+    checkpointStore, nodeLauncher, tmuxAdapter, claudeResume, codexResume, jcodeResume, piResume, ompResume,
     transcriptStore, serviceOrchestrator,
     freshLaunch: async (rigId, nodeId) => persistedFreshPodLaunch
       ? persistedFreshPodLaunch(rigId, nodeId)
@@ -1143,7 +1162,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     db, rigRepo, podRepo,
     sessionRegistry, eventBus, nodeLauncher, startupOrchestrator,
     fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), exists: (p: string) => fs.existsSync(p) },
-    adapters: withCommunityHarnesses({ "claude-code": claudeAdapter, "codex": codexAdapter, "pi": piAdapter, "omp": ompAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() }, { tmux: tmuxAdapter, seatLaunchEnvironment }),
+    adapters: withCommunityHarnesses({ "claude-code": claudeAdapter, "codex": codexAdapter, "jcode": jcodeAdapter, "pi": piAdapter, "omp": ompAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() }, { tmux: tmuxAdapter, seatLaunchEnvironment }),
     tmuxAdapter,
     agentImageLibrary,
     continuityPolicyMaterializer,
@@ -1203,6 +1222,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const runtimeAdaptersMap = withCommunityHarnessResolver({
     "claude-code": claudeAdapter,
     "codex": codexAdapter,
+    "jcode": jcodeAdapter,
     "pi": piAdapter,
     "omp": ompAdapter,
     "stub": stubAdapter,
@@ -1227,6 +1247,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       // "cwd is inside the OpenRig installation". Use the resolved
       // workspace.root setting as the per-operator default.
       cwdOverride: runtimeSettings.workspaceRoot,
+      preferredRuntime: runtimeSettings.kernelRuntime,
       degradedTimeoutMs,
       // A kernel a reboot left down comes back the way `rig up kernel --existing` brings it back.
       // Synchronous, so the restore is registered before any request can ask for the same one.
@@ -1331,10 +1352,11 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // OPR.0.4.3.20 FR-4 — inject contextUsageStore so refresh() can null-fill a
   // Claude token from the sidecar during periodic/manual snapshot refresh.
   // #421 — the pane's current Claude process start time; a sidecar sampled earlier is not this
-  // process's, so capture and null-fill skip it.
+  // process's, so capture and null-fill skip it. Jcode session metadata is read
+  // through the adapter on the same refresher path.
   const claudeProcessStartedAt = (sessionName: string) => observeClaudePaneStartedAt({ target: sessionName, tmux: tmuxAdapter });
   const resumeMetadataRefresher = new ResumeMetadataRefresher({ sessionRegistry, tmuxAdapter, contextUsageStore, claudeProcessStartedAt, codexHome: configuredCodexHome,
-    seatHome: (nodeId, runtime) => seatRuntimeHome(db, nodeId, runtime).home });
+    seatHome: (nodeId, runtime) => seatRuntimeHome(db, nodeId, runtime).home, jcodeSessionReader: jcodeAdapter });
   const claimService = new ClaimService({
     db, rigRepo, sessionRegistry, discoveryRepo, eventBus, tmuxAdapter, transcriptStore,
     claudeContextProvisioner: claudeAdapter,
@@ -1346,6 +1368,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     // OPR.0.4.6.PI1 FR-6 — pi-runner sidecar reader (the adapter exposes it).
     piRunnerStateStore: piAdapter,
     ompRunnerStateStore: ompAdapter,
+    jcodeSessionReader: jcodeAdapter,
   });
   const selfAttachService = new SelfAttachService({
     db, rigRepo, podRepo, sessionRegistry, eventBus, tmuxAdapter, transcriptStore,
@@ -2037,6 +2060,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   {
     const { TerminalService } = await import("./domain/terminal/terminal-service.js");
     const { createHerdrProviders } = await import("./domain/terminal/herdr-sessions.js");
+    const { HerdrAgentBridge } = await import("./domain/terminal/jcode-herdr-agent-bridge.js");
     const { CmuxProviderAdapter } = await import("./domain/terminal/cmux-provider-adapter.js");
     const { RexAdapter } = await import("./domain/terminal/rex-adapter.js");
     const { createRexCliTransport } = await import("./domain/terminal/rex-transport.js");
@@ -2072,7 +2096,20 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       const session = target.attachArgv?.[4];
       if (!session) return "unknown";
       return inspectComposerInput(await tmuxAdapter.captureComposerSnapshot(session), target.runtime ?? null).state;
-    });
+    }, (transport) => new HerdrAgentBridge({
+      transport,
+      eventBus,
+      resolveSeat: (sessionName) => {
+        const row = db.prepare(
+          `SELECT n.id AS node_id, n.runtime, s.resume_token
+             FROM sessions s JOIN nodes n ON n.id = s.node_id
+            WHERE s.session_name = ? AND s.status = 'running'
+            ORDER BY s.id DESC LIMIT 1`,
+        ).get(sessionName) as { node_id: string; runtime: string | null; resume_token: string | null } | undefined;
+        return row ? { nodeId: row.node_id, runtime: row.runtime, resumeToken: row.resume_token } : null;
+      },
+      getSeatState: (nodeId) => seatActivityService.getSeatState(nodeId),
+    }));
     const cmuxProvider = new CmuxProviderAdapter({
       cmuxAdapter,
       // One gridded workspace per composed page — the same grid machinery as
@@ -2609,6 +2646,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const contextMonitor = new ContextMonitor(db, contextUsageStore, claudeAdapter, compactionEnforcer, {
     "claude-code": claudeAdapter,
     codex: codexAdapter,
+    jcode: jcodeAdapter,
     pi: piAdapter,
     omp: ompAdapter,
   }, usageSamplesStore, () => providerWindowSamplesFromSignals(

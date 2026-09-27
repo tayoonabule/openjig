@@ -1,0 +1,29 @@
+# openjig: copy of ../implementation-pair/rig.yaml with every seat on jcode. Keep in sync by
+# hand when upstream changes it.
+version: "0.2"
+name: implementation-pair-jcode
+summary: >-
+  jcode variant of implementation-pair: every agent seat runs on jcode with a model sized to its role. A focused development pair providing implementation and QA capabilities. Project/mission/slice components choose the work and any independent checks; no composition means light Part A, not a per-edit approval loop.
+
+pods:
+  - id: dev
+    label: Development Pair
+    members:
+      - id: impl
+        agent_ref: "local:../../../agents/development/implementer"
+        runtime: jcode
+        profile: default
+        cwd: "."
+        model: gpt-5.6-luna
+      - id: qa
+        agent_ref: "local:../../../agents/development/qa"
+        runtime: jcode
+        profile: default
+        cwd: "."
+        model: claude-sonnet-5
+    edges:
+      - kind: delegates_to
+        from: impl
+        to: qa
+
+edges: []

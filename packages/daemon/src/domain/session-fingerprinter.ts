@@ -31,6 +31,7 @@ function processNameIs(command: string, name: string): boolean {
 // state; a bare `omp` executable could use the default, unisolated user home.
 // No Layer-1 OMP signal: tmux reports the runner as `node`, never its argv.
 const OMP_READY_PATTERN = /^\s*\[omp-runner\] READY(?:\s|$)/;
+const JCODE_PROCESS_PATTERNS = ["jcode"];
 
 const CLAUDE_PANE_PATTERNS = [
   { label: "Claude Code", test: (line: string) => /^\s*Claude Code\b/i.test(line) },
@@ -42,6 +43,10 @@ const CODEX_PANE_PATTERNS = [
   { label: "Codex CLI", test: (line: string) => /^\s*Codex CLI\b/i.test(line) },
   { label: "codex>", test: (line: string) => /^\s*codex>\s*/i.test(line) },
   { label: "╭─ Codex", test: (line: string) => /^\s*╭─ Codex\b/i.test(line) },
+];
+
+const JCODE_PANE_PATTERNS = [
+  { label: "Jcode", test: (line: string) => /^\s*Jcode\b/i.test(line) },
 ];
 
 /**
@@ -86,6 +91,7 @@ export class SessionFingerprinter {
         const hint = cmuxMatch.runtime.includes("claude") ? "claude-code" as RuntimeHint
           : cmuxMatch.runtime.includes("codex") ? "codex" as RuntimeHint
           : cmuxMatch.runtime.toLowerCase() === "omp" || cmuxMatch.runtime.toLowerCase() === "oh-my-pi" ? "omp" as RuntimeHint
+          : cmuxMatch.runtime.includes("jcode") ? "jcode" as RuntimeHint
           : "unknown" as RuntimeHint;
         return { runtimeHint: hint, confidence: "highest", evidence };
       }
@@ -108,6 +114,14 @@ export class SessionFingerprinter {
           evidence.layerUsed = 1;
           evidence.processSignal = { command: pane.activeCommand, matched: pattern };
           return { runtimeHint: "codex", confidence: "high", evidence };
+        }
+      }
+
+      for (const pattern of JCODE_PROCESS_PATTERNS) {
+        if (cmd === pattern || cmd.endsWith(`/${pattern}`)) {
+          evidence.layerUsed = 1;
+          evidence.processSignal = { command: pane.activeCommand, matched: pattern };
+          return { runtimeHint: "jcode", confidence: "high", evidence };
         }
       }
 
@@ -138,6 +152,13 @@ export class SessionFingerprinter {
             return { runtimeHint: "codex", confidence: "medium", evidence };
           }
         }
+        for (const pattern of JCODE_PANE_PATTERNS) {
+          if (pattern.test(line)) {
+            evidence.layerUsed = 2;
+            evidence.paneContentSignal = { pattern: pattern.label, matchedLine: line.trim() };
+            return { runtimeHint: "jcode", confidence: "medium", evidence };
+          }
+        }
       }
 
       // OMP's managed runner prints no Claude/Codex banner, so its READY marker
@@ -159,6 +180,7 @@ export class SessionFingerprinter {
       const hasAgentsDir = this.fsExists(`${pane.cwd}/.agents`);
       evidence.configSignal = { claudeDir: hasClaudeDir, agentsDir: hasAgentsDir };
 
+      // Jcode also reads .agents, so config-only evidence cannot distinguish it from Codex.
       if (hasClaudeDir && !hasAgentsDir) configBoost = "claude-code";
       else if (hasAgentsDir && !hasClaudeDir) configBoost = "codex";
     }

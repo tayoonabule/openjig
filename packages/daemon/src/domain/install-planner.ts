@@ -73,7 +73,8 @@ export class InstallPlanner {
   plan(
     resolved: ResolvedPackage,
     targetRoot: string,
-    runtime: "claude-code" | "codex",
+    // Jcode reads AGENTS.md and .agents/skills, the same project layout as Codex.
+    runtime: "claude-code" | "codex" | "jcode",
     options?: PlanOptions,
   ): InstallPlan {
     // R2-H2: Compatibility check — runtime must be in manifest's runtimes
@@ -166,7 +167,7 @@ export class InstallPlanner {
         });
         continue;
       }
-      if (g.kind === "claude_md" && runtime === "codex") {
+      if (g.kind === "claude_md" && (runtime === "codex" || runtime === "jcode")) {
         entries.push({
           exportType: "guidance",
           exportName: g.name,
@@ -174,7 +175,7 @@ export class InstallPlanner {
           targetPath: "",
           scope: "project_shared",
           deferred: true,
-          deferReason: "claude_md guidance not applicable to codex",
+          deferReason: `claude_md guidance not applicable to ${runtime}`,
         });
         continue;
       }

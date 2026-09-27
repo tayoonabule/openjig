@@ -166,7 +166,7 @@ export function resolveNodeConfig(ctx: ResolutionContext): ResolutionResult {
   // V0.3.0 daemon-skill-discovery (SC-29 #7): runtime + cwd must be
   // resolved BEFORE the pool is queried, so the filesystem skill scan
   // targets the right runtime's path layout (claude-code → .claude/;
-  // codex → .agents/) at the right cwd. Order swapped from prior
+  // codex/jcode → .agents/) at the right cwd. Order swapped from prior
   // versions where runtime/cwd were computed AFTER the pool.
   const runtime = member.runtime
     ?? profile.preferences?.runtime
@@ -200,7 +200,7 @@ export function resolveNodeConfig(ctx: ResolutionContext): ResolutionResult {
   // rig-local declarations are not overwritten by discovery.
   let rejectedSkillsByBasename: Map<string, { path: string; reason: string }> = new Map();
   const scanCache = scanCacheFor(ctx.scanScope);
-  if (runtime === "claude-code" || runtime === "codex" || runtime === "pi") {
+  if (runtime === "claude-code" || runtime === "codex" || runtime === "jcode" || runtime === "pi" || runtime === "omp") {
     const discoveryPaths = {
       runtime: runtime as SkillRuntime,
       homedir: ctx.homedir ?? osHomedir(),

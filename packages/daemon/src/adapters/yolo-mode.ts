@@ -8,6 +8,8 @@
 //             explicit -s workspace-write flag, NOT a harness default)
 //   - Pi:     --approve                       (full RESOURCE TRUST — Pi's
 //             --approve/--no-approve govern RESOURCE TRUST, not a permission policy)
+//   - Jcode:  no flag                         (no CLI approval/sandbox mode exists;
+//             YOLO on/off does not alter its already-unrestricted launch)
 // When OFF (the default), seats boot with the usability floor, unchanged. The YOLO path writes ZERO
 // config files — it only selects a launch flag. Opt-in via the OPENRIG_YOLO env setting. (The
 // zero-permission-config-write property concerns Claude/Codex permission policy; Pi is resource trust.)

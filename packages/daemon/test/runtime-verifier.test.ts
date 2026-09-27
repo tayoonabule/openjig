@@ -106,6 +106,14 @@ describe("RuntimeVerifier", () => {
     expect(result.runtime).toBe("codex");
   });
 
+  it("jcode --version verifies and persists canonical runtime", async () => {
+    const exec = createMockExec({ "jcode --version": "jcode v0.88.97-dev (841545299)" });
+    const verifier = new RuntimeVerifier({ exec, db });
+    const [result] = await verifier.verifyAll(["jcode"]);
+    expect(result).toMatchObject({ runtime: "jcode", status: "verified", version: "0.88.97" });
+    expect(db.prepare("SELECT runtime FROM runtime_verifications WHERE runtime = ?").get("jcode")).toMatchObject({ runtime: "jcode" });
+  });
+
   // T7: verifyTmux auto-persists to DB
   it("verification auto-persists to runtime_verifications table", async () => {
     const exec = createMockExec({ "tmux -V": "tmux 3.4" });

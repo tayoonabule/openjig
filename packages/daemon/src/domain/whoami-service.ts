@@ -80,7 +80,7 @@ export type RuntimeContext =
       lastSampledAt: string | null;
     }
   | {
-      runtime: "claude-code";
+      runtime: "claude-code" | "jcode";
       resumeToken: string | null;
       estimatedTokens: number | null;
       lastSampledAt: string | null;
@@ -407,9 +407,9 @@ export class WhoamiService {
         lastSampledAt,
       };
     }
-    if (runtime === "claude-code") {
+    if (runtime === "claude-code" || runtime === "jcode") {
       return {
-        runtime: "claude-code",
+        runtime,
         resumeToken: this.latestResumeRow(nodeId)?.resume_token ?? null,
         estimatedTokens,
         lastSampledAt,

@@ -220,6 +220,18 @@ function claimFirstLaunchHook(resumeLaunch, generation, dir = path.join(os.tmpdi
   }
 }
 
+function jcodeHookPayload(env) {
+  // Jcode passes lifecycle data in environment variables, not on stdin.
+  const jcodeEvents = {
+    turn_start: "UserPromptSubmit", turn_end: "Stop",
+    session_start: "SessionStart", session_end: "SessionEnd",
+  };
+  const payload = parseJson(env.JCODE_HOOK_PAYLOAD);
+  return { ...payload,
+    hookEvent: jcodeEvents[env.JCODE_HOOK_EVENT] || env.JCODE_HOOK_EVENT,
+    session_id: env.JCODE_HOOK_SESSION_ID || payload.session_id };
+}
+
 function uid() {
   try { return typeof process.getuid === "function" ? String(process.getuid()) : "user"; } catch { return "user"; }
 }
@@ -316,8 +328,10 @@ function runsForThisSeatsProject(env = process.env) {
 
 async function main() {
   // Before anything is read, posted or recorded: a Claude started elsewhere inside this seat is not the seat.
-  if (!runsForThisSeatsProject()) return;
-  const providerPayload = parseJson(await readStdin());
+  if (!process.env.JCODE_HOOK_EVENT && !runsForThisSeatsProject()) return;
+  const providerPayload = process.env.JCODE_HOOK_EVENT
+    ? jcodeHookPayload(process.env)
+    : parseJson(await readStdin());
   if (pluginRunIsRedundant(providerPayload)) return;
   const payload = buildOpenRigPayload(providerPayload);
   const identityPayload = buildSessionIdentityPayload(providerPayload, process.env);
@@ -338,6 +352,7 @@ module.exports = {
   buildOpenRigPayload,
   claimFirstLaunchHook,
   buildSessionIdentityPayload,
+  jcodeHookPayload,
   parseJson,
   postHookPayload,
   resolveEndpoint,

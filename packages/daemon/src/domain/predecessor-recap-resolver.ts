@@ -41,6 +41,12 @@ export interface PredecessorRecapResolverDeps {
   /** Look up the departing session's resume token by node + session name (codex thread id; for a
    *  claude row this is the predecessor's session uuid — the sidecar-ownership verifier). */
   lookupResumeToken: (nodeId: string, sessionName: string) => string | null;
+  /** jcode: `~/.jcode/sessions/<resumeToken>.json` `messages[]` already carries {role, content}
+   *  pairs directly (structured JSON, not a JSONL transcript), so no JSONL parser is needed —
+   *  this dep reads the file and returns the raw exchange list (unbounded); the resolver applies
+   *  the same maxExchanges/maxCharsPerExchange bounding used for the claude/codex legs below.
+   *  Resolved via the resume token (the jcode session id). */
+  readJcodeExchanges?: (resumeToken: string) => { path: string; exchanges: JsonlExchange[] } | null;
   /** Injectable for tests; defaults to the real JSONL parser. */
   parseExchanges?: (path: string, n: number) => JsonlExchange[];
   /** Bounded recap size (default 6). */
@@ -59,6 +65,22 @@ export function makePredecessorRecapResolver(deps: PredecessorRecapResolverDeps)
   const max = deps.maxExchanges ?? DEFAULT_MAX_EXCHANGES;
   const maxChars = deps.maxCharsPerExchange ?? DEFAULT_MAX_CHARS_PER_EXCHANGE;
   return ({ nodeId, runtime, sessionName }): PredecessorRecapResolution => {
+    // jcode has its own arm before the codex/claude branch: its session JSON already carries
+    // {role, content} pairs directly (no JSONL parsing needed), keyed by resume token, and must
+    // never fall through to the claude sidecar reader (a file a jcode seat never writes).
+    if (runtime === "jcode") {
+      const resumeToken = deps.lookupResumeToken(nodeId, sessionName);
+      if (!resumeToken) return { unavailableReason: "no resume token recorded for the departing jcode session" };
+      if (!deps.readJcodeExchanges) return { unavailableReason: "no jcode session reader configured" };
+      const result = deps.readJcodeExchanges(resumeToken);
+      if (!result) return { unavailableReason: `no jcode session record found for session ${resumeToken}` };
+      const recap = result.exchanges.slice(-max);
+      if (recap.length === 0) {
+        return { unavailableReason: `the predecessor record at ${result.path} yielded no user/assistant exchanges (empty, unreadable, or too large to read)` };
+      }
+      return { recap: recap.map((ex) => boundExchange(ex, maxChars)), recordPath: result.path };
+    }
+
     let path: string | null;
     if (runtime === "codex") {
       const threadId = deps.lookupResumeToken(nodeId, sessionName);

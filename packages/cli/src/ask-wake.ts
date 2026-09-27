@@ -22,7 +22,7 @@ export interface WakeDeps {
 export interface WakeArgs {
   question: string;
   token: string;
-  runtime: "claude" | "codex";
+  runtime: "claude" | "codex" | "jcode";
   timeoutMs?: number;
 }
 
@@ -51,11 +51,15 @@ const NO_PREAMBLE = "Answer directly and concisely, with no preamble. Question: 
  * prints the answer and EXITS — the wake target is the session FILE, so the
  * process goes back to cold with no lingering process (pin 2/3, mini-PRD A).
  * codex uses `codex exec resume` (adapter-honest; session-file size lags the host).
+ * jcode's `run --resume` is its documented one-shot resume surface.
  */
-export function buildWakeCommand(runtime: "claude" | "codex", token: string, question: string): { cmd: string; args: string[] } {
+export function buildWakeCommand(runtime: "claude" | "codex" | "jcode", token: string, question: string): { cmd: string; args: string[] } {
   const prompt = `${NO_PREAMBLE}${question}`;
   if (runtime === "codex") {
     return { cmd: "codex", args: ["exec", "resume", token, prompt] };
+  }
+  if (runtime === "jcode") {
+    return { cmd: "jcode", args: ["--quiet", "run", "--resume", token, prompt] };
   }
   return { cmd: "claude", args: ["-p", "--resume", token, prompt] };
 }

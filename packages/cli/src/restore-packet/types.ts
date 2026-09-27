@@ -91,6 +91,9 @@ export interface StructuredTranscript {
 /** Source-runtime kind. v0 supports codex + claude-code transcript shapes. */
 export type SourceRuntime = "codex" | "claude-code";
 
+/** Target runtimes may include jcode even though it has no transcript parser yet. */
+export type TargetRuntime = SourceRuntime | "jcode";
+
 export function emptyOmittedCounts(): OmittedCounts {
   return {
     reasoning_records: 0,

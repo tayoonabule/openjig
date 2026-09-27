@@ -525,6 +525,8 @@ export interface RestoreNodeResult {
   // outside the five-term split.) `left_attached`: a seat joined with `rig attach` as an external CLI, which
   // restore leaves as it is; nothing was launched, and OpenRig can't see whether that app still runs.
   status: "resumed" | "rebuilt" | "fresh" | "fresh-primed" | "awaiting-decision" | "failed" | "attention_required" | "operator_recovered" | "left_attached";
+  /** Set for terminal seats: a fresh terminal is its normal restore, not a loss. */
+  runtime?: string;
   error?: string;
   /** Pane evidence captured when status is `attention_required` (L3, optional). */
   attentionEvidence?: string | null;
@@ -1590,7 +1592,7 @@ export type ContextUnknownReason =
 export interface ContextUsage {
   availability: ContextAvailability;
   reason: ContextUnknownReason | null;
-  source: "claude_statusline_json" | "codex_token_count_jsonl" | null;
+  source: "claude_statusline_json" | "codex_token_count_jsonl" | "jcode_session_json" | null;
   usedPercentage: number | null;
   remainingPercentage: number | null;
   contextWindowSize: number | null;

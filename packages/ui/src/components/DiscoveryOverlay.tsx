@@ -226,7 +226,7 @@ export function GenerateDraftSection() {
 export function DiscoveryOverlay() {
   const { data: sessions = [] } = useDiscoveredSessions({
     status: "active",
-    runtimeHint: ["claude-code", "codex"],
+    runtimeHint: ["claude-code", "codex", "jcode"],
     minConfidence: "medium",
   });
   const scanMutation = useDiscoveryScan();

@@ -18,7 +18,7 @@ export type PackageInstallOutcome =
 interface PackageInstallOpts {
   resolved: ResolvedPackage;
   targetRoot: string;
-  runtime: "claude-code" | "codex";
+  runtime: "claude-code" | "codex" | "jcode";
   roleName?: string;
   allowMerge?: boolean;
   bootstrapId?: string;

@@ -47,8 +47,8 @@ export interface SeatActivityServiceDeps {
   /** Visible prompt observation: null means capture could not establish a state. */
   permissionPromptReader?: (sessionName: string, runtime: string) => Promise<boolean | null>;
   permissionPromptChanged?: (sessionName: string, confirmed: boolean, runtime: string) => void;
-  /** Claude pid.json, consulted for seats declaring self-report. */
-  selfReportReader?: (sessionName: string, seatNodeId: string) => ActivityEvidence | null;
+  /** Runtime-scoped self-report, consulted per sweep for seats declaring the rung. */
+  selfReportReader?: (sessionName: string, seatNodeId: string, runtime: string | null) => ActivityEvidence | null | Promise<ActivityEvidence | null>;
   /** A runner seat's last recorded hook, restored when its inventory is declared with no hook evidence yet (after a
    *  daemon restart). Null when nothing qualifies: another generation or session, or nothing recorded. */
   restoreHookEvidence?: (seat: { seatNodeId: string; sessionName: string }, runtime: string) => ActivityEvidence | null;
@@ -71,7 +71,7 @@ export class SeatActivityService {
   private readonly permissionPromptReader?: SeatActivityServiceDeps["permissionPromptReader"];
   private readonly permissionPromptChanged?: SeatActivityServiceDeps["permissionPromptChanged"];
 
-  private readonly selfReportReader: ((sessionName: string, seatNodeId: string) => ActivityEvidence | null) | null;
+  private readonly selfReportReader: SeatActivityServiceDeps["selfReportReader"] | null;
 
   private readonly restoreHookEvidence: SeatActivityServiceDeps["restoreHookEvidence"] | null;
 
@@ -159,7 +159,12 @@ export class SeatActivityService {
       });
       const seat = this.ladder.get(seatNodeId);
       if (this.selfReportReader && seat?.inventory?.rungs.some((r) => r.rung === "self-report")) {
-        const evd = this.selfReportReader(paneId, seatNodeId);
+        let evd: ActivityEvidence | null = null;
+        try {
+          evd = await this.selfReportReader(paneId, seatNodeId, seat.inventory.runtime);
+        } catch {
+          evd = null; // an unreadable self-report falls down the ladder, never errors
+        }
         if (evd) this.reportEvidence(evd); // null = unreadable ⇒ the rung simply stales
       }
     }
@@ -668,6 +673,7 @@ export class SeatActivityService {
       if (trust !== "authoritative" && trust !== "positive-only") continue;
       const evd = this.latestByRung(seat, rung, "activity");
       if (!evd || evd.activity === undefined) continue;
+      if (evd.validForMs !== undefined && nowMs - Date.parse(evd.observedAt) > evd.validForMs) continue;
       // A positive-only rung answers only "working"; its silence leaves the state to the rungs below, or unknown.
       if (trust === "positive-only" && evd.activity !== "working") continue;
       // A durable rung's idle or attention boundary holds; a bare working boundary still expires, then falls to the
@@ -680,6 +686,7 @@ export class SeatActivityService {
       if (rung === "lifecycle-hooks" && evd.activity === "idle-at-prompt" && evd.livenessSeconds
           && (this.latestByRung(seat, rung)?.needsInput?.count ?? 0) === 0
           && nowMs - Date.parse(evd.observedAt) > 2 * 1000 * evd.livenessSeconds) continue;
+      if (rung === "lifecycle-hooks" && nowMs - Date.parse(evd.observedAt) > HOOK_AUTHORITY_WINDOW_MS) continue;
       return evd;
     }
     return null;

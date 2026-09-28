@@ -1,8 +1,10 @@
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import nodePath from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import type { ActivityEvidence } from "../domain/activity-taxonomy.js";
 
 export interface JcodeSessionFs {
   readFile(path: string): string;
@@ -32,6 +34,92 @@ export async function defaultJcodeDebugSessions(socket: string): Promise<string>
 
 export function jcodeRuntimeDir(stateRoot: string, sessionName: string): string {
   return nodePath.join(stateRoot, sessionName, "runtime");
+}
+
+/** How long one jcode self-report stays authoritative. The sweep polls at 1Hz, so a live
+ *  socket refreshes it long before this; a dead socket's last answer expires and the seat
+ *  falls back to sampling instead of freezing on a stale verdict. */
+export const JCODE_SELF_REPORT_VALID_MS = 5_000;
+
+/** One `debug_command: sessions` round trip on the seat's debug socket, in-process (no
+ *  `jcode` child per poll). Resolves the raw JSON output string, or null on any failure. */
+export function queryJcodeDebugSocket(socketPath: string, timeoutMs = 750): Promise<string | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let buf = "";
+    const sock = net.createConnection(socketPath);
+    const done = (value: string | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      sock.destroy();
+      resolve(value);
+    };
+    const timer = setTimeout(() => done(null), timeoutMs);
+    if (typeof timer === "object" && "unref" in timer) timer.unref();
+    sock.on("connect", () => {
+      sock.write(JSON.stringify({ type: "debug_command", id: 1, command: "sessions" }) + "\n");
+    });
+    sock.on("data", (chunk) => {
+      buf += chunk.toString("utf-8");
+      const nl = buf.indexOf("\n");
+      if (nl < 0) return;
+      try {
+        const reply = JSON.parse(buf.slice(0, nl)) as { type?: unknown; ok?: unknown; output?: unknown };
+        done(reply.type === "debug_response" && reply.ok === true && typeof reply.output === "string" ? reply.output : null);
+      } catch {
+        done(null);
+      }
+    });
+    sock.on("error", () => done(null));
+    sock.on("close", () => done(null));
+  });
+}
+
+/** Map the seat's `sessions` rows to working/idle. Any processing session ⇒ working; every
+ *  session `ready` and not processing ⇒ idle-at-prompt; anything else (unknown vocabulary,
+ *  no rows) ⇒ null so the ladder falls through rather than guessing. */
+export function jcodeActivityFromSessions(output: string): "working" | "idle-at-prompt" | null {
+  let rows: unknown;
+  try { rows = JSON.parse(output); } catch { return null; }
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  let allReady = true;
+  for (const row of rows) {
+    if (!row || typeof row !== "object") return null;
+    const r = row as { status?: unknown; is_processing?: unknown };
+    if (r.is_processing === true || r.status === "running") return "working";
+    if (r.status !== "ready" || r.is_processing !== false) allReady = false;
+  }
+  return allReady ? "idle-at-prompt" : null;
+}
+
+/** The jcode self-report rung: the seat-scoped debug socket is jcode's own statement of
+ *  whether a turn is in flight. Unreadable/absent socket ⇒ null (the rung stales). */
+export async function readJcodeSelfReportEvidence(input: {
+  stateRoot: string;
+  sessionName: string;
+  seatNodeId: string;
+  now?: () => Date;
+  query?: (socketPath: string) => Promise<string | null>;
+  exists?: (path: string) => boolean;
+}): Promise<ActivityEvidence | null> {
+  const socket = nodePath.join(jcodeRuntimeDir(input.stateRoot, input.sessionName), "jcode-debug.sock");
+  if (!(input.exists ?? fs.existsSync)(socket)) return null;
+  const output = await (input.query ?? queryJcodeDebugSocket)(socket);
+  if (output === null) return null;
+  const activity = jcodeActivityFromSessions(output);
+  if (!activity) return null;
+  const at = (input.now ?? (() => new Date()))();
+  return {
+    seatNodeId: input.seatNodeId,
+    sessionName: input.sessionName,
+    rung: "self-report",
+    sourceId: "jcode:debug-socket",
+    seq: at.getTime(),
+    observedAt: at.toISOString(),
+    activity,
+    validForMs: JCODE_SELF_REPORT_VALID_MS,
+  };
 }
 
 export function readJcodeDebugSessions(socket: string, exec: (socket: string) => string | Promise<string>): Promise<JcodeSession[]> {

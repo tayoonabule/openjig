@@ -519,6 +519,9 @@ export type AgentActivityEvidenceSource =
    *  UI has called this source `terminal_activity` since slice 15 (activity-visuals.ts); the daemon
    *  reports under the SAME name rather than minting a second word for one signal. */
   | "terminal_activity"
+  /** OPR.99.0.1 — the runtime's own polled statement of turn state (jcode seat debug socket).
+   *  Time-bounded in the oracle; outranks terminal motion, which a repainting TUI keeps fresh. */
+  | "runtime_self_report"
   | "tmux_session"
   | "external_cli"
   | "session_registry";

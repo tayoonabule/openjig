@@ -33,6 +33,7 @@ import { ClaudeResumeAdapter } from "./adapters/claude-resume.js";
 import { CodexResumeAdapter } from "./adapters/codex-resume.js";
 import { JcodeResumeAdapter } from "./adapters/jcode-resume.js";
 import { JcodeRuntimeAdapter } from "./adapters/jcode-runtime-adapter.js";
+import { readJcodeSelfReportEvidence } from "./adapters/jcode-session.js";
 import { codexDaemonSupportProbe } from "./domain/codex-daemon-support.js";
 import { PiResumeAdapter } from "./adapters/pi-resume.js";
 import { RigSpecExporter } from "./domain/rigspec-exporter.js";
@@ -402,7 +403,11 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     eventBus,
     // S19 — the Claude self-report rung (pid.json), consulted per sweep for seats whose
     // declared inventory staffs it; unreadable = null = the ladder falls, never errors.
-    selfReportReader: (sessionName, seatNodeId) => {
+    selfReportReader: (sessionName, seatNodeId, runtime) => {
+      // OPR.99.0.1 — jcode's self-report is its seat-scoped debug socket (turn in flight or not).
+      if (runtime === "jcode") {
+        return readJcodeSelfReportEvidence({ stateRoot: nodePath.join(OPENRIG_HOME, "state", "jcode"), sessionName, seatNodeId });
+      }
       const sessionsDir = nodePath.join(process.env.CLAUDE_CONFIG_DIR ?? nodePath.join(os.homedir(), ".claude"), "sessions");
       return readClaudeSelfReportEvidence({ sessionsDir, sessionName, seatNodeId });
     },

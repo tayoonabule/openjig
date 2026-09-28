@@ -1164,7 +1164,12 @@ export async function attachAgentActivity(
      *  `{state: "running", source: "terminal_activity"}` on `terminalActive === true` since slice
      *  15). ACTIVITY was the one consumer that never read it, which is why the web UI could show a
      *  seat working while `rig ps` called the same seat `unknown`. Absent = the pre-fix behavior. */
-    seatActivity?: { getSeatActivity(sessionName: string): SeatActivity | null };
+    seatActivity?: {
+      getSeatActivity(sessionName: string): SeatActivity | null;
+      /** OPR.99.0.1 — optional: the arbitrated oracle, consulted only to let a jcode seat's
+       *  own self-report veto repaint motion. Absent = the pre-fix behavior. */
+      getSeatStateBySession?(sessionName: string): { activity: string; decidedBy: string | null } | null;
+    };
     now?: Date;
     // OPR.0.4.3 healthz-wedge amplification fix: cheap by default. The per-node
     // tmux `capturePaneContent` fallback (probeSessionActivity) is the storm that
@@ -1217,7 +1222,16 @@ export async function attachAgentActivity(
       const rawMs = motion.lastActivityAt ? Date.parse(motion.lastActivityAt) : Number.NaN;
       if (!Number.isFinite(rawMs)) return false;
       const ageSeconds = (sampledAt.getTime() - rawMs) / 1000;
-      return ageSeconds < motion.silenceWindowSeconds;
+      if (ageSeconds >= motion.silenceWindowSeconds) return false;
+      // OPR.99.0.1 — the jcode TUI repaints while idle, so its pane is ALWAYS in motion and
+      // motion alone would pin every idle jcode seat at `running`. When jcode's own fresh
+      // self-report (seat debug socket, time-bounded in the oracle) says idle, motion is
+      // repaint, not work. Scoped to jcode: Claude's D2 precedence is untouched.
+      if (entry.runtime === "jcode" && entry.canonicalSessionName) {
+        const arb = deps.seatActivity?.getSeatStateBySession?.(entry.canonicalSessionName) ?? null;
+        if (arb?.decidedBy === "self-report" && arb.activity === "idle-at-prompt") return false;
+      }
+      return true;
     })();
 
     /**
@@ -1268,6 +1282,27 @@ export async function attachAgentActivity(
       sessionName: entry.canonicalSessionName,
       now: sampledAt,
     });
+    // OPR.99.0.1 — a jcode seat's fresh self-report (its own debug socket: turn in flight or
+    // not) IS the activity answer. It outranks motion (repaint) and the aged hook, but never a
+    // needs_input hook — a blocked seat must stay visible.
+    if (entry.runtime === "jcode" && entry.canonicalSessionName && hookActivity?.state !== "needs_input") {
+      const arb = deps.seatActivity?.getSeatStateBySession?.(entry.canonicalSessionName) ?? null;
+      if (arb?.decidedBy === "self-report" && (arb.activity === "working" || arb.activity === "idle-at-prompt")) {
+        return {
+          ...entry,
+          agentActivity: {
+            state: arb.activity === "working" ? "running" : "idle",
+            reason: "jcode_self_report",
+            evidenceSource: "runtime_self_report",
+            sampledAt: sampledAt.toISOString(),
+            evidence: arb.activity,
+            runtime: "jcode",
+            fallback: false,
+            stale: false,
+          },
+        };
+      }
+    }
     // A fresh POSITIVE hook (running/needs_input/idle) is authoritative — EXCEPT that a positive
     // `idle` hook now yields to live motion (D2). running/needs_input hooks are untouched.
     if (hookActivity && hookActivity.state !== "unknown") {

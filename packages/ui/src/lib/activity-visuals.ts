@@ -93,6 +93,11 @@ export function getActivityStateWithSource(
   if (isFreshHook) {
     return { state: activity!.state, source: "hook" };
   }
+  // OPR.99.0.1 — a runtime's own fresh self-report outranks terminal motion (a repainting
+  // TUI keeps terminalActive true while idle).
+  if (activity && activity.evidenceSource === "runtime_self_report" && activity.state !== "unknown" && !activity.stale) {
+    return { state: activity.state, source: "hook" };
+  }
   if (activity?.state === "needs_input" && activity.evidenceSource === "pane_heuristic") {
     return { state: "needs_input", source: "pane_heuristic" };
   }

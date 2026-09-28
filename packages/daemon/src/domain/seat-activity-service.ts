@@ -41,7 +41,7 @@ export interface SeatActivityServiceDeps {
   now?: () => Date;
   /** S19: the self-report rung producer (Claude pid.json). Consulted per sweep for seats
    *  whose declared inventory staffs self-report; absent = the rung is absent. */
-  selfReportReader?: (sessionName: string, seatNodeId: string) => ActivityEvidence | null;
+  selfReportReader?: (sessionName: string, seatNodeId: string, runtime: string | null) => ActivityEvidence | null | Promise<ActivityEvidence | null>;
 }
 
 export interface PollSeatOptions {
@@ -59,7 +59,7 @@ export class SeatActivityService {
   // overlapping whole-fleet sweeps — at most one sweep's worth is ever in flight.
   private sweeping = false;
 
-  private readonly selfReportReader: ((sessionName: string, seatNodeId: string) => ActivityEvidence | null) | null;
+  private readonly selfReportReader: SeatActivityServiceDeps["selfReportReader"] | null;
 
   constructor(deps: SeatActivityServiceDeps) {
     this.tmux = deps.tmux;
@@ -139,7 +139,12 @@ export class SeatActivityService {
       });
       const seat = this.ladder.get(seatNodeId);
       if (this.selfReportReader && seat?.inventory?.rungs.some((r) => r.rung === "self-report")) {
-        const evd = this.selfReportReader(paneId, seatNodeId);
+        let evd: ActivityEvidence | null = null;
+        try {
+          evd = await this.selfReportReader(paneId, seatNodeId, seat.inventory.runtime);
+        } catch {
+          evd = null; // an unreadable self-report falls down the ladder, never errors
+        }
         if (evd) this.reportEvidence(evd); // null = unreadable ⇒ the rung simply stales
       }
     }
@@ -487,6 +492,7 @@ export class SeatActivityService {
       const evd = this.latestByRung(seat, rung, "activity");
       if (!evd || evd.activity === undefined) continue;
       if (rung === "lifecycle-hooks" && nowMs - Date.parse(evd.observedAt) > HOOK_AUTHORITY_WINDOW_MS) continue;
+      if (evd.validForMs !== undefined && nowMs - Date.parse(evd.observedAt) > evd.validForMs) continue;
       return evd;
     }
     return null;

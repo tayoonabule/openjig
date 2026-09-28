@@ -32,12 +32,13 @@ describe("S19 A5 — per-harness rung inventories (one data source)", () => {
     expect(rungs.has("self-report")).toBe(false); // absent rung — rendered honestly, never manufactured
   });
 
-  // Mirrors the codex inventory exactly: hooks TRIAL, sampling authoritative floor, no self-report rung.
-  it("jcode: hooks enter at TRIAL (AM-2), sampling authoritative, and NO self-report rung (mirrors codex)", () => {
+  // OPR.99.0.1: jcode's debug socket is an authoritative self-report rung (its TUI repaints while
+  // idle, so sampling alone reads an idle seat as working forever). Hooks still enter at TRIAL.
+  it("jcode: self-report authoritative (debug socket), hooks enter at TRIAL (AM-2), sampling authoritative", () => {
     const rungs = new Map(JCODE_ACTIVITY_RUNG_INVENTORY.rungs.map((r) => [r.rung, r]));
     expect(rungs.get("lifecycle-hooks")!.initialTrust).toBe("trial");
     expect(rungs.get("window-sampling")!.initialTrust).toBe("authoritative");
-    expect(rungs.has("self-report")).toBe(false);
+    expect(rungs.get("self-report")!.initialTrust).toBe("authoritative");
   });
 
   it("runtime resolution: claude/codex/jcode map to their inventories; anything else gets the generic floor", () => {
@@ -142,14 +143,14 @@ describe("S19 A5 — production wiring: the sweep auto-declares, consults self-r
     expect(s.rungs.find((r) => r.rung === "lifecycle-hooks")!.trust).toBe("trial");
   });
 
-  // Mirrors the codex wiring assertion: hooks appear at trial, sampling still decides.
-  it("a jcode seat is auto-declared with the jcode inventory: hooks appear at trial, sampling still decides", async () => {
+  // With no readable self-report (this harness's reader returns null), sampling still decides.
+  it("a jcode seat is auto-declared with the jcode inventory: hooks at trial, self-report staffed, sampling decides when it is silent", async () => {
     const { svc, db } = harness({ runtime: "jcode" });
     await svc.pollAllRunningTmuxSeats(db);
     expect(svc.hasRungInventory(SEAT)).toBe(true);
     const s = svc.getSeatState(SEAT)!;
     expect(s.decidedBy).toBe("window-sampling");
-    expect(s.rungs.some((r) => r.rung === "self-report")).toBe(false);
+    expect(s.rungs.find((r) => r.rung === "self-report")!.trust).toBe("authoritative");
     expect(s.rungs.find((r) => r.rung === "lifecycle-hooks")!.trust).toBe("trial");
   });
 });

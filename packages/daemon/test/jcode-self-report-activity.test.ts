@@ -37,6 +37,13 @@ describe("OPR.99.0.1 jcodeActivityFromSessions", () => {
     expect(jcodeActivityFromSessions(JSON.stringify(rows))).toBe("working");
   });
 
+  it("a stopped/completed/failed last turn, not processing, is at the prompt ⇒ idle", () => {
+    for (const status of ["stopped", "completed", "failed"]) {
+      expect(jcodeActivityFromSessions(JSON.stringify([{ status, is_processing: false }]))).toBe("idle-at-prompt");
+    }
+    expect(jcodeActivityFromSessions(JSON.stringify([{ status: "crashed", is_processing: false }]))).toBeNull();
+  });
+
   it("unknown vocabulary, empty or malformed output ⇒ null (never guess)", () => {
     expect(jcodeActivityFromSessions("[]")).toBeNull();
     expect(jcodeActivityFromSessions("not json")).toBeNull();

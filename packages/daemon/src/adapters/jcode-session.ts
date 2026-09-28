@@ -76,9 +76,14 @@ export function queryJcodeDebugSocket(socketPath: string, timeoutMs = 750): Prom
   });
 }
 
+/** jcode member statuses that mean "at the prompt, no turn in flight" once not processing:
+ *  `ready`, plus the terminal outcomes of the last turn (`stopped` after an interrupt,
+ *  `completed`, `failed`). */
+const JCODE_AT_PROMPT_STATUSES = new Set(["ready", "stopped", "completed", "failed"]);
+
 /** Map the seat's `sessions` rows to working/idle. Any processing session ⇒ working; every
- *  session `ready` and not processing ⇒ idle-at-prompt; anything else (unknown vocabulary,
- *  no rows) ⇒ null so the ladder falls through rather than guessing. */
+ *  session at the prompt and not processing ⇒ idle-at-prompt; anything else (unknown
+ *  vocabulary, no rows) ⇒ null so the ladder falls through rather than guessing. */
 export function jcodeActivityFromSessions(output: string): "working" | "idle-at-prompt" | null {
   let rows: unknown;
   try { rows = JSON.parse(output); } catch { return null; }
@@ -88,7 +93,7 @@ export function jcodeActivityFromSessions(output: string): "working" | "idle-at-
     if (!row || typeof row !== "object") return null;
     const r = row as { status?: unknown; is_processing?: unknown };
     if (r.is_processing === true || r.status === "running") return "working";
-    if (r.status !== "ready" || r.is_processing !== false) allReady = false;
+    if (typeof r.status !== "string" || !JCODE_AT_PROMPT_STATUSES.has(r.status) || r.is_processing !== false) allReady = false;
   }
   return allReady ? "idle-at-prompt" : null;
 }

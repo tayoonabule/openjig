@@ -64,6 +64,7 @@ import { prepareCodexSeatFolder, prepareCodexTeamWorkspace } from "./domain/code
 import { resolveCodexGitAddDirs } from "./domain/codex-git-add-dirs.js";
 import { JcodeResumeAdapter } from "./adapters/jcode-resume.js";
 import { JcodeRuntimeAdapter } from "./adapters/jcode-runtime-adapter.js";
+import { readJcodeSelfReportEvidence } from "./adapters/jcode-session.js";
 import { PiResumeAdapter } from "./adapters/pi-resume.js";
 import { OmpResumeAdapter } from "./adapters/omp-resume.js";
 import { OMP_PROVIDER_ENV_VARS, OMP_PROVIDER_EXTRA_ENV_VARS } from "./adapters/pi-runner-protocol.js";
@@ -566,7 +567,10 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     eventBus,
     // S19 — the Claude self-report rung (pid.json), consulted per sweep for seats whose
     // declared inventory staffs it; unreadable = null = the ladder falls, never errors.
-    selfReportReader: (sessionName, seatNodeId) => {
+    selfReportReader: (sessionName, seatNodeId, runtime) => {
+      if (runtime === "jcode") {
+        return readJcodeSelfReportEvidence({ stateRoot: nodePath.join(OPENRIG_HOME, "state", "jcode"), sessionName, seatNodeId });
+      }
       // The seat's own Claude config dir when it declares one, where its Claude writes pid.json.
       const sessionsDir = nodePath.join(claudeConfigRootFor(db, seatNodeId), "sessions");
       return readClaudeSelfReportEvidence({ sessionsDir, sessionName, seatNodeId });

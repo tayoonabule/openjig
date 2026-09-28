@@ -139,6 +139,10 @@ export interface ActivityEvidence {
   /** Which relay route posted hook evidence, when it said. One event can arrive by more than one route (a Codex seat's
    *  plugin hook and its managed hook), so promotion counts agreements per route. Absent for an untagged post. */
   route?: EvidenceRoute;
+  /** Optional freshness bound. When set, the evidence stops deciding activity once it is older
+   *  than this (the same time-bounding hooks get). Used by POLLED self-reports (jcode's debug
+   *  socket) so a dead socket's last answer can never stay authoritative. */
+  validForMs?: number;
 }
 
 /** The bounded set of relay routes. "unrecognised" stands for any other label, so a post can never add a new key. */
@@ -249,13 +253,17 @@ export const COMMUNITY_RUNNER_RUNG_INVENTORY: AdapterRungInventory = {
   rungs: RUNNER_ACTIVITY_RUNGS,
 };
 
-/** Jcode's activity-relay.cjs hooks (turn_start/turn_end/session_start/session_end) give the
- *  same four-event lifecycle coverage as Codex, so this inventory mirrors CODEX's exactly:
- *  hooks enter at TRIAL, sampling stays the authoritative floor. */
+/** Jcode: the seat's own debug socket (`sessions` → status/is_processing) is a self-report
+ *  rung, polled per sweep, time-bounded, and AUTHORITATIVE above sampling. Sampling alone
+ *  cannot tell idle from working here: the jcode TUI repaints while idle, so tmux
+ *  `#{window_activity}` advances every second and an idle seat would read working forever
+ *  (OPR.99.0.1). Activity-relay hooks still enter at TRIAL, with TUI sampling as the authoritative
+ *  floor only when no self-report is available. */
 export const JCODE_ACTIVITY_RUNG_INVENTORY: AdapterRungInventory = {
   adapterId: "jcode-runtime-adapter",
   runtime: "jcode",
   rungs: [
+    { rung: "self-report", lifecycleCoverage: "full", initialTrust: "authoritative" },
     { rung: "lifecycle-hooks", lifecycleCoverage: "full", initialTrust: "trial" },
     { rung: "window-sampling", lifecycleCoverage: "full", initialTrust: "authoritative" },
   ],

@@ -1438,7 +1438,12 @@ export class SessionTransport {
   private async bareShellForeground(sessionName: string): Promise<string | null> {
     try {
       const paneCommand = await this.tmuxAdapter.getPaneCommand(sessionName);
-      return paneCommand && isShellForeground(paneCommand) ? paneCommand.replace(/^-/, "") : null;
+      if (!paneCommand || !isShellForeground(paneCommand)) return null;
+      // A runtime launched through a shell wrapper (`/bin/sh <script>` -> jcode) reads as `sh`;
+      // a live non-shell descendant means the runtime is running, not a bare shell.
+      const wrapped = await this.tmuxAdapter.paneHasNonShellDescendant?.(sessionName, (c) => isShellForeground(c));
+      if (wrapped === true) return null;
+      return paneCommand.replace(/^-/, "");
     } catch {
       return null;
     }

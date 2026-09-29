@@ -935,15 +935,55 @@ export class TmuxAdapter {
   /** A launch metadata read. Callers must never put credential values in terminal input. */
   async getSessionEnv(session: string, key: string): Promise<string | undefined> {
     if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) throw new Error("Invalid session environment key.");
+    const target = exactTarget(session, "session");
     try {
-      const output = await this.run(["tmux", "show-environment", "-t", session, key],
-        `tmux show-environment -t ${shellQuote(session)} ${shellQuote(key)}`);
+      const output = await this.run(["tmux", "show-environment", "-t", target, key],
+        `tmux show-environment -t ${shellQuote(target)} ${shellQuote(key)}`);
       if (output.trim() === `-${key}`) return undefined;
       if (!output.startsWith(`${key}=`)) throw new Error("Unexpected session environment response.");
       return output.slice(key.length + 1).replace(/\r?\n$/, "");
     } catch (error) {
       if (error instanceof Error && error.message.includes(`unknown variable: ${key}`)) return undefined;
       throw new Error("Cannot read the session's launch environment.");
+    }
+  }
+
+  /**
+   * Does any process under the pane's shell run something other than a shell?
+   * A seat launched through a `/bin/sh <script>` wrapper reports `sh` as its
+   * pane command while the agent runtime runs as that script's child, so the
+   * pane command alone cannot tell a bare shell from a wrapped runtime.
+   * Returns null when the process table cannot be read.
+   */
+  async paneHasNonShellDescendant(paneId: string, isShell: (command: string) => boolean): Promise<boolean | null> {
+    const root = await this.getPanePid(paneId);
+    if (root == null) return null;
+    try {
+      const table = await this.exec(`ps -A -o pid= -o ppid= -o comm=`);
+      const children = new Map<number, Array<{ pid: number; comm: string }>>();
+      for (const line of table.split("\n")) {
+        const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+        if (!match) continue;
+        const entry = { pid: Number(match[1]), comm: match[3]!.trim() };
+        const ppid = Number(match[2]);
+        const list = children.get(ppid) ?? [];
+        list.push(entry);
+        children.set(ppid, list);
+      }
+      const queue = [root];
+      const seen = new Set<number>(queue);
+      while (queue.length) {
+        for (const child of children.get(queue.shift()!) ?? []) {
+          if (seen.has(child.pid)) continue;
+          seen.add(child.pid);
+          const base = child.comm.split("/").pop() ?? child.comm;
+          if (!isShell(base)) return true;
+          queue.push(child.pid);
+        }
+      }
+      return false;
+    } catch {
+      return null;
     }
   }
 

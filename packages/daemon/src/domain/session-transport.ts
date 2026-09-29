@@ -1753,6 +1753,13 @@ export class SessionTransport {
       return null;
     }
     if (!paneCommand || !isShellForeground(paneCommand)) return null;
+    // A shell label can wrap an active runtime (`/bin/sh <script>`). Clear the
+    // bare-shell refusal only on positive descendant evidence; unreadable or
+    // unavailable process tables remain fail-closed.
+    const wrapped = pane
+      ? await this.tmuxAdapter.paneHasNonShellDescendant?.(pane, isShellForeground).catch(() => null)
+      : null;
+    if (wrapped === true) return null;
     if (runtime === "codex" && pane) {
       // Reuse stable, foreground, pane-descendant Codex proof. A resumed process
       // must name this session's token. Stale UI, a Node

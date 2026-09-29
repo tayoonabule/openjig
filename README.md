@@ -11,9 +11,19 @@ A harness wraps a model. A rig wraps your harnesses. Define your agent team in Y
 
 OpenRig turns AI coding agents from a pile of terminal sessions into a persistent, organized team. Talk to a lead agent about the outcome you want; it can coordinate specialists across teams and bring you results and decisions that need your attention. Start with a repository and one useful change, then keep the team's work and context at the same addresses.
 
+**Guide:** [Getting started](docs/reference/getting-started.md) · **Stuck?** [Help](docs/reference/help.md) · **Questions:** [Q&A](https://github.com/mvschwarz/openrig/discussions/92) · **Updates and demos:** [@_feralmachine on X](https://x.com/_feralmachine)
+
+## See it running
+
+![The OpenRig TUI: the build rig as a graph, then as a table of seats with runtime, model, context and state, then one seat in detail (real recording, 10 seconds)](assets/readme/openrig-agents-working.gif)
+
+**Start here:** [the guided first-use path](docs/reference/getting-started.md): install, launch a two-agent team in your repository, and get one reviewed change.
+
+Not setting this up today? Get the next walkthrough and occasional OpenRig updates → https://openrig.dev/follow
+
 ## Install and first run
 
-Requires Node.js 20, 22 or 24 and tmux, on macOS or Linux. On a Mac with Apple silicon, use Node.js 22 ([why](docs/releases/v0.5.15.md#known-compatibility-limitation)). Native Windows is not supported yet, and WSL2 has not been tested. Launching a rig writes provider hooks and workspace trust settings. Before running the commands below, read [what OpenRig changes on your machine](#what-openrig-changes-on-your-machine) and back up the relevant files.
+Requires Node.js 22 or 24 and tmux, on macOS or Linux. On a Mac with Apple silicon, use Node.js 22 ([compatibility history](docs/releases/v0.5.15.md#known-compatibility-limitation)). Native Windows is not supported yet, and WSL2 has not been tested. Launching a rig writes provider hooks and workspace trust settings. Before running the commands below, read [what OpenRig changes on your machine](#what-openrig-changes-on-your-machine) and back up the relevant files.
 
 ```bash
 npm install -g @openrig/cli
@@ -22,41 +32,48 @@ rig setup --dry-run
 
 To install with Bun instead, run `bun add -g @openrig/cli`. OpenRig still runs on Node.js, so install Node.js 22 as well. Bun may block this package's postinstall script, in which case the Node.js and SQLite check described under [what OpenRig changes on your machine](#what-openrig-changes-on-your-machine) does not run at install time.
 
-Review setup's plan before applying `rig setup`: it checks both native harnesses and cmux. This starter requires tmux and authenticated Codex; the other harness and terminal provider are optional for its repository task.
+Choose the working account you already have: **Claude Code, Codex, or both**. Reuse an explicit choice; no second subscription is required. `rig setup --dry-run` previews the broader setup, but applying `rig setup` checks both harnesses and cmux. It is optional for the [selected-provider path](docs/reference/getting-started.md#choose-your-providers).
 
-Before launching, ask your agent to [configure your chosen permissions](docs/reference/getting-started.md#have-your-agent-configure-permissions): keep prompts, remember selected commands, or deliberately choose broader access. The agent handles setup and verification; OpenRig's shipped defaults stay unchanged.
+Before launching, your agent asks once: **“Allow your agents to run OpenRig commands without repeated permission prompts?” Yes — recommended / No — keep prompts.** This covers every `rig` command, including starting/stopping agents and configuration, at personal project scope unless you explicitly choose user-wide sessions. It is not global YOLO or permission to invent work. On Yes, the agent [adds and verifies native rules](docs/reference/getting-started.md#have-your-agent-configure-permissions); No or no answer leaves settings unchanged. An existing explicit choice is reused. Say “Undo the OpenRig command allowances added by this setup” to remove only its additions.
 
-Check prerequisites in your launch shell:
+Check `tmux -V` and only your selected CLI/login: `claude --version` plus
+`claude auth status`, or `codex --version` plus `codex login status`. If needed,
+sign in once with `claude auth login` or `codex login`; do not install or log in
+to an unused provider.
 
-```bash
-tmux -V
-codex --version
-codex login status
-```
+| Team | Starter | Models |
+| --- | --- | --- |
+| Two Codex agents | `first-project` | Both `gpt-6-astra` (unchanged) |
+| Two Claude agents | `first-project-claude` | Configured native Claude default |
+| Claude owner + Codex checker | `first-project-mixed` | Claude default + `gpt-6-astra` |
 
-Resolve missing tools or login before continuing. From your repository, inspect the plan before launching the two Codex seats, an owner and a checker:
+All three use the same owner/checker roles and task. Show the selected runtime,
+configured model and command before launch; confirm the account supports the
+model instead of silently falling back. The kernel starts automatically and
+selects from available authenticated providers independently of these two project
+agents. A missing unused provider is not a setup requirement.
 
 ```bash
 cd /path/to/your/repository
-rig up first-project --cwd . --plan
-rig up first-project --cwd .
+starter=first-project  # or first-project-claude or first-project-mixed
+rig specs preview "$starter" --kind rig
+rig up "$starter" --cwd . --plan
+rig up "$starter" --cwd .
 rig tui --shared
 ```
 
 The kernel provides separate operational support and the shared dashboard. To detach without stopping the dashboard, press Ctrl-b then d; `rig tui --shared` returns to that view. Plain `rig tui` opens an independent view. Closing a viewing terminal does not mean you should relaunch the team.
 
-Check project-seat readiness with `rig ps --nodes --rig first-project` and resolve any authentication, trust or permission prompt before assigning work. Then give the owner one bounded outcome from your repository:
+Check project-seat readiness with `rig ps --nodes --rig "$starter"` and resolve any authentication, trust or permission prompt before assigning work. Then give the owner one bounded outcome from your repository:
 
 ```bash
-rig send dev-owner@first-project 'Implement <one useful change>. Track the task in the queue and return its ID. Keep it local, verify the behavior, ask dev-check@first-project to check the exact candidate, and record the result and how I can try it.'
-rig queue list --destination dev-owner@first-project --limit 1000
+rig send "dev-owner@$starter" 'Implement <one useful change>. Track the task in the queue and return its ID. Keep it local, verify the behavior, ask dev-check in this rig to check the exact candidate, and record the result and how I can try it.'
+rig queue list --destination "dev-owner@$starter" --limit 1000
 ```
 
 Sending a message does not itself create a queue item; the owner records the task. Read the final artifact and the review of its exact candidate, then return to the same owner for the next change. [The guided first-use path](docs/reference/getting-started.md) covers readiness, a useful task, a reviewed result, Herdr/cmux terminals and recovery.
 
-## See it running
-
-![The OpenRig TUI: the build rig as a graph, then as a table of seats with runtime, model, context and state, then one seat in detail (real recording, 10 seconds)](assets/readme/openrig-agents-working.gif)
+Not setting this up today? Get the next walkthrough and occasional OpenRig updates → https://openrig.dev/follow
 
 ## Community
 
@@ -81,7 +98,7 @@ using a published package, since repository guidance can be ahead of npm.
 | **`rig setup`** | Attempts missing tools and writes an OpenRig block in `~/.tmux.conf` for mouse support and scrollback. On macOS it can install cmux and enable its automation socket control in `~/.config/cmux/settings.json`. `--full` adds workstation tools. `--dry-run` shows setup's plan without applying it. |
 | **Daemon startup** | Creates/updates instance state under `OPENRIG_HOME` (normally `~/.openrig`), including its database and managed plugin resources. Seeds the `openrig-skills` discovery skill in `~/.claude/skills` and `~/.agents/skills`, subject to existing version ownership. With `runtime.codex.hooks_enabled` enabled (the default), writes Codex hook configuration and trust records as described below—even before a rig launches. |
 | **Rig/seat launch and attachment** | Creates tmux sessions, supplies seat identity and daemon connection environment, and projects selected guidance, skills, plugins and runtime resources into the workspace. Managed startup pre-trusts the workspace. Claude context collection can also be provisioned for attached sessions and refreshed during monitoring. |
-| **Explicit permission configuration** | The built-in bootstrap does **not** add `rig` command allow rules. Ask your agent to [apply your chosen project or user scope](docs/reference/getting-started.md#have-your-agent-configure-permissions); existing rules remain relevant. Broader access is a separate choice. |
+| **Explicit permission configuration** | The built-in bootstrap does **not** add `rig` command allow rules. Agent-guided setup recommends Yes and requires your actual answer before the agent [adds rules at your chosen scope](docs/reference/getting-started.md#have-your-agent-configure-permissions). No/no answer preserves settings; existing choices and stricter rules remain relevant. Broader access is separate. |
 
 The provider files are separate from instance state. Here `~` means the daemon
 user's home; changing `OPENRIG_HOME` alone does not isolate provider configuration.
@@ -115,14 +132,28 @@ endpoint on GitHub.
 Managed launches supply `HOME`, `CODEX_HOME` and `OPENRIG_*` identity/connection
 variables. Claude uses `--permission-mode acceptEdits` and defaults to the classic
 renderer for terminal scrollback. Codex uses `-s workspace-write` unless a named
-profile governs its sandbox; OpenRig does not force an approval-policy flag.
+profile governs its sandbox; the default does not force an approval-policy flag.
 Fresh Codex launches also add writable access to the workspace's `.git` and the
 pod's shared queue-state directory with `--add-dir`; the shared root comes from
 `OPENRIG_SHARED_DOCS_ROOT` or `~/.openrig/shared-docs`.
-YOLO is **off by default**. Explicit `OPENRIG_YOLO=1` or a full-bypass seat policy
-selects Claude's `--dangerously-skip-permissions` or Codex's
-`-s danger-full-access`; a resolved seat policy takes precedence over the
+YOLO is **off by default**. An explicitly selected full-bypass policy selects
+Claude's `--dangerously-skip-permissions` or Codex's
+`-s danger-full-access -a never`. The legacy environment-only `OPENRIG_YOLO=1`
+path still selects only Codex's sandbox; a resolved policy overrides that
 environment setting.
+
+Permission mode controls native execution permissions; work posture is separate
+project guidance. Use `rig policy permissions list|show|current|apply` for rig
+policy configuration (the four `rig policy` aliases remain compatible). Use
+`rig seat set-permissions <seat> --mode <mode> --reason <text>` for an audited
+future-launch choice: `floor`, `full_bypass`, or `inherit` to clear the seat
+override. Additional Claude modes such as `auto` require support from the exact
+managed Claude executable at the seat's working directory; selection and launch
+each check it. Unsupported or changed contexts refuse without a fallback.
+This does not relaunch the seat
+or change its current native process, history, rules or hooks. `rig seat status`
+separates the desired selection from the last launch arguments; neither proves
+native enforcement. See the [permission guide](docs/reference/getting-started.md#per-seat-permission-mode).
 
 Managed hook blocks target OpenRig's entries and retain unrelated hooks, but
 trust entries, selected resource keys and Claude's existing status-line command
@@ -142,13 +173,16 @@ OpenRig is a multi-agent harness — it manages the system that coding agents fo
 - **Discover** existing Claude Code and Codex sessions in tmux and adopt them into a managed rig
 - **Snapshot** the topology with `rig down --snapshot`, restore by name with `rig up <name>`
 - **Communicate** across agents with `rig send`, `rig broadcast`, and `rig chatroom`
+- **Protect** a seat where you type by hand: `rig seat set-typing-guard <seat> --enabled true --reason <text>` holds automatic messages and wakes instead of typing them into that seat (off by default; see `rig seat set-typing-guard --help`)
+- **Connect** Slack through an app you create in your own workspace; the experimental `rig slack manifest` prints that app's manifest ([setup guide](docs/reference/slack-app-setup.md))
 - **Evolve** running topologies with `rig grow`, `rig shrink`, `rig launch`, `rig remove`
 
 Every agent runs in a tmux session you can attach to, inspect, and work with directly.
 
 ## Starter Rigs
 
-Use `first-project` for the focused first-use path. `product-team` is an optional
+Use `first-project`, `first-project-claude`, or `first-project-mixed` for the
+same focused first-use path on your selected providers. `product-team` is an optional
 larger product-development example:
 
 ```bash
@@ -208,7 +242,7 @@ With herdr installed and connected, open the starter's terminals together:
 rig terminal open first-project --provider herdr
 ```
 
-For cmux, use `--provider cmux`. The underlying sessions remain accessible through tmux. See the [terminal workspace guide](docs/reference/getting-started.md#share-the-dashboard-and-return-to-it) for setup and returning to an existing view.
+For cmux, use `--provider cmux`. In the TUI, a rig's detail view has a `term ▸ rig <name>` link that opens every running seat of that rig in the default terminal provider; with herdr that is up to 16 seats per tab, in a workspace named after the rig. The underlying sessions remain accessible through tmux. See the [terminal workspace guide](docs/reference/getting-started.md#share-the-dashboard-and-return-to-it) for setup and returning to an existing view.
 
 ## Key Concepts
 
@@ -235,7 +269,27 @@ Requires Docker for service-backed rigs.
 
 ## Upgrading an existing instance
 
-For an existing installation, follow the [upgrade procedure](skills/_canonical/core/openrig-upgrade/SKILL.md) and the [0.5.14 release notes](docs/releases/v0.5.14.md). Preserve live seats during the upgrade; `rig down` is not an upgrade step.
+For an existing installation, follow the [upgrade procedure](skills/_canonical/core/openrig-upgrade/SKILL.md) and the [0.5.14 release notes](docs/releases/v0.5.14.md). Preserve live seats during the upgrade; `rig down` is not an upgrade step. Upgrading to 0.6.0 also requires Node.js 22 or 24: see [Moving off Node 20](#moving-off-node-20) and the [0.6.0 release notes](docs/releases/v0.6.0.md).
+
+### Moving off Node 20
+
+OpenRig 0.6.0 supports Node.js 22 and 24 only. Its SQLite binding
+(better-sqlite3 13) requires Node 22 or newer. Node 20 is no longer supported;
+the install check refuses it with an explanation.
+
+If you run OpenRig on Node 20, switch Node first, then reinstall the CLI under
+the new Node (a version manager keeps a separate global package set for each
+Node):
+
+```bash
+nvm install 22          # or 24; fnm or your package manager work the same way
+npm install -g @openrig/cli
+rig --version
+```
+
+Your existing OpenRig data stays where it is. The daemon reopens the same
+database under the new binding and applies any pending migrations in place.
+Restart the daemon under the new Node by following the upgrade procedure above.
 
 ### Crossing the 0.5.9 layout boundary
 
@@ -282,7 +336,9 @@ seat, plugin, and release lifecycle actions remain agent-owned.
 
 ## Requirements
 
-- Node.js 20, 22, or 24 (the supported versions in this release). On a Mac with Apple silicon, use Node.js 22: see the [known compatibility limitation](docs/releases/v0.5.15.md#known-compatibility-limitation)
+- Node.js 22 or 24 (the supported versions in this release). Node 20 is no
+  longer supported. Node 26 and other versions are untested. On a Mac with Apple
+  silicon, use Node.js 22: see the [compatibility history](docs/releases/v0.5.15.md#known-compatibility-limitation).
 - tmux
 - macOS or Linux. Native Windows is not supported yet, and WSL2 has not been tested
 
@@ -302,7 +358,7 @@ Before setup or managed launch, review [what OpenRig changes on your machine](#w
 
 Already-running adopted sessions may need restart before they pick up newly written runtime config.
 
-**For agents:** Ask the user whether they want core setup (`rig setup`) or the fuller workstation path (`rig setup --full`) before choosing the invocation. Inspect the result with `--json` and use `rig doctor` to finish any remaining machine-specific issues.
+**For agents:** First ask which available provider(s) the user wants, reusing an explicit choice. Recommend the working account they already have and follow the selected-provider guide above. Offer core setup (`rig setup`) or the fuller workstation path (`rig setup --full`) only when they want those additional tools. Inspect the result with `--json` and use `rig doctor` to finish any remaining machine-specific issues. When OpenRig itself misbehaves, read [docs/reference/help.md](docs/reference/help.md) (installed agents can run `rig context get help`; the same text is at [openrig.dev/help/agents](https://www.openrig.dev/help/agents)): it covers the next step, known problems, and how to reach the team if you're still stuck.
 
 ## Comparison with Claude Managed Agents
 

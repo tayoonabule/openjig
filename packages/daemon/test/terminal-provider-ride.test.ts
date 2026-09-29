@@ -191,6 +191,29 @@ describe("view-composer partition vectors", () => {
   it("chunkPanes rejects a non-positive page size", () => {
     expect(() => chunkPanes([], 0)).toThrow();
   });
+
+  it("carries live Claude and Codex runtimes into Herdr tile hints but leaves terminal seats unchanged", () => {
+    const members = deriveViewMembers([
+      { canonicalSessionName: "claude@rig", attachmentType: "tmux", runtime: "claude-code" },
+      { canonicalSessionName: "codex@rig", attachmentType: "tmux", runtime: "codex" },
+      { canonicalSessionName: "operator@rig", attachmentType: "tmux", runtime: "terminal" },
+    ]);
+    const view = composeView("rig:rig", members, ctxWith([]));
+    const grid = buildGridRoot(view.opened).root;
+    const panes: HerdrPaneNode[] = [];
+    const collect = (node: HerdrLayoutNode) => {
+      if (node.type === "pane") panes.push(node);
+      else { collect(node.first); collect(node.second); }
+    };
+    collect(grid);
+
+    expect(panes.filter((pane) => pane.label).map((pane) => pane.command)).toEqual([
+      ["sh", "-c", "env HERDR_AGENT=claude tmux attach -t 'claude@rig'"],
+      ["sh", "-c", "env HERDR_AGENT=codex tmux attach -t 'codex@rig'"],
+      ["sh", "-c", "tmux attach -t 'operator@rig'"],
+    ]);
+    expect(panes.at(-1)?.command).toEqual(["sh"]);
+  });
 });
 
 describe("terminal-views store — round-trip byte-stable + atomic write + A3", () => {
@@ -290,7 +313,8 @@ describe("herdr layout plan — fresh-tab-on-relaunch (BR-5) + equal auto-grid r
     expect(first.pages[0]!.tabLabel).toBe("openrig:acme-build#l1");
     expect(second.pages[0]!.tabLabel).toBe("openrig:acme-build#l2");
     expect(first.pages[0]!.tabLabel).not.toBe(second.pages[0]!.tabLabel);
-    // Same token → deterministic (same label). The workspace label matches.
+    // Same token → deterministic (same label). OPR.0.6.0.8: the workspace is named for
+    // people (the view id here; the rig name for a rig: view); tabs keep the token.
     expect(planHerdrLayout(view, "l1").pages[0]!.tabLabel).toBe(first.pages[0]!.tabLabel);
     // The sidebar label is readable; the tab label carries the reuse key.
     expect(first.workspaceLabel).toBe("acme-build");
@@ -456,8 +480,12 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
     expect(res.ok).toBe(true);
     expect(res.opened).toEqual(["a@r"]);
     expect(res.pages).toBe(1);
-    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "layout.apply"]);
+    // OPR.0.6.0.8: after the page is applied, its tab is focused (no blank-tab close here:
+    // this create reply carries no default tab id).
+    // The fork's reuse lookup (tab.list, workspace.list) runs first.
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "layout.apply", "tab.focus"]);
     expect(requests[2]!.params).toEqual({ focus: false, label: "v" });
+    expect(requests[4]!.params).toEqual({ tab_id: "wG:t2" });
     expect(requests[3]!.params).toEqual({
       workspace_id: "wG",
       tab_label: "openrig:v#tok",
@@ -466,21 +494,21 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
     });
   });
 
-  it("the first page replaces the new workspace's blank default tab; later pages add tabs", async () => {
+  it("every page adds a tab, then the known-blank starting tab is closed (OPR.0.6.0.8 #26)", async () => {
     // Live Herdr 0.9.1 envelope: workspace.create returns its default tab.
+    let n = 0;
     const { transport, requests } = fakeSocketTransport({
       respond: async (method) => method === "workspace.create"
         ? { type: "workspace_created", workspace: { workspace_id: "wG" }, tab: { tab_id: "wG:t1" } }
-        : { type: "layout_apply" },
+        : method === "layout.apply" ? { type: "layout_apply", tab: { tab_id: `wG:t${++n + 1}` } } : { type: "ok" },
     });
     const adapter = new HerdrAdapter({ transportFactory: () => transport, newLaunchToken: () => "tok" });
     const two: ComposedView = { id: "v", opened: [pane, pane], absent: [], degraded: [], pages: [[pane], [pane]] };
     await adapter.openView(two);
     const applies = requests.filter((r) => r.method === "layout.apply").map((r) => r.params as Record<string, unknown>);
-    expect(applies[0]).toMatchObject({ tab_id: "wG:t1" });
-    expect(applies[0]).not.toHaveProperty("workspace_id");
-    expect(applies[1]).toMatchObject({ workspace_id: "wG" });
-    expect(applies[1]).not.toHaveProperty("tab_id");
+    for (const a of applies) expect(a).toMatchObject({ workspace_id: "wG" });
+    expect(requests.find((r) => r.method === "tab.focus")!.params).toEqual({ tab_id: "wG:t2" });
+    expect(requests.find((r) => r.method === "tab.close")!.params).toEqual({ tab_id: "wG:t1" });
   });
 
   it("REGRESSION (the VM-RED class): only socket methods ever — the absent CLI `herdr layout apply` cannot pass again", async () => {
@@ -496,7 +524,7 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
       expect(r.method).not.toContain("--help");
       expect(r.method).not.toContain(" ");
     }
-    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "layout.apply"]);
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "layout.apply", "tab.focus"]);
   });
 
   it("a labeled workspace.create failure falls back ONCE to a bare create (uncaptured-param defense)", async () => {
@@ -513,8 +541,11 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
     const res = await adapter.openView(view);
     expect(res.ok).toBe(true);
     expect(res.opened).toEqual(["a@r"]);
-    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "workspace.create", "layout.apply"]);
-    expect((requests[4]!.params as Record<string, unknown>)["workspace_id"]).toBe("wH");
+    // Fork reuse lookup (tab.list, workspace.list), then OPR.0.6.0.8: before the bare
+    // fallback it checks for a same-named workspace (none here).
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "workspace.list", "workspace.create", "layout.apply"]);
+    expect((requests[5]!.params as Record<string, unknown>)["workspace_id"]).toBe("wH");
+    expect(res.notes?.join(" ")).toContain('refused the workspace name "v"');
   });
 
   it("an already-open view is found by its tab key, relabelled readable, focused, not duplicated", async () => {

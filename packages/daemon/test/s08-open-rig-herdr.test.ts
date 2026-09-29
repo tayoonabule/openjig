@@ -100,9 +100,9 @@ describe("S08 — the rig opens as one Herdr space, 16 cells per tab", () => {
     const { transport, requests } = herdrTransport();
     const { svc } = service(new HerdrAdapter({ transportFactory: () => transport }));
     const res = await svc.openView({ view: `rig:${RIG}` });
-    expect(requests.map((r) => r.method)).toEqual(["workspace.create", "layout.apply", "layout.apply", "tab.focus", "tab.close"]);
-    expect(requests[3]!.params).toEqual({ tab_id: "w1:t1" });
-    expect(requests[4]!.params).toEqual({ tab_id: "w1:t0" });
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "layout.apply", "layout.apply", "tab.focus", "tab.close"]);
+    expect(requests[5]!.params).toEqual({ tab_id: "w1:t1" });
+    expect(requests[6]!.params).toEqual({ tab_id: "w1:t0" });
     expect(res.notes).toBeUndefined();
   });
 
@@ -197,7 +197,7 @@ describe("S08 correction — the starting tab is kept unless it is known blank",
     const { transport, requests } = herdrTransport((m) => (m === "workspace.create" ? create : { type: "l" }));
     const { svc } = service(new HerdrAdapter({ transportFactory: () => transport }));
     const res = await svc.openView({ view: `rig:${RIG}` });
-    expect(requests.map((r) => r.method)).toEqual(["workspace.create", "layout.apply", "layout.apply"]);
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "layout.apply", "layout.apply"]);
     expect(res.notes).toEqual(["herdr returned no tab id for any page, so no tab was focused explicitly.", KEPT]);
   });
 
@@ -220,7 +220,7 @@ describe("S08 correction — the starting tab is kept unless it is known blank",
     const { transport, requests } = herdrTransport((m) => { if (m === "workspace.create") return create; throw new Error("refused"); });
     const { svc } = service(new HerdrAdapter({ transportFactory: () => transport }));
     const res = await svc.openView({ view: `rig:${RIG}` });
-    expect(requests.map((r) => r.method)).toEqual(["workspace.create", "layout.apply", "layout.apply"]);
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "layout.apply", "layout.apply"]);
     expect(res.opened).toEqual([]);
     expect(res.degraded).toHaveLength(17);
   });

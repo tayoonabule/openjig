@@ -47,7 +47,12 @@ export function observerRuntimeLife(rows: NativeProcessRow[], panePid: number | 
     const argv = row.command.match(/"[^"]*"|'[^']*'|\S+/g)?.map(v => v.replace(/^['"]|['"]$/g, "")) ?? [];
     if (path.basename(argv[0] ?? "") !== executable) continue;
     if (runtime === "jcode" && argv.includes("serve")) continue;
-    if (token && !(argv.some((arg, i) => ["--resume", "--session-id", "resume"].includes(arg) && argv[i + 1] === token) || argv.includes(`--resume=${token}`))) continue;
+    const hasResumeSelector = argv.some(arg => ["--resume", "--session-id", "resume"].includes(arg) || arg.startsWith("--resume=") || arg.startsWith("--session-id="));
+    const matchesToken = argv.some((arg, i) => ["--resume", "--session-id", "resume"].includes(arg) && argv[i + 1] === token) || argv.includes(`--resume=${token}`) || argv.includes(`--session-id=${token}`);
+    // Fresh Jcode TUI launches acquire their saved token after the process starts.
+    // Exact pane binding remains the authority; an explicit conflicting resume
+    // selector is still unknown, never absence or permission to switch sessions.
+    if (token && !matchesToken && !(runtime === "jcode" && !hasResumeSelector && argv[1]?.startsWith("-"))) continue;
     return "running";
   }
   const rootExecutable = path.basename(root.executableName ?? root.command.split(/\s+/)[0] ?? "").replace(/^-/, "");

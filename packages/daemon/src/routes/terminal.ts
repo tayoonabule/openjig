@@ -49,6 +49,11 @@ function readOpenBody(raw: unknown): { provider?: string; view?: string; expecte
 export function terminalRoutes(): Hono {
   const app = new Hono();
 
+  app.get("/managed-views", c => {
+    const controller = c.get("managedHerdrViews" as never) as { status(): Record<string, string> } | undefined;
+    return c.json({ enabled: !!controller, findings: controller?.status() ?? {} });
+  });
+
   app.post("/open", async (c) => {
     const svc = getService(c);
     if (!svc) return c.json({ error: "terminal_service_unavailable" }, 503);

@@ -56,6 +56,19 @@ export class HerdrAgentBridge {
     this.bindings.clear();
   }
 
+  /** Rebind a verified passive observer after daemon restart, without reattaching. */
+  registerPane(sessionName: string, paneId: string): void {
+    const seat = this.deps.resolveSeat(sessionName);
+    if (!seat?.runtime) return;
+    const existing = this.bindings.get(paneId);
+    if (existing && existing.sessionName === sessionName && existing.seat.nodeId === seat.nodeId && existing.seat.resumeToken === seat.resumeToken) return;
+    const binding = { paneId, sessionName, seat, seq: Date.now() };
+    this.bindings.set(paneId, binding);
+    this.enqueueReport(binding);
+  }
+
+  forgetPane(paneId: string): void { this.bindings.delete(paneId); }
+
   /**
    * Called immediately after Herdr creates a layout. Its returned tree contains
    * the public pane ids, in the same leaf order as the submitted layout tree.

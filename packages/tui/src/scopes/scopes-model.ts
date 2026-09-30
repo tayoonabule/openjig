@@ -47,7 +47,8 @@ export function authoredCompletion(slices: readonly SliceScopeSnap[]): string | 
   if (!slices.length || slices.some(s => s.error || s.status?.trim().toLowerCase() !== "done" || s.readiness?.configured)) return null;
   const verdicts = slices.map(s => s.proofReport?.verdict?.trim().toLowerCase());
   if (verdicts.some(verdict => verdict !== "pass" && verdict !== "pass-with-residue")) return null;
-  return `${slices.length} of ${slices.length} done, ${verdicts.includes("pass-with-residue") ? "closed with residue" : "pass"}`;
+  const residue = verdicts.includes("pass-with-residue") || slices.some(s => /\bwith[ -]residue\b/i.test(s.proofReport?.detail ?? ""));
+  return `${slices.length} of ${slices.length} done, ${residue ? "closed with residue" : "pass"}`;
 }
 
 /** Slice state glyph (mock: ● building/spec · ✓ delivery-locked · ⊙ other/idle). */
@@ -78,8 +79,9 @@ export function scopesExplorerRows(
   for (const m of scopes) {
     const key = `scopes-mission:${m.mission}`;
     const open = expanded.has(key);
+    const completion = !m.error ? authoredCompletion(m.slices) : null;
     rows.push({
-      label: `${indent}${open ? "▾" : "▸"} ${m.mission}${m.error ? " · unavailable" : authoredCompletion(m.slices) ? ` · ${authoredCompletion(m.slices)}` : ""}`,
+      label: `${indent}${open ? "▾" : "▸"} ${m.mission}${m.error ? " · unavailable" : completion ? ` · ${completion}` : ""}`,
       action: { type: "scopes-mission-open", mission: m.mission },
       disclosureAction: { type: "toggle-expand", key },
       key,

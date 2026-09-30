@@ -1109,7 +1109,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
     if (state.project && !state.scopesMission) return [...projectHeader, { text: "Choose a mission" }, ...(snap.scopes ?? []).flatMap(m => {
       const completion = !m.error ? authoredCompletion(m.slices) : null;
       return [listItem(m.mission + (m.error ? " · source unavailable" : completion ? ` · ${completion}` : ""), { type: "scopes-mission-open", mission: m.mission }),
-        ...(completion ? [{ text: "  formal item proof not recorded", segs: [{ text: "  formal item proof not recorded", token: "dim" as const }] }] : [])];
+        ...(completion ? [{ text: "  Authored reports · formal item proof not recorded", segs: [{ text: "  Authored reports · formal item proof not recorded", token: "dim" as const }] }] : [])];
     }), ...(!snap.scopes?.length && !errors.length ? [{ text: "No missions found in this project." }] : [])];
     // SCOPES owns both levels. Both mission-graph and Explorer slice routes land
     // on the same execution-backed canonical detail; store-direct content is

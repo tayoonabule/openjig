@@ -13,7 +13,7 @@ import { connectionsLines } from "./connections/connections-model.js";
 // SAME semantic actions commands produce (PIN 1). Isolated seam: a substrate
 // swap touches only this module (spike verdict revisit trigger).
 import { computeExplorerRows, findAgent, findSpec, findAgentBySession, agentsRunningSpec, agentsRunningSpecTargets, specDetailArrowsScroll } from "./state.js";
-import { scopesContentLines } from "./scopes/scopes-model.js";
+import { authoredCompletion, scopesContentLines } from "./scopes/scopes-model.js";
 import { executionContentLines, executionSliceStripLines } from "./execution/execution-model.js";
 import { navigatorDisplay } from "./navigator.js";
 import { renderGraphStyle } from "./topology/render-graph.js";
@@ -1106,7 +1106,11 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
       ? [{ text: `PROJECT ${state.project.id}`, action: { type: "project-source" as const } }, ...wrapDetailLines(errors, contentWidth)]
       : [...identity, listItem("Read current source", { type: "project-source" }), ...wrapDetailLines(errors, contentWidth)] : [];
     if (state.project && (!entry || entry.error)) return [...projectHeader, { text: "Choose a project again or go Back." }];
-    if (state.project && !state.scopesMission) return [...projectHeader, { text: "Choose a mission" }, ...(snap.scopes ?? []).map(m => listItem(m.mission + (m.error ? " · source unavailable" : ""), { type: "scopes-mission-open", mission: m.mission })), ...(!snap.scopes?.length && !errors.length ? [{ text: "No missions found in this project." }] : [])];
+    if (state.project && !state.scopesMission) return [...projectHeader, { text: "Choose a mission" }, ...(snap.scopes ?? []).flatMap(m => {
+      const completion = !m.error ? authoredCompletion(m.slices) : null;
+      return [listItem(m.mission + (m.error ? " · source unavailable" : completion ? ` · ${completion}` : ""), { type: "scopes-mission-open", mission: m.mission }),
+        ...(completion ? [{ text: "  formal item proof not recorded", segs: [{ text: "  formal item proof not recorded", token: "dim" as const }] }] : [])];
+    }), ...(!snap.scopes?.length && !errors.length ? [{ text: "No missions found in this project." }] : [])];
     // SCOPES owns both levels. Both mission-graph and Explorer slice routes land
     // on the same execution-backed canonical detail; store-direct content is
     // composed into that page instead of surviving as a competing destination.

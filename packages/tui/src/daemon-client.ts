@@ -147,12 +147,13 @@ export class DaemonClient {
 
   async readFile(target: import("./reading.js").FileTarget): Promise<import("./reading.js").FileReadResult> {
     if (!target.root) return { error: "root_unknown", message: "Source is outside the configured readable roots. No other root was searched." };
-    const query = new URLSearchParams({ root: target.root, path: target.path });
+    const query = new URLSearchParams(target.scopeSource ?? { root: target.root, path: target.path });
+    const route = target.scopeSource ? "/api/scopes/source" : "/api/files/read";
     try {
-      const response = await this.fetchImpl(`${this.baseUrl}/api/files/read?${query}`, { headers: this.headers, signal: AbortSignal.timeout(5_000) });
+      const response = await this.fetchImpl(`${this.baseUrl}${route}?${query}`, { headers: this.headers, signal: AbortSignal.timeout(5_000) });
       const data = await response.json() as Record<string, unknown> | null;
       if (!response.ok) return { error: String(data?.error ?? `HTTP ${response.status}`), message: String(data?.message ?? "Current file could not be read") };
-      if (!data || typeof data.content !== "string" || typeof data.absolutePath !== "string" || typeof data.mtime !== "string" || typeof data.contentHash !== "string" || typeof data.truncated !== "boolean") {
+      if (!data || (target.scopeSource && data.readOnly !== true) || typeof data.content !== "string" || typeof data.absolutePath !== "string" || typeof data.mtime !== "string" || typeof data.contentHash !== "string" || typeof data.truncated !== "boolean") {
         return { error: "invalid_file_response", message: "Reader did not serve current-file content and metadata" };
       }
       return data as unknown as import("./reading.js").FileRead;

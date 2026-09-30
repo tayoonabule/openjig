@@ -45,6 +45,46 @@ beforeEach(() => {
 afterEach(() => { db.close(); fs.rmSync(root, { recursive: true, force: true }); });
 async function get(url: string) { const response = await app.request(url); return { status: response.status, body: await response.json() as any }; }
 describe("catalog project identity across work reads", () => {
+  it("reads only the selected project, mission or slice source without a generic file root", async () => {
+    for (const [selector, expected] of [["", "a project only"], ["&mission=release-x", "a mission only"], ["&mission=release-x&slice=01-story", "a slice only"]]) {
+      const read = await get("/api/scopes/source?project=a" + selector);
+      expect(read.status).toBe(200);
+      expect(read.body.content).toContain(expected);
+      expect(read.body.content).not.toContain("b slice only");
+      expect(read.body.contentHash).toMatch(/^[a-f0-9]{64}$/);
+      expect(read.body.truncated).toBe(false);
+      expect(read.body.absolutePath).toContain(path.join(root, "a"));
+    }
+    expect((await app.request("/api/scopes/source?project=a", { method: "POST" })).status).toBe(404);
+  });
+  it("refuses arbitrary paths, missing identities, root drift and traversal on source reads", async () => {
+    expect((await get("/api/scopes/source")).status).toBe(400);
+    expect((await get("/api/scopes/source?project=missing")).status).toBe(409);
+    expect((await get("/api/scopes/source?project=a&projectRoot=wrong")).body.error).toBe("project_changed");
+    expect((await get("/api/scopes/source?project=a&path=.env.local")).status).toBe(400);
+    expect((await get("/api/scopes/source?project=a&root=b")).status).toBe(400);
+    expect((await get("/api/scopes/source?project=a&slice=01-story")).status).toBe(400);
+    expect((await get("/api/scopes/source?project=a&mission=../b")).status).toBe(400);
+    expect((await get("/api/scopes/source?project=a&mission=release-x&slice=../01-story")).status).toBe(400);
+  });
+  it("reads malformed child source for repair but never escapes or substitutes another source", async () => {
+    const spec = path.join(root, "a/missions/release-x/slices/01-story/SPEC.md");
+    file(spec, "---\nid: [broken\n---\n# Repair this source\n");
+    expect((await get("/api/scopes/source?project=a&mission=release-x&slice=01-story")).body.content).toContain("Repair this source");
+    fs.unlinkSync(spec); fs.symlinkSync(path.join(root, "b/SPEC.md"), spec);
+    expect((await get("/api/scopes/source?project=a&mission=release-x&slice=01-story")).body.error).toBe("project_path_escape");
+    fs.unlinkSync(spec);
+    expect((await get("/api/scopes/source?project=a&mission=release-x&slice=01-story")).status).toBe(409);
+  });
+  it("caps catalog source reads using the shared file reader contract", async () => {
+    file(path.join(root, "a/missions/release-x/slices/01-story/SPEC.md"), "# Long source\n" + "x".repeat(1048600));
+    const read = await get("/api/scopes/source?project=a&mission=release-x&slice=01-story");
+    expect(read.status).toBe(200);
+    expect(read.body.truncated).toBe(true);
+    expect(read.body.truncatedAtBytes).toBe(1048576);
+    expect(Buffer.byteLength(read.body.content)).toBe(1048576);
+    expect(read.body.totalBytes).toBe(1048614);
+  });
   it("opens the exact mission slice even when an earlier mission uses the same directory name", async () => {
     file(path.join(root, "a/missions/earlier/SPEC.md"), source("earlier mission"));
     file(path.join(root, "a/missions/earlier/slices/04-release/SPEC.md"), source("wrong release"));

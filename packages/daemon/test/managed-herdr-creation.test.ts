@@ -93,4 +93,11 @@ describe("direct-argv additive observer creation", () => {
     });
     await f.views.reconcile(); expect(f.calls.some(c => c.method === "pane.move")).toBe(false);
   });
+  it("occupant changes during the final focus observation cannot authorize move", async () => {
+    const f = nativeFixture(); await f.views.reconcile(); f.add();
+    let workspaceReads = 0;
+    f.fault(method => { if (method === "workspace.list" && ++workspaceReads === 2) f.current(false); });
+    await f.views.reconcile(); expect(f.calls.some(c => c.method === "pane.move")).toBe(false);
+    expect(f.views.status().rig).toContain("seat changed after focus observation");
+  });
 });

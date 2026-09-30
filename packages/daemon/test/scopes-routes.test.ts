@@ -71,6 +71,11 @@ describe("scopes routes", () => {
   it.each([
     ["Closed by: <seat>   Date: <date>   Verdict: <pass | pass-with-residue | ...>", null, null],
     ["```text\nVerdict: PASS\n```\n> Verdict: FAIL\n", null, null],
+    ["  ```text\n  Verdict: PASS\n  ```\n", null, null],
+    ["   > Verdict: FAIL\n", null, null],
+    ["```text\nVerdict: PASS\n", null, null],
+    ["~~~text\nVerdict: FAIL\n", null, null],
+    ["    Verdict: PASS\n", null, null],
     ["**Verdict:** Content checks pass. Client approval remains open.", "content", "Content checks pass. Client approval remains open."],
     ["Verdict: **PASS with residue**", "pass", "PASS with residue"],
     ["Closed by: qa   Verdict: BLOCKING / NOT-CLEAR product acceptance", "blocking", "BLOCKING / NOT-CLEAR product acceptance"],

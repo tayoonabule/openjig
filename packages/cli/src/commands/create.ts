@@ -42,7 +42,7 @@ export function createCommand(depsOverride?: StatusDeps): Command {
       const client = deps.clientFactory(getDaemonUrl(status));
       let agentRef: string;
       try {
-        agentRef = await resolveDefaultAgentRef(client, opts.runtime);
+        agentRef = opts.runtime === "terminal" ? "builtin:terminal" : await resolveDefaultAgentRef(client, opts.runtime);
       } catch (err) {
         console.error(err instanceof Error ? err.message : String(err));
         process.exitCode = 1;

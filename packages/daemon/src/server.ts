@@ -266,6 +266,8 @@ export interface AppDeps {
   reviewGatherer?: import("./domain/review/gather.js").ReviewGatherer;
   // OPR.0.4.6.02 C3 — the terminal-provider-ride composer (herdr/cmux views).
   terminalService?: import("./domain/terminal/terminal-service.js").TerminalService;
+  managedHerdrViews?: import("./domain/terminal/managed-herdr-views.js").ManagedHerdrViews;
+  herdrAgentBridge?: import("./domain/terminal/jcode-herdr-agent-bridge.js").HerdrAgentBridge;
   sliceDetailProjector?: import("./domain/slices/slice-detail-projector.js").SliceDetailProjector;
   /** User Settings v0 — daemon-side settings store (env > file > default). */
   settingsStore?: import("./domain/user-settings/settings-store.js").SettingsStore;
@@ -582,6 +584,7 @@ export function createApp(deps: AppDeps): Hono {
     c.set("sliceDetailProjector" as never, deps.sliceDetailProjector);
     c.set("reviewGatherer" as never, deps.reviewGatherer);
     c.set("terminalService" as never, deps.terminalService);
+    c.set("managedHerdrViews" as never, deps.managedHerdrViews);
     c.set("filesAllowlist" as never, deps.filesAllowlist);
     c.set("settingsStore" as never, deps.settingsStore);
     c.set("previewRateLimiter" as never, deps.previewRateLimiter);

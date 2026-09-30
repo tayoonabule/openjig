@@ -1,137 +1,77 @@
 import { describe, expect, it } from "vitest";
-import { observerGrid, readonlyAttachTarget, ManagedHerdrViews } from "../src/domain/terminal/managed-herdr-views.js";
-import type { HerdrResult } from "../src/domain/terminal/herdr-transport.js";
+import { ManagedHerdrViews, type ObserverSeat, readonlyAttachTarget } from "../src/domain/terminal/managed-herdr-views.js";
 
-const seat = (id = "node", life: "running" | "absent" | "unknown" = "running") => ({ nodeId: id, occupant: "occupant-1", target: `${id}@rig`, label: id, runtime: "jcode", life });
 function fixture() {
-  const calls: Array<{ method: string; params: any }> = [];
-  const panes: any[] = [{ pane_id: "w:p1", terminal_id: "term1", tab_id: "w:t2", label: "node" }];
-  let seats = [seat()];
-  const saved: any = { version: 1, rigs: {} };
-  const request = async (method: string, params: any): Promise<HerdrResult> => {
+  let seats: ObserverSeat[] = [{ nodeId: "lead", target: "lead@rig", label: "lead", life: "running" }];
+  let workspace = false, next = 0, current = true;
+  const tabs: any[] = [], panes: any[] = [], calls: any[] = [];
+  const human = { pane_id: "human", terminal_id: "human-terminal", tab_id: "mission-control" };
+  const request = async (method: string, params: any): Promise<any> => {
     calls.push({ method, params });
-    switch (method) {
-      case "workspace.list": return { type: "workspace_list", workspaces: [{ workspace_id: "w", label: "rig" }] };
-      case "tab.list": return { type: "tab_list", tabs: [{ tab_id: "w:t2", label: "seats" }] };
-      case "pane.list": return { type: "pane_list", panes: [...panes] };
-      case "pane.process_info": return { type: "pane_process_info", process_info: { foreground_processes: [{ pid: 123, argv: ["tmux", "attach", "-r", "-t", "node@rig"] }] } };
-      case "pane.close": panes.splice(panes.findIndex(p => p.pane_id === params.pane_id), 1); return { type: "ok" };
-      default: return { type: "ok" };
+    if (method === "workspace.list") return { workspaces: workspace ? [{ workspace_id: "w", label: "rig" }] : [] };
+    if (method === "workspace.create") { workspace = true; return { workspace: { workspace_id: "w", label: "rig" } }; }
+    if (method === "tab.list") return { tabs: tabs.map(t => ({ ...t })) };
+    if (method === "pane.list") return { panes: [human, ...panes].map(p => ({ ...p })) };
+    if (method === "pane.process_info") {
+      const p = panes.find(p => p.pane_id === params.pane_id);
+      return { process_info: { shell_pid: p.pid, foreground_processes: p.argv ? [{ pid: p.pid, argv: p.argv }] : [] } };
     }
+    if (method === "layout.apply") {
+      if (params.tab_id) { tabs.splice(tabs.findIndex(t => t.tab_id === params.tab_id), 1); panes.splice(0); }
+      const tab = "tab" + ++next; tabs.push({ tab_id: tab, label: params.tab_label });
+      const visit = (node: any) => {
+        if (node.type !== "pane") { visit(node.first); visit(node.second); return; }
+        const id = ++next, argv = node.command[0] === "sh" ? ["sleep", "2147483647"] : node.command;
+        panes.push({ pane_id: "pane" + id, terminal_id: "terminal" + id, tab_id: tab, argv, pid: id });
+      };
+      visit(params.root); return { layout: { tab_id: tab } };
+    }
+    throw new Error("Forbidden mutation: " + method);
   };
-  const views = new ManagedHerdrViews({ transport: { request }, listRigs: async () => [{ id: "rig-id", name: "rig", seats }], listClients: async () => [{ pid: 123, target: "node@rig", readOnly: true, ignoreSize: true }], load: () => saved, save: state => Object.assign(saved, structuredClone(state)), adoptionRigNames: new Set(["rig"]) });
-  return { calls, panes, views, saved, setSeats: (value: typeof seats) => { seats = value; } };
+  const deps = { transport: { request }, listRigs: async () => [{ id: "rig", name: "rig", seats }],
+    listClients: async () => panes.filter(p => p.argv?.[0] === "tmux").map(p => ({ pid: p.pid, target: p.argv[5], readOnly: true, ignoreSize: true })),
+    isCurrent: () => current };
+  return { views: new ManagedHerdrViews(deps), deps, panes, tabs, calls, human,
+    setSeats: (value: ObserverSeat[]) => { seats = value; }, setCurrent: (value: boolean) => { current = value; } };
 }
 
-describe("passive managed Herdr views", () => {
-  it("uses direct readonly, environment-safe attaches and no filler agent panes", () => {
-    const root = observerGrid(Array.from({ length: 5 }, (_, i) => seat(String(i))));
-    const leaves: any[] = [];
-    const visit = (n: any) => { if (n.type === "pane") leaves.push(n); else { visit(n.first); visit(n.second); } };
-    visit(root);
-    expect(leaves).toHaveLength(5);
-    expect(root).toMatchObject({ type: "split", direction: "right", ratio: 0.5 });
-    expect(leaves[0].command).toEqual(["tmux", "attach", "-r", "-E", "-t", "0@rig"]);
-  });
-  it("never treats an interactive attach or a substring target as read-only authority", () => {
-    expect(readonlyAttachTarget(["tmux", "attach", "-t", "node@rig"])).toBeNull();
-    expect(readonlyAttachTarget(["sh", "-c", "tmux attach -r -t node@rig"])).toBeNull();
-    expect(readonlyAttachTarget(["tmux", "attach", "-r", "-E", "-t", "node@rig"])).toBe("node@rig");
-  });
-  it("adopts verified readonly panes and keeps unchanged layouts completely untouched", async () => {
-    const f = fixture();
-    await f.views.reconcile();
-    await f.views.reconcile();
-    expect(f.saved.rigs["rig-id"].panes[0]).toMatchObject({ paneId: "w:p1", terminalId: "term1", target: "node@rig" });
-    expect(f.calls.filter(c => !c.method.endsWith(".list") && c.method !== "pane.process_info")).toEqual([]);
-  });
-  it("unknown liveness never authorizes observer deletion", async () => {
-    const f = fixture(); await f.views.reconcile(); f.setSeats([seat("node", "unknown")]); await f.views.reconcile();
-    expect(f.calls.some(c => c.method === "pane.close")).toBe(false);
-  });
-  it("terminal identity drift prevents closing a human-replaced pane", async () => {
-    const f = fixture(); await f.views.reconcile(); f.panes[0].terminal_id = "human-new-terminal";
-    f.setSeats([seat("node", "absent")]); await f.views.reconcile();
-    expect(f.calls.some(c => c.method === "pane.close")).toBe(false);
-  });
-  it("does not adopt matching labels without the actual client read-only flags", async () => {
-    const f = fixture(); (f.views as any).deps.listClients = async () => [{ pid: 123, target: "node@rig", readOnly: false, ignoreSize: true }];
-    await f.views.reconcile(); expect(f.saved.rigs["rig-id"]).toBeUndefined();
-    expect(f.views.status()["rig-id"]).toContain("unowned");
-  });
-  it("serializes/coalesces overlapping sweeps and stops future work on dispose", async () => {
-    const f = fixture(); await Promise.all([f.views.reconcile(), f.views.reconcile()]);
-    await f.views.dispose(); const count = f.calls.length; await f.views.reconcile(); expect(f.calls).toHaveLength(count);
-  });
-  it.each([undefined, []])("never treats missing/empty foreground evidence as exit (%j)", async foreground => {
+describe("automatic read-only rig views", () => {
+  it("creates a rig workspace and exactly one seats tab with direct read-only panes", async () => {
     const f = fixture(); await f.views.reconcile();
-    const deps = (f.views as any).deps;
-    const request = deps.transport.request;
-    deps.transport.request = async (method: string, params: any) => method === "pane.process_info"
-      ? { type: "pane_process_info", process_info: { foreground_processes: foreground } }
-      : request(method, params);
-    f.setSeats([]); await f.views.reconcile();
-    expect(f.calls.some(c => c.method === "pane.close")).toBe(false);
-    expect(f.saved.rigs["rig-id"].panes).toHaveLength(1);
+    expect(f.tabs).toHaveLength(1); expect(f.tabs[0].label).toBe("seats");
+    expect(f.panes[0].argv).toEqual(["tmux", "attach", "-r", "-E", "-t", "lead@rig"]);
+    expect(f.calls.find(c => c.method === "workspace.create").params.focus).toBe(false);
   });
-  it("rechecks terminal identity after process observation before close", async () => {
+  it("adds and removes running seats by replacing only the disposable view tab", async () => {
     const f = fixture(); await f.views.reconcile();
-    const deps = (f.views as any).deps, request = deps.transport.request;
-    deps.transport.request = async (method: string, params: any) => {
+    f.setSeats([{ nodeId: "lead", target: "lead@rig", label: "lead", life: "running" }, { nodeId: "helper", target: "helper@rig", label: "helper", life: "running" }]);
+    await f.views.reconcile(); expect(f.panes).toHaveLength(2); expect(f.tabs).toHaveLength(1);
+    f.setSeats([]); await f.views.reconcile(); expect(f.tabs).toHaveLength(1); expect(f.panes[0].argv).toEqual(["sleep", "2147483647"]);
+    expect(f.human).toEqual({ pane_id: "human", terminal_id: "human-terminal", tab_id: "mission-control" });
+    expect(f.calls.filter(c => !["workspace.create", "layout.apply", "pane.process_info"].includes(c.method) && !c.method.endsWith(".list"))).toEqual([]);
+    expect(f.calls.filter(c => c.method === "layout.apply").every(c => c.params.focus === false)).toBe(true);
+  });
+  it("leaves matching views untouched across controller restart and unknown status", async () => {
+    const f = fixture(); await f.views.reconcile(); const original = structuredClone(f.panes);
+    await f.views.dispose(); const restarted = new ManagedHerdrViews(f.deps);
+    f.setSeats([{ nodeId: "lead", target: "lead@rig", label: "lead", life: "unknown" }]);
+    await restarted.reconcile(); expect(f.panes).toEqual(original);
+    expect(f.calls.filter(c => c.method === "layout.apply")).toHaveLength(1);
+  });
+  it.each([null, ["tmux", "attach", "-t", "lead@rig"]])("never replaces unverified or interactive panes (%j)", async argv => {
+    const f = fixture(); await f.views.reconcile(); f.panes[0].argv = argv; f.setSeats([]);
+    await f.views.reconcile(); expect(f.calls.filter(c => c.method === "layout.apply")).toHaveLength(1);
+    expect(readonlyAttachTarget(argv)).toBeNull();
+  });
+  it("never replaces a changed terminal or acts on a stale seat observation", async () => {
+    const f = fixture(); await f.views.reconcile(); const request = f.deps.transport.request;
+    f.deps.transport.request = async (method, params) => {
       const result = await request(method, params);
-      if (method === "pane.process_info") f.panes[0].terminal_id = "replacement-after-await";
+      if (method === "pane.process_info") f.panes[0].terminal_id = "human-replacement";
       return result;
     };
-    f.setSeats([]); await f.views.reconcile();
-    expect(f.calls.some(c => c.method === "pane.close")).toBe(false);
-  });
-  it("rechecks occupant after process observation before metadata binding", async () => {
-    const f = fixture(); await f.views.reconcile();
-    const deps = (f.views as any).deps, request = deps.transport.request;
-    let current = true, bound = 0;
-    deps.isCurrent = () => current; deps.bind = () => bound++;
-    deps.transport.request = async (method: string, params: any) => {
-      const result = await request(method, params);
-      if (method === "pane.process_info") current = false;
-      return result;
-    };
-    await f.views.reconcile(); expect(bound).toBe(0);
-    expect(f.views.status()["rig-id"]).toContain("seat changed");
-  });
-  it("malformed native workspace inventory is not absence authority", async () => {
-    const f = fixture(); await f.views.reconcile();
-    const deps = (f.views as any).deps, request = deps.transport.request;
-    deps.transport.request = async (method: string, params: any) => method === "workspace.list" ? { type: "workspace_list" } : request(method, params);
-    await f.views.reconcile();
-    expect(f.saved.rigs["rig-id"].panes).toHaveLength(1);
-    expect(f.views.status().transport).toContain("malformed");
-    expect(f.calls.some(c => c.method === "pane.close")).toBe(false);
-  });
-  it("persists native auto-removal and unbinds even if the follow-on empty layout fails", async () => {
-    const f = fixture(); await f.views.reconcile();
-    const forgotten: string[] = [];
-    (f.views as any).deps.unbind = (id: string) => forgotten.push(id);
-    f.panes.splice(0); f.setSeats([seat("node", "unknown")]);
-    await f.views.reconcile();
-    expect(f.saved.rigs["rig-id"].panes).toEqual([]);
-    expect(forgotten).toEqual(["w:p1"]);
-    expect(f.calls.some(c => c.method === "pane.close")).toBe(false);
-  });
-  it("positive direct exec exit is required and shell PID replacement is retained", async () => {
-    const f = fixture();
-    const deps = (f.views as any).deps, request = deps.transport.request;
-    let exited = false;
-    deps.processExited = () => exited;
-    deps.transport.request = async (method: string, params: any) => {
-      const result = await request(method, params);
-      if (method === "pane.process_info") result.process_info.shell_pid = exited ? 999 : 123;
-      return result;
-    };
-    await f.views.reconcile(); await f.views.reconcile();
-    expect(f.saved.rigs["rig-id"].panes[0].directAttachPid).toBe(123);
-    exited = true;
-    deps.listClients = async () => [];
-    f.setSeats([]); await f.views.reconcile();
-    expect(f.calls.some(c => c.method === "pane.close")).toBe(false);
+    f.setSeats([]); await f.views.reconcile(); expect(f.calls.filter(c => c.method === "layout.apply")).toHaveLength(1);
+    f.setCurrent(false); f.setSeats([{ nodeId: "helper", target: "helper@rig", label: "helper", life: "running" }]);
+    await f.views.reconcile(); expect(f.calls.filter(c => c.method === "layout.apply")).toHaveLength(1);
   });
 });

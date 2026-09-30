@@ -2125,30 +2125,19 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     });
     if (herdrAgentBridge) deps.herdrAgentBridge = herdrAgentBridge;
     deps.herdrAgentBridges = herdrAgentBridges;
-    if (process.env["OPENRIG_HERDR_MANAGED_VIEWS"] !== "0") {
-      try {
-        const { ManagedHerdrViews, managedViewsFile, observerProcessExited } = await import("./domain/terminal/managed-herdr-views.js");
-        const { managedViewInventory, listObserverClients } = await import("./domain/terminal/managed-herdr-inventory.js");
-        const sharedTransport = managedHerdrTransport;
-        const sharedAgentBridge = herdrAgentBridge;
-        if (!sharedTransport || !sharedAgentBridge) throw new Error("Herdr provider resources are unavailable.");
-        deps.managedHerdrViews = new ManagedHerdrViews({
-          transport: sharedTransport,
-          ...managedViewInventory(db, tmuxAdapter),
-          listClients: listObserverClients,
-          processExited: observerProcessExited,
-          ...managedViewsFile(nodePath.join(OPENRIG_HOME, "state", "herdr-managed-views.json")),
-          // Owner-approved adoption of the advisor's existing readonly tabs.
-          adoptionRigNames: new Set(["zero", "kadence", "blip"]),
-          eventBus,
-          bind: (seat, paneId) => sharedAgentBridge.registerPane(seat.target, paneId),
-          unbind: paneId => sharedAgentBridge.forgetPane(paneId),
-          log: message => console.warn(message),
-        });
-      } catch (error) {
-        console.warn("[herdr-views] disabled: ownership could not be loaded", error);
-      }
-    }
+    const { ManagedHerdrViews, managedViewInventory, listObserverClients } = await import("./domain/terminal/managed-herdr-views.js");
+    const sharedTransport = managedHerdrTransport;
+    const sharedAgentBridge = herdrAgentBridge;
+    if (!sharedTransport || !sharedAgentBridge) throw new Error("Herdr provider resources are unavailable.");
+    deps.managedHerdrViews = new ManagedHerdrViews({
+      transport: sharedTransport,
+      ...managedViewInventory(db, tmuxAdapter),
+      listClients: listObserverClients,
+      eventBus,
+      bind: (seat, paneId) => sharedAgentBridge.registerPane(seat.target, paneId),
+      unbind: paneId => sharedAgentBridge.forgetPane(paneId),
+      log: message => console.warn(message),
+    });
     const cmuxProvider = new CmuxProviderAdapter({
       cmuxAdapter,
       // One gridded workspace per composed page — the same grid machinery as

@@ -2095,25 +2095,60 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       logicalId: e.logicalId,
     });
 
+    let managedHerdrTransport: import("./domain/terminal/herdr-transport.js").HerdrTransport | null = null;
+    let herdrAgentBridge: InstanceType<typeof HerdrAgentBridge> | null = null;
+    const herdrAgentBridges: InstanceType<typeof HerdrAgentBridge>[] = [];
     const { defaultProvider: herdrProvider, sessionProvider: herdrSessionProvider } = createHerdrProviders(process.env, async target => {
       // Read-only native input observation. Never persist the captured text.
       const session = target.attachArgv?.[4];
       if (!session) return "unknown";
       return inspectComposerInput(await tmuxAdapter.captureComposerSnapshot(session), target.runtime ?? null).state;
-    }, (transport) => new HerdrAgentBridge({
-      transport,
-      eventBus,
-      resolveSeat: (sessionName) => {
-        const row = db.prepare(
-          `SELECT n.id AS node_id, n.runtime, s.resume_token
-             FROM sessions s JOIN nodes n ON n.id = s.node_id
-            WHERE s.session_name = ? AND s.status = 'running'
-            ORDER BY s.id DESC LIMIT 1`,
-        ).get(sessionName) as { node_id: string; runtime: string | null; resume_token: string | null } | undefined;
-        return row ? { nodeId: row.node_id, runtime: row.runtime, resumeToken: row.resume_token } : null;
-      },
-      getSeatState: (nodeId) => seatActivityService.getSeatState(nodeId),
-    }));
+    }, (transport) => {
+      const bridge = new HerdrAgentBridge({
+        transport,
+        eventBus,
+        resolveSeat: (sessionName) => {
+          const row = db.prepare(
+            `SELECT n.id AS node_id, n.runtime, s.resume_token
+               FROM sessions s JOIN nodes n ON n.id = s.node_id
+              WHERE s.session_name = ? AND s.status = 'running'
+              ORDER BY s.id DESC LIMIT 1`,
+          ).get(sessionName) as { node_id: string; runtime: string | null; resume_token: string | null } | undefined;
+          return row ? { nodeId: row.node_id, runtime: row.runtime, resumeToken: row.resume_token } : null;
+        },
+        getSeatState: (nodeId) => seatActivityService.getSeatState(nodeId),
+      });
+      managedHerdrTransport ??= transport;
+      herdrAgentBridge ??= bridge;
+      herdrAgentBridges.push(bridge);
+      return bridge;
+    });
+    if (herdrAgentBridge) deps.herdrAgentBridge = herdrAgentBridge;
+    deps.herdrAgentBridges = herdrAgentBridges;
+    if (process.env["OPENRIG_HERDR_MANAGED_VIEWS"] !== "0") {
+      try {
+        const { ManagedHerdrViews, managedViewsFile, observerProcessExited } = await import("./domain/terminal/managed-herdr-views.js");
+        const { managedViewInventory, listObserverClients } = await import("./domain/terminal/managed-herdr-inventory.js");
+        const sharedTransport = managedHerdrTransport;
+        const sharedAgentBridge = herdrAgentBridge;
+        if (!sharedTransport || !sharedAgentBridge) throw new Error("Herdr provider resources are unavailable.");
+        deps.managedHerdrViews = new ManagedHerdrViews({
+          transport: sharedTransport,
+          ...managedViewInventory(db, tmuxAdapter),
+          listClients: listObserverClients,
+          processExited: observerProcessExited,
+          ...managedViewsFile(nodePath.join(OPENRIG_HOME, "state", "herdr-managed-views.json")),
+          // Owner-approved adoption of the advisor's existing readonly tabs.
+          adoptionRigNames: new Set(["zero", "kadence", "blip"]),
+          eventBus,
+          bind: (seat, paneId) => sharedAgentBridge.registerPane(seat.target, paneId),
+          unbind: paneId => sharedAgentBridge.forgetPane(paneId),
+          log: message => console.warn(message),
+        });
+      } catch (error) {
+        console.warn("[herdr-views] disabled: ownership could not be loaded", error);
+      }
+    }
     const cmuxProvider = new CmuxProviderAdapter({
       cmuxAdapter,
       // One gridded workspace per composed page — the same grid machinery as

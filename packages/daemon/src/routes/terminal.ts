@@ -87,6 +87,11 @@ export function terminalRoutes(opts?: { bearerToken?: string | null }): Hono {
     return c.json(result, statusForOpen(result.ok, result.code));
   });
 
+  app.get("/managed-views", c => {
+    const controller = c.get("managedHerdrViews" as never) as { status(): Record<string, string> } | undefined;
+    return c.json({ enabled: !!controller, findings: controller?.status() ?? {} });
+  });
+
   app.post("/open", async (c) => {
     const svc = getService(c);
     if (!svc) return c.json({ error: "terminal_service_unavailable" }, 503);

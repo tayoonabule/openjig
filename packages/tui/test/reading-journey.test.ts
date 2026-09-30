@@ -4,19 +4,27 @@ import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { filesRoutes } from "../../daemon/src/routes/files.js";
+import { scopesRoutes } from "../../daemon/src/routes/scopes.js";
 import { DaemonClient } from "../src/daemon-client.js";
 import { hydrateSnapshot } from "../src/hydrate.js";
 import { createViewState, emptySnapshot, computeExplorerRows } from "../src/state.js";
 import { renderScreen } from "../src/render.js";
 import { resolveEscapeAction } from "../src/input.js";
 import { fileLines, referenceAction } from "../src/reading.js";
+import { parseCommand } from "../src/grammar.js";
 import type { Action, FleetSnapshot, ViewStateStore } from "../src/types.js";
 
 let home: string, root: string, snap: FleetSnapshot, view: ViewStateStore, client: DaemonClient;
-let requests: string[], failRead: boolean;
+let requests: string[], failRead: boolean, scopedOnly: boolean;
 beforeEach(() => {
   home = realpathSync(mkdtempSync(join(tmpdir(), "s02-reading-")));
   root = join(home, "project"); mkdirSync(join(root, "docs"), { recursive: true });
+  mkdirSync(join(home, "workspace"));
+  mkdirSync(join(root, "missions/release/slices/01-story"), { recursive: true });
+  writeFileSync(join(home, "workspace.yaml"), "projects:\n  - id: manuscript\n    root: project\n");
+  writeFileSync(join(root, "SPEC.md"), "---\nid: manuscript\nstatus: active\n---\n# Catalog project\n");
+  writeFileSync(join(root, "missions/release/SPEC.md"), "---\nid: release\nstatus: active\n---\n# Catalog mission\n");
+  writeFileSync(join(root, "missions/release/slices/01-story/SPEC.md"), "---\nid: story\nstatus: done\n---\n# Catalog slice\n\n## Current bytes\nRead this disk sentence.\n");
   writeFileSync(join(root, "story.yaml"), "summary: |\n  Understand the manuscript.\n  Read [chapter](docs/chapter.md#second-act).\n");
   writeFileSync(join(root, "docs/chapter.md"), "# First act\nOriginal disk sentence.\n" + "A manuscript paragraph.\n".repeat(35) + "## Second act\nThe second act is current.\n[Back to outline](../outline.md)\n[External](https://example.org/reading)\n");
   writeFileSync(join(root, "outline.md"), "# Outline\nCurrent outline.\n");
@@ -24,15 +32,20 @@ beforeEach(() => {
   symlinkSync(join(home, "outside.md"), join(root, "escape.md"));
   symlinkSync(join(root, "docs/chapter.md"), join(root, "alias.md"));
   const app = new Hono();
-  app.use("*", async (c, next) => { c.set("filesAllowlist" as never, [{ name: "project", canonicalPath: root }]); await next(); });
+  app.use("*", async (c, next) => {
+    c.set("filesAllowlist" as never, scopedOnly ? [{ name: "workspace", canonicalPath: join(home, "workspace") }] : [{ name: "project", canonicalPath: root }]);
+    c.set("settingsStore" as never, { resolveOne: (key: string) => ({ value: key === "workspace.root" ? home : join(home, "workspace.yaml") }) });
+    await next();
+  });
   app.route("/api/files", filesRoutes());
+  app.route("/api/scopes", scopesRoutes());
   app.get("/api/specs/library", (c) => c.json([{ id: "story", name: "story", kind: "rig", sourceType: "user_file", sourcePath: join(root, "story.yaml"), version: "1" }]));
   app.get("/api/specs/library/story/review", (c) => c.json({ kind: "rig", format: "pod_aware", sourceState: "library_item", raw: readFileSync(join(root, "story.yaml"), "utf8"), pods: [], edges: [] }));
   app.get("/healthz", (c) => c.json({ selfHostId: "reading-fixture" }));
-  requests = []; failRead = false;
+  requests = []; failRead = false; scopedOnly = false;
   client = new DaemonClient({ baseUrl: "http://fixture", fetchImpl: (async (url, init) => {
     const u = new URL(String(url)); requests.push(`${init?.method ?? "GET"} ${u.pathname}`);
-    if (failRead && u.pathname === "/api/files/read") throw new Error("fixture disconnected");
+    if (failRead && ["/api/files/read", "/api/scopes/source"].includes(u.pathname)) throw new Error("fixture disconnected");
     return app.request(u.pathname + u.search, init);
   }) as typeof fetch });
   snap = emptySnapshot(); view = createViewState({ instanceId: "reader", getSnapshot: () => snap });
@@ -48,6 +61,54 @@ function back() { view.dispatch(resolveEscapeAction({ type: "key", key: "escape"
 function open(target: { root: string; path: string; anchor?: string }) { view.dispatch({ type: "file-open", target }); }
 
 describe("current-file reading through real routes and TUI state", () => {
+  it.each([[140, 42], [80, 24]])("opens exact catalog sources outside generic roots and returns to the caller at %ix%i", async (cols, rows) => {
+    scopedOnly = true;
+    view.dispatch(parseCommand("projects")); await refresh();
+    view.dispatch(parseCommand("project manuscript")); await refresh();
+    for (const [action, expected, mission, slice] of [
+      [null, "Catalog project", undefined, undefined],
+      [parseCommand("mission release"), "Catalog mission", "release", undefined],
+      [{ type: "scopes-open", mission: "release", slice: "01-story" }, "Catalog slice", "release", "01-story"],
+    ] as const) {
+      if (action) { view.dispatch(action); await refresh(); }
+      const caller = view.get();
+      view.dispatch(parseCommand("source")); await refresh();
+      expect(view.get().file?.scopeSource).toEqual({ project: "manuscript", projectRoot: root, ...(mission ? { mission } : {}), ...(slice ? { slice } : {}) });
+      expect(draw(cols, rows).lines.join("\n")).toContain(expected);
+      expect(snap.fileRead!.result).toHaveProperty("readOnly", true);
+      expect(snap.fileRead!.result).toHaveProperty("contentHash", expect.stringMatching(/^[a-f0-9]{64}$/));
+      expect(snap.fileRoots).toEqual([{ name: "workspace", path: join(home, "workspace") }]);
+      back(); await refresh();
+      expect(view.get()).toMatchObject({ project: caller.project, scopesSelected: caller.scopesSelected, scopesMission: caller.scopesMission });
+    }
+    expect(requests.filter(r => r === "GET /api/scopes/source")).toHaveLength(3);
+    expect(requests).not.toContain("GET /api/files/read");
+    expect(requests.every(r => r.startsWith("GET "))).toBe(true);
+  });
+  it("keeps scoped anchors read-only, re-reads disk bytes and refuses unrelated relative files", async () => {
+    scopedOnly = true;
+    const target = { root: "source:manuscript", path: "missions/release/slices/01-story/SPEC.md", scopeSource: { project: "manuscript", projectRoot: root, mission: "release", slice: "01-story" } };
+    view.dispatch({ type: "file-open", target }); await refresh();
+    view.dispatch(referenceAction(view.get().file!, "#current-bytes")); await refresh();
+    expect(view.get().file?.scopeSource).toEqual(target.scopeSource);
+    expect(draw().lines.join("\n")).toContain("Read this disk sentence.");
+    const fromStart = fileLines(snap.fileRead!.result, view.get().file!, 100).find(line => line.text.includes("Read from start"))!.action!;
+    view.dispatch(fromStart); await refresh();
+    expect(view.get().file).toMatchObject({ scopeSource: target.scopeSource });
+    expect(view.get().file?.anchor).toBeUndefined();
+    expect(draw().lines.join("\n")).toContain("Catalog slice");
+    view.dispatch(referenceAction(view.get().file!, "#current-bytes")); await refresh();
+    writeFileSync(join(root, target.path), "## Current bytes\nCHANGED CATALOG SOURCE\n"); await refresh();
+    expect(draw().lines.join("\n")).toContain("CHANGED CATALOG SOURCE");
+    const unrelated = referenceAction(view.get().file!, "../../../../outside.md");
+    expect(unrelated).not.toHaveProperty("target.scopeSource");
+    view.dispatch(unrelated); await refresh();
+    expect(snap.fileRead!.result).toHaveProperty("error", "root_unknown");
+    expect(draw().lines.join("\n")).not.toContain("not readable through project root");
+    back(); await refresh(); failRead = true; await refresh();
+    expect(draw().lines.join("\n")).toContain("read_unavailable");
+    expect(draw().lines.join("\n")).not.toContain("CHANGED CATALOG SOURCE");
+  });
   it.each([[140, 42], [80, 24]])("previews actual purpose, opens detail/source and preserves the caller at %ix%i", async (cols, rows) => {
     view.dispatch({ type: "jump", section: "specs" }); await refresh();
     view.dispatch({ type: "filter", text: "story" });

@@ -3,7 +3,10 @@ import { posix as path } from "node:path";
 import { fieldLine, listItem, wrapDetailLines, type ContentLine } from "./detail.js";
 import type { Action } from "./types.js";
 
-export interface FileTarget { root: string; path: string; anchor?: string }
+export interface FileTarget {
+  root: string; path: string; anchor?: string;
+  scopeSource?: { project: string; projectRoot: string; mission?: string; slice?: string };
+}
 export interface FileRoot { name: string; path: string }
 export interface FileRead {
   root: string; path: string; absolutePath: string; resolvedPath?: string;
@@ -30,7 +33,7 @@ export function referenceAction(origin: FileTarget, href: string): Action {
     // Resolve relative to this actual source. An escape remains ../ and is
     // refused by the existing reader; symlink containment remains server-owned.
     const resolved = name ? (name.startsWith("/") ? name : path.normalize(path.join(path.dirname(origin.path), name))) : origin.path;
-    return { type: "file-open", target: { root: origin.root, path: resolved, ...(anchor ? { anchor } : {}) } };
+    return { type: "file-open", target: { root: origin.root, path: resolved, ...(anchor ? { anchor } : {}), ...(!name && origin.scopeSource ? { scopeSource: origin.scopeSource } : {}) } };
   } catch { return { type: "error", message: "Invalid percent-encoding in reference" }; }
 }
 
@@ -77,7 +80,8 @@ export function fileLines(result: FileReadResult | null | undefined, target: Fil
     });
     if (found < 0) lines.push({ text: `Heading not found: #${target.anchor}${result.truncated ? " in the returned prefix" : ""}; showing from start.` });
     else { start = found; lines.push({ text: `Showing from #${target.anchor} · source line ${start + 1}` }); }
-    lines.push(listItem("Read from start", { type: "file-open", target: { root: target.root, path: target.path } }));
+    const { anchor: _anchor, ...fromStart } = target;
+    lines.push(listItem("Read from start", { type: "file-open", target: fromStart }));
   }
   const origin = { ...target, path: result.resolvedPath ?? result.path };
   lines.push({ text: "" });

@@ -12,6 +12,7 @@ import * as path from "node:path";
 import { parse } from "yaml";
 import type { SliceIndexer } from "../domain/slices/slice-indexer.js";
 import { projectSliceScope, type ScopeFsDeps, type SliceScopeDetail } from "../domain/scope/scope-view-projection.js";
+import { readAllowedFile } from "../domain/files/file-read.js";
 
 const realFs: ScopeFsDeps = {
   readBytes: p => { try { return fs.readFileSync(p); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return null; throw e; } },
@@ -34,6 +35,30 @@ export function scopesRoutes(): Hono {
   const app = new Hono();
   app.get("/projects", c => { try { return c.json(listProjects(c)); } catch (err) { return projectReadResponse(err); } });
   app.onError(err => projectReadResponse(err));
+
+  // Read one catalog-selected authored source, not an arbitrary project file.
+  // This temporary read root never enters the generic read/write allowlist.
+  app.get("/source", c => {
+    if (Object.keys(c.req.query()).some(key => !["project", "projectRoot", "mission", "slice"].includes(key))) {
+      return c.json({ error: "unsupported_source_selector" }, 400);
+    }
+    const selected = selectedProject(c);
+    if (!selected) return c.json({ error: "project_required" }, 400);
+    const mission = c.req.query("mission");
+    const slice = c.req.query("slice");
+    const validName = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+    if ((mission !== undefined && !validName.test(mission)) || (slice !== undefined && !validName.test(slice))) {
+      return c.json({ error: "invalid_source_selector" }, 400);
+    }
+    if (slice && !mission) return c.json({ error: "mission_required" }, 400);
+    const dir = mission ? path.join(selected.missionsRoot, mission, ...(slice ? ["slices", slice] : [])) : selected.root;
+    // Raw bytes must remain readable for repairing malformed frontmatter.
+    // workSource still checks exact source precedence and realpath containment.
+    const source = workSource(selected.root, dir, false);
+    const rootName = `source:${selected.id}`;
+    const result = readAllowedFile([{ name: rootName, canonicalPath: selected.root }], rootName, path.relative(selected.root, source));
+    return c.json({ ...result, readOnly: true });
+  });
 
   app.get("/", (c) => {
     const r = rootOf(c);

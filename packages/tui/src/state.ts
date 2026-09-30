@@ -195,7 +195,12 @@ function reduce(state: ViewState, action: Action, snap: FleetSnapshot): ViewStat
       const sliceDir = state.scopesSelected?.slice ?? snap.sliceDetailName;
       const source = sliceDir && state.scopesMission ? snap.scopes?.find(m => m.mission === state.scopesMission)?.slices.find(s => s.dirName === sliceDir)?.sourcePath : missionSource ?? entry?.sourcePath;
       if (!source) return { ...next, lastError: "Selected source is unavailable" };
-      return reduce(next, { type: "file-open", target: fileTargetForPath(source, snap.fileRoots ?? []) ?? { root: "", path: source } }, snap);
+      const target = fileTargetForPath(source, snap.fileRoots ?? []) ?? {
+        root: `source:${state.project.id}`, path: source,
+        scopeSource: { project: state.project.id, projectRoot: state.project.root,
+          ...(state.scopesMission ? { mission: state.scopesMission } : {}), ...(sliceDir ? { slice: sliceDir } : {}) },
+      };
+      return reduce(next, { type: "file-open", target }, snap);
     }
     case "scopes-mission-open": {
       if (snap.projects !== undefined && !state.project) return { ...next, lastError: "Choose a project first" };

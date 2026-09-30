@@ -27,16 +27,16 @@ export class PassiveCeremonySource implements HealthObservationSource {
     const start = new Date(Date.parse(now) - p.observationWindowSeconds * 1000).toISOString();
     const touched = this.queue.db.prepare("SELECT DISTINCT qitem_id AS id FROM queue_transitions WHERE ts >= ? AND ts <= ? ORDER BY qitem_id LIMIT 2001").all(start, now) as Array<{ id: string }>;
     if (touched.length > 2000) throw new Error("health_passive_queue_window_truncated");
-    type Member = { qitemId: string; handedOffFrom: string | null; tags: string[] };
+    type Member = { qitemId: string; handedOffFrom: string | null; tags: string[]; state: string };
     const roots = new Map<string, Member>();
     const members = new Map<string, Set<string>>();
     const cached = new Map<string, Member | null>();
     // Read only linkage metadata; the queue's full row projection derives pickup
     // and notification state that this bounded source neither needs nor interprets.
-    const lookup = this.queue.db.prepare("SELECT qitem_id AS qitemId, handed_off_from AS handedOffFrom, tags FROM queue_items WHERE qitem_id = ?");
+    const lookup = this.queue.db.prepare("SELECT qitem_id AS qitemId, handed_off_from AS handedOffFrom, tags, state FROM queue_items WHERE qitem_id = ?");
     const get = (id: string): Member | null => {
       if (!cached.has(id)) {
-        const row = lookup.get(id) as { qitemId: string; handedOffFrom: string | null; tags: string | null } | undefined;
+        const row = lookup.get(id) as { qitemId: string; handedOffFrom: string | null; tags: string | null; state: string } | undefined;
         cached.set(id, row ? { ...row, tags: JSON.parse(row.tags ?? "[]") as string[] } : null);
       }
       return cached.get(id)!;
@@ -141,7 +141,7 @@ export class PassiveCeremonySource implements HealthObservationSource {
         if (receipt && receipt.result.basis !== basis) missingFacts.push("normal evidence changed since the attributed assessment; reassess the current basis");
         if (receipt?.evidenceChanged) missingFacts.push("assessment evidence changed or became unavailable");
         const assessment = receipt ? { result: receipt.result, actor: receipt.actor, at: receipt.at, transitionId: receipt.transitionId, identityProvenance: receipt.identityProvenance } : undefined;
-        const ceremony: PassiveCeremony = { origin: "passive", stage: "needs-diagnosis", lineageId, basis, transitionIds, context, workflowReceipts, ...(assessment ? { assessment } : {}), missingFacts };
+        const ceremony: PassiveCeremony = { origin: "passive", stage: "needs-diagnosis", lineageId, workState: root.state, basis, transitionIds, context, workflowReceipts, ...(assessment ? { assessment } : {}), missingFacts };
         const latest = [...segment.map((t) => t.ts), ...workflowReceipts.map((r) => r.at)].sort().at(-1)!;
         observations.push({ kind: "coordination-lineage", scope, episodeKey, episodeStartedAt,
           lastObservedAt: latest, lineageId, coordinationTransitions: segment.length,

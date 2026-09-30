@@ -9,6 +9,7 @@ import { proofSourceObservation } from "../domain/proof/source-watch.js";
 import { createProofPolicyRead, readMissionReadiness } from "../domain/proof/judgments.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { parse } from "yaml";
 import type { SliceIndexer } from "../domain/slices/slice-indexer.js";
 import { projectSliceScope, type ScopeFsDeps, type SliceScopeDetail } from "../domain/scope/scope-view-projection.js";
 
@@ -47,6 +48,8 @@ export function scopesRoutes(): Hono {
       try {
         if (selected) sourcePath = workSource(selected.root, path.join(r.root, missionName, "slices", dirName), false);
         if (selected) workSource(selected.root, path.join(r.root, missionName, "slices", dirName));
+        const report = path.join(r.root, missionName, "slices", dirName, "PROOF.md");
+        if (selected && realFs.exists(report)) insideProject(selected.root, report);
         const d = projectSliceScope(realFs, path.join(r.root, missionName, "slices", dirName), readPolicy);
         if (!d) return null;
         // The TUI one-read hydrate: narrative CONTENT rides inline for the `n` DISPLAY —
@@ -62,10 +65,25 @@ export function scopesRoutes(): Hono {
     const missionFor = (name: string) => {
       if (selected) projectMission(selected, name);
       const dir = path.join(r.root, name);
+      const manifestPath = path.join(dir, "mission.yaml");
+      if (realFs.exists(manifestPath)) insideProject(selected?.root ?? r.root, manifestPath);
+      const manifest = realFs.readFile(manifestPath);
+      const authored = manifest ? parse(manifest)?.composition?.mission_markdown?.spec : null;
+      const source = typeof authored === "string" ? path.resolve(dir, authored)
+        : ["SPEC.md", "README.md"].map(file => path.join(dir, file)).find(file => realFs.exists(file));
+      let declaration = null;
+      if (source) {
+        insideProject(selected?.root ?? r.root, source);
+        const content = realFs.readFile(source);
+        const match = content && /^---\s*\n([\s\S]*?)\n---/.exec(content);
+        const metadata = match ? parse(match[1]!) : null;
+        declaration = { sourcePath: source, stage: typeof metadata?.stage === "string" ? metadata.stage : null,
+          status: typeof metadata?.status === "string" ? metadata.status : null };
+      }
       const slices = realFs.listDir(path.join(dir, "slices"))
         .filter(s => realFs.isDirectory(path.join(dir, "slices", s)))
         .map(s => detailFor(name, s)).filter((s): s is NonNullable<typeof s> => s !== null);
-      return { mission: name, slices: wantDetail ? slices : slices.map(({ intent, miniRequirements, proofContract, progressPath, specShaShort, prdExists, narrative, ...summary }) => summary), readiness: readMissionReadiness(dir, readPolicy) };
+      return { mission: name, declaration, slices: wantDetail ? slices : slices.map(({ intent, miniRequirements, proofContract, progressPath, specShaShort, prdExists, narrative, ...summary }) => summary), readiness: readMissionReadiness(dir, readPolicy) };
     };
     if (mission) {
       if (!realFs.isDirectory(path.join(r.root, mission))) return c.json({ error: "mission_not_found", mission }, 404);
@@ -94,6 +112,8 @@ export function scopesRoutes(): Hono {
     if (selected && slice && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(slice)) return c.json({ error: "invalid_slice" }, 400);
     if (!mission || !slice) return c.json({ error: "missing_params", hint: "?mission=&slice=" }, 400);
     if (selected && slice) workSource(selected.root, path.join(r.root, mission!, "slices", slice));
+    const report = path.join(r.root, mission, "slices", slice, "PROOF.md");
+    if (selected && realFs.exists(report)) insideProject(selected.root, report);
     const detail = projectSliceScope(realFs, path.join(r.root, mission, "slices", slice));
     return detail ? c.json(detail) : c.json({ error: "slice_not_found", mission, slice }, 404);
   });

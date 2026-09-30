@@ -62,6 +62,10 @@ export function attentionLines(state: ViewState, snap: FleetSnapshot, width: num
     }
   } else {
     const bad = read.sources.filter(s => s.state !== "available");
+    const requests = read.items.filter(i => i.kind === "action").length;
+    const queueAnswered = read.sources.some(s => s.source === "queue" && s.state === "available");
+    lines.push({ text: requests ? `${requests} request${requests === 1 ? "" : "s"} need${requests === 1 ? "s" : ""} you.` : queueAnswered ? "Nothing needs you right now." : "Cannot confirm whether anything else needs you; human requests have not fully answered." });
+    if (requests && !queueAnswered) lines.push({ text: "Cannot confirm whether anything else needs you; human requests have not fully answered." });
     if (bad.length) lines.push({ text: "Some sources unavailable or partial; this feed is incomplete." });
     for (const [kind, title] of [["action", "Human requests"], ["update", "Updates"]] as const) {
       if (state.attentionCategory && state.attentionCategory !== kind) continue;
@@ -76,7 +80,7 @@ export function attentionLines(state: ViewState, snap: FleetSnapshot, width: num
         lines.push({ text: `    ${i.scope} · ${i.at ?? "time unknown"}` });
       }
     }
-    lines.push({ text: "" }, { text: `Read at ${read.readAt}` }, ...read.sources.map(s => ({ text: `${s.source}: ${s.state} · ${s.detail}` })));
+    lines.push({ text: "" }, { text: `Read at ${read.readAt}` }, ...bad.map(s => ({ text: `${s.source}: ${s.state} · ${s.detail}` })));
   }
   lines.push({ text: "" }, { text: "Viewing is not approval. Required Slack decisions still apply." });
   return wrapDetailLines(lines, width);

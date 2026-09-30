@@ -7,6 +7,22 @@ import { parseCommand } from "../src/grammar.js";
 import type { AttentionRead } from "@openrig/daemon/attention";
 import type { FleetSnapshot } from "../src/types.js";
 
+it("summarizes human requests without exposing successful source telemetry", () => {
+  const snap = emptySnapshot();
+  const view = createViewState({ instanceId: "attention", getSnapshot: () => snap });
+  snap.attentionRead = { scope: "instance", readAt: "2026-09-29T23:00:00Z", items: [], detail: null, detailError: null,
+    sources: [{ source: "queue", state: "available", detail: "Queue read succeeded" },
+      ...Array.from({ length: 12 }, (_, i) => ({ source: `proof: project ${i}`, state: "available" as const, detail: "Native outcome judgments" }))] };
+  const text = () => attentionLines(view.get(), snap, 80).map(l => l.text).join("\n");
+  expect(text()).toContain("Nothing needs you right now.");
+  expect(text()).not.toContain("proof: project");
+  snap.attentionRead.items.push({ id: "queue:one", kind: "action", summary: "Choose the release", urgency: "normal", scope: "instance", at: null, unblocks: null, source: "/api/queue/one", project: null });
+  expect(text()).toContain("1 request needs you.");
+  snap.attentionRead.sources[0]!.state = "unavailable";
+  expect(text()).toContain("Cannot confirm whether anything else needs you");
+  expect(text()).not.toContain("Nothing needs you");
+});
+
 it.each([140, 80])("keeps readable summaries, passive exact source navigation and Back at width %i", async width => {
   const requests: string[] = [];
   const item = { id: "queue:request", kind: "action" as const, summary: "Choose the readable cover for the book", unblocks: "Print the approved edition", urgency: "urgent", at: "2026-09-10T01:00:00Z", scope: "project alpha", project: { id: "alpha", root: "/books/alpha" }, source: "/api/queue/request" };

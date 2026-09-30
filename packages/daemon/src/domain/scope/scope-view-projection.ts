@@ -44,6 +44,8 @@ export interface ScopeLocks {
 }
 
 export interface SliceScopeSummary {
+  /** Authored report, not a verified item judgment or release authorization. */
+  proofReport?: { file: string; verdict: string | null; detail?: string | null } | null;
   readiness?: ScopeReadiness;
   dirName: string;
   id: string | null;
@@ -78,6 +80,23 @@ function extractFrontmatterRaw(content: string): string | null {
 function fmValue(fm: string, key: string): string | null {
   const m = new RegExp(`^${key}\\s*:\\s*(.+)$`, "m").exec(fm);
   return m ? m[1]!.trim().replace(/^["']|["']$/g, "") : null;
+}
+
+/** Read only an explicitly labeled verdict. A stray PASS in a log or example is
+ * not a report verdict, and this projection never converts it into readiness. */
+export function readAuthoredProofReport(fs: ScopeFsDeps, dir: string): SliceScopeSummary["proofReport"] {
+  const content = fs.readFile(path.join(dir, "PROOF.md"));
+  if (content === null) return null;
+  const fm = extractFrontmatterRaw(content);
+  // Example commands and quoted examples do not constitute the author's verdict.
+  const body = content.replace(/^(?:`{3,}|~{3,})[^\n]*\n[\s\S]*?^(?:`{3,}|~{3,})[^\n]*$/gm, "").replace(/^>.*$/gm, "");
+  const labeled = /(?:^|\s)(?:\*\*)?(?:Final\s+)?Verdict(?:\*\*)?\s*:\s*([^\r\n]+)/im.exec(body)?.[1];
+  const section = sectionBody(body, "(?:Final )?Verdict").split(/\r?\n/).find(line => line.trim());
+  const value = (fm && fmValue(fm, "verdict")) || labeled || section;
+  const clean = value?.replace(/[*`]/g, "").trim();
+  const detail = clean && !/^[<\[]|^(?:tbd|todo|pending)\b/i.test(clean) ? clean : null;
+  const verdict = detail ? (/^[a-z]+(?:-[a-z]+)*/i.exec(detail)?.[0] ?? detail).toLowerCase() : null;
+  return { file: "PROOF.md", verdict, detail };
 }
 
 /** Parse a YAML block list under `key:` — the C1 `evidences:` / `media:` shape. */
@@ -222,6 +241,7 @@ export function projectSliceScope(fs: ScopeFsDeps, sliceDir: string, readPolicy?
   const heading = /^# (.+)$/m.exec(content);
   const progressPath = path.join(sliceDir, "PROGRESS.md");
   return {
+    proofReport: readAuthoredProofReport(fs, sliceDir),
     readiness: readSliceReadiness(sliceDir, fs, readPolicy),
     dirName: path.basename(sliceDir),
     id: fmValue(fm, "id"),

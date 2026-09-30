@@ -19,6 +19,7 @@ import type { ContextUsageStore } from "./context-usage-store.js";
 import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
 import { queryUsageSeries } from "./usage-series.js";
+import { ACTIVE_QUEUE_STATES, QUEUE_STATES } from "./queue-repository.js";
 
 const CONTEXT_PRESSURE_PERCENT = 95;
 const CONTEXT_CRITICAL_PERCENT = 99;
@@ -142,7 +143,7 @@ export class HealthProjectionService {
       (query.scopeType === undefined || record.scope.type === query.scopeType)
       && (query.scopeId === undefined || healthScopeId(record.scope) === query.scopeId)
       && (query.severity === undefined || record.severity === query.severity)
-      && (query.status === undefined ? record.status !== "cleared" : record.status === query.status))
+      && (query.status === undefined ? record.status !== "cleared" && currentHealthFinding(record) : record.status === query.status))
       // Reserve visibility for the primary signal before the query cap. A hundred
       // context samples must not hide ceremony from the default CLI/TUI read.
       .sort((a, b) => Number(b.detector === "process.ceremony-amplification") - Number(a.detector === "process.ceremony-amplification"));
@@ -159,6 +160,16 @@ export class HealthProjectionService {
   get(id: string): HealthRecord | null {
     return this.records().find((record) => record.id === id) ?? null;
   }
+}
+
+/** Completed/historical traffic is still inspectable via get or an explicit
+ * status query. Hiding an unconfirmed suspicion is not a cleared diagnosis. */
+function currentHealthFinding(record: HealthRecord): boolean {
+  if (!record.ceremony || record.ceremony.stage === "confirmed") return true;
+  const state = record.ceremony.workState ?? "";
+  const inactive = (QUEUE_STATES as readonly string[]).includes(state) && !(ACTIVE_QUEUE_STATES as readonly string[]).includes(state);
+  return record.freshness.state === "fresh"
+    && !inactive;
 }
 
 /** The live v1 adapter intentionally supplies only context observations. The other
@@ -373,7 +384,7 @@ function evaluatePassiveCeremony(o: Extract<HealthDetectorObservation, { kind: "
   return record({ ...o, ceremony: c, conditionCleared: cleared }, {
     detector: "process.ceremony-amplification", category: "process", severity: c.stage === "confirmed" ? "warning" : "info",
     status: c.stage === "confirmed" ? "active" : cleared ? "cleared" : "indeterminate", confidence: "medium",
-    summary: `${c.stage === "needs-diagnosis" ? "Needs diagnosis: suspected ceremony amplification" : c.stage === "confirmed" ? "Confirmed ceremony signal from attributed progress" : cleared ? "Ceremony suspicion cleared by agent assessment" : "Ceremony assessment is indeterminate"} for ${o.lineageId}.`,
+    summary: `${c.stage === "needs-diagnosis" ? "Check whether repeated coordination is helping the work" : c.stage === "confirmed" ? "Repeated coordination is slowing progress" : cleared ? "Coordination concern reviewed and dismissed" : "Coordination concern needs more evidence"} (${o.lineageId}).`,
     threshold: `Candidate: coordinationTransitions >= ${policy.thresholds.ceremonyTransitions}; confirmation requires attributed outcomes, ratio >= ${policy.thresholds.ceremonyRatio}, and boundedAuthority = false. Counts alone never confirm.`,
     explanation: `${explanation}${c.assessment ? ` Assessed by ${c.assessment.actor} at ${c.assessment.at}, transition ${c.assessment.transitionId}. Boundary: ${result!.boundary}.` : ""} Missing facts: ${[...c.missingFacts, ...result?.missingFacts ?? [], ...(!current ? [`source freshness is ${o.source.freshness.state}`] : [])].join("; ") || (result ? "none declared by assessor" : "semantic outcome/boundary assessment pending")}.`,
     suggestedInspection: `Read the normal scope/proof/workflow evidence and current authority; extend beyond this packet. Record a progress assessment with the existing diagnosis disposition for ${o.lineageId}.`,

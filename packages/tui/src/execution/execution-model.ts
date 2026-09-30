@@ -260,6 +260,7 @@ function stateWord(slice: SliceFacts): string {
 
 function proofText(scope: SliceScopeSnap | null): string | null {
   if (!scope) return null;
+  if (scope.proofReport) return `Report: ${scope.proofReport.verdict ?? "no verdict declared"}`;
   if (scope.proof.total === 0) return "no proof contract";
   return `proof ${scope.proof.paired} of ${scope.proof.total}`;
 }
@@ -277,7 +278,7 @@ function plannedOwnerText(slice: SliceFacts): string {
 function nextText(slice: SliceFacts): string | null {
   const seq = slice.sequencing;
   if (!seq) return null;
-  if (outcomeComplete(slice) || slice.work.length) return null;
+  if (outcomeComplete(slice) || (!slice.readiness?.configured && declaredText(slice) === "done") || slice.work.length) return null;
   if (seq["next_up"] === true) return "ready to start";
   if (blockerText(seq["blocked_on_rows"])) return null; // the problem column carries it
 
@@ -322,7 +323,7 @@ function padCell(text: string, width: number): string {
   return value + " ".repeat(Math.max(0, width - value.length));
 }
 
-function graphNode(slice: SliceFacts, width: number): ContentLine[] {
+function graphNode(slice: SliceFacts, width: number, showReport: boolean): ContentLine[] {
   const inside = width - 2;
   const state = stateWord(slice);
   const owners = assigneeText(slice);
@@ -336,6 +337,7 @@ function graphNode(slice: SliceFacts, width: number): ContentLine[] {
     cell(slice.name, "bright"), cell(`${stateMark(state)} ${state}`, stateToken(state)),
     cell(owners ? `Owner: ${owners}` : `Planned: ${plannedOwnerText(slice)}`, "dim"),
     cell(`After: ${after}`, "dim"),
+    ...(showReport ? [cell(proofText(slice.scope) ?? "Report: not recorded", "dim")] : []),
     semantic([{ text: `└${"─".repeat(inside)}┘`, token: "chrome" }], width),
   ];
 }
@@ -347,9 +349,10 @@ function graphChunk(execution: ExecutionViewSnap, members: SliceFacts[], width: 
   const out: ContentLine[] = [];
   for (let start = 0; start < members.length; start += perRow) {
     const chunk = members.slice(start, start + perRow);
-    const boxes = chunk.map(slice => graphNode(slice, nodeWidth));
+    const showReport = chunk.some(slice => !!slice.scope?.proofReport);
+    const boxes = chunk.map(slice => graphNode(slice, nodeWidth, showReport));
     const zones = chunk.map((slice, index) => ({ start: index * (nodeWidth + gap), end: index * (nodeWidth + gap) + nodeWidth, action: sliceAction(execution, slice) }));
-    for (let line = 0; line < 6; line++) {
+    for (let line = 0; line < boxes[0]!.length; line++) {
       const segs = boxes.flatMap((box, index) => [...(index ? [{ text: " ".repeat(gap) }] : []), ...box[line]!.segs!]);
       out.push({ text: segs.map(seg => seg.text).join(""), segs, zones });
     }
@@ -450,16 +453,20 @@ function overviewLines(execution: ExecutionViewSnap, scopes: readonly MissionSco
   const attributed = slices.some(slice => slice.readiness?.configured);
   const done = slices.filter(outcomeComplete).length;
   const allComplete = slices.length > 0 && done === slices.length;
-  const next = slices.find(slice => nextText(slice) === "ready to start") ?? slices.find(slice => !outcomeComplete(slice) && !slice.work.length);
-  const unknown = slices.filter(slice => !slice.readiness?.configured).length;
-  const missionState = allComplete ? "OUTCOMES COMPLETE" : "OUTCOMES OPEN";
+  const declaredDone = slices.filter(slice => declaredText(slice) === "done").length;
+  const legacy = slices.filter(slice => !!slice.scope && !slice.readiness?.configured).length;
+  const reports = slices.filter(slice => slice.scope?.proofReport).length;
+  const next = slices.find(slice => nextText(slice) === "ready to start") ?? slices.find(slice => !outcomeComplete(slice) && !(slice.scope && !slice.readiness?.configured && declaredText(slice) === "done") && !slice.work.length);
+  const unknown = slices.filter(slice => !slice.scope && !slice.readiness?.configured).length;
+  const missionState = allComplete ? "OUTCOMES COMPLETE" : !attributed && legacy === slices.length && slices.length > 0 ? declaredDone === slices.length ? "DECLARED DONE" : "DECLARED WORK" : "OUTCOMES OPEN";
   const missionToken: Token = problems ? "warn" : allComplete ? "ok" : "dim";
   const nowText = active.length ? active.map(slice => `${slice.id} · ${assigneeText(slice) ?? "owner unknown"} · ${stateWord(slice)}`).join("; ") : "no open slice work in this read";
   const nextValue = next ? `${next.id} · ${nextText(next) ?? "dependency eligibility unknown"}`
     : allComplete ? "outcomes complete; release decision separate"
+    : !attributed && declaredDone > 0 && declaredDone === slices.length ? "declared work done; acceptance and release separate"
     : active.length ? "await current work; outcomes remain open"
     : "next eligibility unknown";
-  const progress = `${done}/${slices.length} outcomes complete · ${live} working${problems ? ` · ${problems} waiting` : ""}${unknown ? ` · ${unknown} proof unknown` : ""}`;
+  const progress = `${!attributed && legacy > 0 ? `${declaredDone}/${slices.length} declared done` : `${done}/${slices.length} outcomes complete`} · ${live} working${problems ? ` · ${problems} waiting` : ""}${unknown ? ` · ${unknown} proof unknown` : ""}`;
   const fact = (label: string, value: string, token: Token): ContentLine => semantic([
     { text: `  ${label.padEnd(10)}`, token: "dim", bold: true },
     { text: value, token },
@@ -480,7 +487,9 @@ function overviewLines(execution: ExecutionViewSnap, scopes: readonly MissionSco
   }
   lines.push(fact("NEXT", nextValue, next ? "accentBright" : "dim"));
   lines.push(fact("PROGRESS", progress, "bright"));
-  lines.push(fact("LIFECYCLE", `${execution.readiness?.historicalStatus ?? "unknown"} · separate from outcomes`, "dim"));
+  const declaration = scopes?.find(scope => scope.mission === execution.mission)?.declaration;
+  const lifecycle = execution.readiness?.historicalStatus ?? declaration?.status ?? declaration?.stage ?? "not declared";
+  lines.push(fact("LIFECYCLE", `${lifecycle} · separate from outcomes`, "dim"));
   if (needsHuman.length) {
     const first = needsHuman[0]!;
     lines.push(semanticAction([
@@ -491,10 +500,10 @@ function overviewLines(execution: ExecutionViewSnap, scopes: readonly MissionSco
   const waves = new Map<string, SliceFacts[]>();
   for (const slice of slices) waves.set(waveOf(slice), [...(waves.get(waveOf(slice)) ?? []), slice]);
   for (const [wave, members] of waves) lines.push(...waveRows(execution, wave, members, width));
-  const provenanceAction = attributed || unknown > 0 ? open("evidence") : open("sources");
+  const provenanceAction = attributed || legacy > 0 || unknown > 0 ? open("evidence") : open("sources");
   const provenance: SemanticSeg[] = [
     { text: "  provenance · ", token: "dim" },
-    { text: attributed ? `proof judgments · ${done}/${slices.length} ready${unknown ? ` · ${unknown} legacy unknown` : ""}` : unknown > 0 ? `evidence gap ${unknown}/${slices.length} unknown` : `daemon build ${build}`, token: unknown > 0 || (attributed && execution.readiness!.state === "unknown") ? "warn" : "dim" },
+    { text: attributed ? `proof judgments · ${done}/${slices.length} ready${legacy ? ` · ${legacy} without item judgments` : ""}` : legacy > 0 ? `${reports} reports · no item judgments` : unknown > 0 ? `evidence gap ${unknown}/${slices.length} unknown` : `daemon build ${build}`, token: unknown > 0 || (attributed && execution.readiness?.state === "unknown") ? "warn" : "dim" },
   ];
   const localTime = displayTime(execution.derived_at, timeZone);
   if (provenance.reduce((n, s) => n + s.text.length, 0) + localTime.length + 3 <= width) {

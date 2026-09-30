@@ -106,6 +106,34 @@ it("small activity never mints a diagnosis; false positive does not invent a den
   expect(clear.ceremony?.stage).toBe("cleared"); expect(clear.explanation).toContain("no ratio is computed");
 });
 
+it("archives stale or terminal passive suspicions from current health without rewriting their verdict", async () => {
+  const t = await setup();
+  const original = t.projection.list().records[0]!;
+  for (const state of ["done", "handed-off", "canceled", "denied", "failed"]) {
+    t.db.prepare("UPDATE queue_items SET state = ? WHERE qitem_id = 'root'").run(state);
+    expect(t.projection.list().records).toEqual([]);
+    expect(t.projection.get(original.id)?.status).toBe("indeterminate");
+    expect(t.projection.list({ status: "indeterminate" }).records).toHaveLength(1);
+  }
+  t.db.prepare("UPDATE queue_items SET state = 'in-progress' WHERE qitem_id = 'root'").run();
+  expect(t.projection.list().records).toHaveLength(1);
+  t.time("2026-09-05T13:00:00Z");
+  expect(t.projection.list().records).toEqual([]);
+  expect(t.projection.get(original.id)?.freshness.state).toBe("stale");
+});
+
+it("keeps confirmed concerns visible when their originating work is inactive, but does not call stale evidence confirmed", async () => {
+  const t = await setup(); const id = (await t.service.evaluate("system:health", true)).actions[0]!.qitemId;
+  t.dispose(id, t.assessment());
+  const finding = t.projection.list().records[0]!;
+  t.db.prepare("UPDATE queue_items SET state = 'done' WHERE qitem_id = 'root'").run();
+  expect(t.projection.list().records[0]?.id).toBe(finding.id);
+  t.time("2026-09-05T13:00:00Z");
+  expect(t.projection.list().records).toEqual([]);
+  expect(t.projection.get(finding.id)?.ceremony?.stage).toBe("indeterminate");
+  expect(t.projection.get(finding.id)?.ceremony?.assessment?.result.conclusion).toBe("established");
+});
+
 it("rejects stale basis, wrong custody, missing refs, duplicate outcomes and invented timestamps", async () => {
   const t = await setup(); const id = (await t.service.evaluate("system:health", true)).actions[0]!.qitemId;
   const a = t.assessment();
@@ -153,8 +181,10 @@ it("neither recursive diagnosis traffic nor prose closures become product progre
   for (let i = 0; i < 25; i++) t.queue.update({ qitemId: id, actorSession: "owner@rig", transitionNote: "progress claimed, product shipped" });
   expect(t.projection.list().records).toHaveLength(1);
   expect(t.projection.list().records[0]!.ceremony!.transitionIds).toHaveLength(30);
+  const episode = t.projection.list().records[0]!.id;
   t.time("2026-09-05T13:00:00Z");
-  expect(t.projection.list().records[0]!.freshness.state).toBe("stale");
+  expect(t.projection.list().records).toHaveLength(0);
+  expect(t.projection.get(episode)!.freshness.state).toBe("stale");
   expect((await t.service.evaluate("system:health", true)).actions.every((a) => a.action !== "create" && a.action !== "represent")).toBe(true);
 });
 

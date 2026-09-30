@@ -224,14 +224,14 @@ describe("mission execution story — readable rows over the shipped projections
     expect(body).not.toMatch(/\bp\d+\/\d+\b/);
     expect(body).not.toContain("@—");
     expect(body).not.toMatch(/\?\?/);
-    // declared state is kept and attributed; the evidence gap is one compact mission-level drill
-    expect(body).toContain("release-0.5.8 · OUTCOMES OPEN · 20 slices");
-    expect(body).toContain("PROGRESS  0/20 outcomes complete · 0 working");
-    const gap = lines.find((line) => line.text.includes("evidence gap"))!;
+    // Declared completion is attributed, never confused with formal acceptance.
+    expect(body).toContain("release-0.5.8 · DECLARED DONE · 20 slices");
+    expect(body).toContain("PROGRESS  20/20 declared done · 0 working");
+    expect(body).not.toContain("OUTCOMES COMPLETE");
+    const gap = lines.find((line) => line.action?.type === "execution-open" && line.action.key === "evidence")!;
     expect(gap.text).toContain("provenance");
-    expect(gap.text).toContain("evidence gap");
+    expect(gap.text).toContain("no item judgments");
     expect(gap.action).toEqual({ type: "execution-open", key: "evidence" });
-    expect(body.split("evidence gap").length - 1).toBe(1);
     // every wave header counts declared words, never a work-state verdict the projection did not make
     const headers = lines.filter((l) => l.text.includes("WAVE "));
     expect(headers.length).toBeGreaterThan(0);
@@ -250,8 +250,8 @@ describe("mission execution story — readable rows over the shipped projections
   it("shows each slice once, in wave order, as ordinary words with real assignment, evidence, proof, and next", () => {
     const lines = executionContentLines(executionFixture(), executionScopes(), [], null, 160);
     const body = text(lines);
-    expect(body).toContain("release-0.5.8 · OUTCOMES OPEN · 4 slices");
-    expect(body).toContain("PROGRESS  0/4 outcomes complete · 1 working · 1 waiting");
+    expect(body).toContain("release-0.5.8 · DECLARED WORK · 4 slices");
+    expect(body).toContain("PROGRESS  3/4 declared done · 1 working · 1 waiting");
     expect(body).toContain("WAVE active-parallel · 2 slices · 1 working, 1 needs input");
     expect(body).toContain("WAVE foundation · 1 slice · 1 declared done");
     expect(body).toContain("WAVE next-unlock · 1 slice · 1 declared done");
@@ -287,7 +287,7 @@ describe("mission execution story — readable rows over the shipped projections
     fixture.q1_lanes = [];
     fixture.lifecycle_instances = [{ instance_id: "WF", status: "waiting", frontier_packets: [] }];
     const body = text(executionContentLines(fixture, executionScopes(4, () => "done"), [], null, 160));
-    expect(body).toContain("Slices: OUTCOMES OPEN");
+    expect(body).toContain("Slices: DECLARED DONE");
     expect(body).toContain("Mission lifecycle · waiting");
   });
 
@@ -446,7 +446,7 @@ describe("mission execution story — readable rows over the shipped projections
     expect(narrow).toContain("Owner: dev-1");
     expect(narrow).toContain("◐ needs input");
     expect(narrow).toContain("Owner: dev-2");
-    expect(narrow).toContain("evidence gap");
+    expect(narrow).toContain("no item judgments");
   });
 
   it("renders structured blockers as words with the blocker first and never [object Object]", () => {
@@ -538,8 +538,8 @@ describe("execution drill — one page from source, esc back", () => {
     view.dispatch({ type: "scopes-mission-open", mission: "release-0.5.8" });
     let screen = renderScreen(view.get(), snap, { cols: 110, rows: 40 });
     let body = screen.lines.join("\n");
-    expect(body).toContain("release-0.5.8 · OUTCOMES OPEN");
-    expect(body).toContain("evidence gap");
+    expect(body).toContain("release-0.5.8 · DECLARED WORK");
+    expect(body).toContain("no item judgments");
     expect(body).not.toMatch(GLYPH_BLOB);
     expect(body).not.toContain("WAITING");
     const target = screen.contentTargets.find((t) => t.action.type === "execution-open" && t.action.key === "slice:OPR.0.5.8.1")!;

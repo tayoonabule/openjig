@@ -55,6 +55,49 @@ function appWith(root: string): Hono {
 }
 
 describe("scopes routes", () => {
+  it("serves the labeled authored proof report separately from item judgments", async () => {
+    const root = scaffold(), slice = path.join(root, "release-x/slices/01-thing");
+    try {
+      fs.writeFileSync(path.join(slice, "PROOF.md"), "# Proof\n\nClosed by: qa@rig   Verdict: **pass-with-residue** (owner accepted the caveat)\n");
+      const response = await (await appWith(root).request("/api/scopes/slice?mission=release-x&slice=01-thing")).json() as any;
+      expect(response.proofReport).toEqual({ file: "PROOF.md", verdict: "pass-with-residue", detail: "pass-with-residue (owner accepted the caveat)" });
+      expect(response.readiness.configured).toBe(false);
+      expect(response.readiness.state).toBe("legacy");
+      fs.writeFileSync(path.join(slice, "PROOF.md"), "# Example\nPASS is only a test fixture here, not a verdict.\n");
+      const unlabeled = await (await appWith(root).request("/api/scopes/slice?mission=release-x&slice=01-thing")).json() as any;
+      expect(unlabeled.proofReport).toEqual({ file: "PROOF.md", verdict: null, detail: null });
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+  it.each([
+    ["Closed by: <seat>   Date: <date>   Verdict: <pass | pass-with-residue | ...>", null, null],
+    ["```text\nVerdict: PASS\n```\n> Verdict: FAIL\n", null, null],
+    ["**Verdict:** Content checks pass. Client approval remains open.", "content", "Content checks pass. Client approval remains open."],
+    ["Verdict: **PASS with residue**", "pass", "PASS with residue"],
+    ["Closed by: qa   Verdict: BLOCKING / NOT-CLEAR product acceptance", "blocking", "BLOCKING / NOT-CLEAR product acceptance"],
+    ["---\nverdict: PASS\n---\n# Proof", "pass", "PASS"],
+  ])("preserves the explicitly authored report without inventing template authority: %s", async (content, verdict, detail) => {
+    const root = scaffold();
+    try {
+      fs.writeFileSync(path.join(root, "release-x/slices/01-thing/PROOF.md"), content!);
+      const body = await (await appWith(root).request("/api/scopes/slice?mission=release-x&slice=01-thing")).json() as any;
+      expect(body.proofReport).toEqual({ file: "PROOF.md", verdict, detail });
+      expect(body.readiness.configured).toBe(false);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+  it("reads the manifest-selected mission source stage without upgrading acceptance", async () => {
+    const root = scaffold(), mission = path.join(root, "release-x");
+    try {
+      fs.writeFileSync(path.join(mission, "SPEC.md"), "---\nstage: done\n---\n# Stale source\n");
+      fs.writeFileSync(path.join(mission, "INTAKE.md"), "---\nstage: wip\n---\n# Selected source\n");
+      fs.writeFileSync(path.join(mission, "mission.yaml"), "composition:\n  mission_markdown:\n    spec: INTAKE.md\n  slices: []\n");
+      const body = await (await appWith(root).request("/api/scopes?mission=release-x")).json() as any;
+      expect(body.declaration).toEqual({ sourcePath: path.join(mission, "INTAKE.md"), stage: "wip", status: null });
+      expect(body.readiness.historicalStatus).toBeNull();
+      fs.writeFileSync(path.join(mission, "INTAKE.md"), "# Body-only intake\n");
+      const unstructured = await (await appWith(root).request("/api/scopes?mission=release-x")).json() as any;
+      expect(unstructured.declaration.stage).toBeNull();
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
   it("overview + detail + narrative serve store-direct", async () => {
     const root = scaffold();
     const app = appWith(root);

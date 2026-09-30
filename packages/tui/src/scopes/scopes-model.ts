@@ -23,6 +23,8 @@ export interface SliceScopeSnap {
   error?: string;
   sourcePath?: string;
   readiness?: ReadinessSnap;
+  /** An authored report is not formal item acceptance. */
+  proofReport?: { file: string; verdict: string | null; detail?: string | null } | null;
   dirName: string;
   id: string | null;
   displayName: string;
@@ -37,7 +39,7 @@ export interface SliceScopeSnap {
   specShaShort: string | null;
   prdExists: boolean;
 }
-export interface MissionScopesSnap { mission: string; slices: SliceScopeSnap[]; error?: string }
+export interface MissionScopesSnap { mission: string; slices: SliceScopeSnap[]; error?: string; declaration?: { stage: string | null; status: string | null; sourcePath: string } | null }
 
 /** Slice state glyph (mock: ● building/spec · ✓ delivery-locked · ⊙ other/idle). */
 export function sliceGlyph(s: SliceScopeSnap): string {
@@ -52,6 +54,7 @@ export function sliceGlyph(s: SliceScopeSnap): string {
  *  no unproven suffix; the visible COUNT carries the honesty (4/6 🔒 shows partial). */
 export function proofBadge(s: SliceScopeSnap): string {
   if (s.readiness?.configured) return `accepted: ${s.readiness.items.filter(i => i.state === "accepted").length}/${s.readiness.items.length} · ${s.readiness.state}`;
+  if (s.proofReport) return `report: ${s.proofReport.verdict ?? "no verdict declared"}`;
   const base = `proof: ${s.proof.paired}/${s.proof.total} paired`;
   return s.locks.delivery ? `${base} 🔒` : base;
 }
@@ -276,7 +279,7 @@ export interface ScopeContentOpts {
  * canonical slice detail. Keeping it here prevents Explorer and mission-graph
  * navigation from growing separate slice pages again. */
 export function scopeIdentityLines(detail: SliceScopeSnap, mission: string | null, width: number): ContentLine[] {
-  if (detail.error) return wrapped(`${mission}/${detail.dirName} · Source unavailable: ${detail.error}`, width, "", "warn");
+  if (detail.error) return wrapped(`${mission}/${detail.dirName} · ${detail.error.startsWith("Invalid frontmatter:") ? "Check source formatting" : "Source unavailable"}: ${detail.error}`, width, "", "warn");
   const lines: ContentLine[] = [];
   const w = Math.max(24, width);
   const stage = detail.readiness?.configured ? (detail.readiness.state === "ready" ? "outcome complete" : detail.readiness.items.some(i => i.state === "withdrawn" || i.state === "rejected") ? "reopened" : "outcomes pending") : detail.stage ?? detail.status ?? "unknown";
@@ -311,6 +314,7 @@ export function scopeIdentityLines(detail: SliceScopeSnap, mission: string | nul
     ], w));
   }
   if (detail.readiness?.configured) lines.push({ text: `  judgment basis ${detail.readiness.revision.slice(0, 12)} · publication is separate` });
+  if (detail.proofReport) lines.push(...wrapped(`Report: ${detail.proofReport.detail ?? detail.proofReport.verdict ?? "no verdict declared"} · ${detail.proofReport.file} (authored, not item acceptance)`, w, "  ", "bright"));
   const provenance = [
     detail.specShaShort ? `spec ${detail.specShaShort}` : "spec sha unknown",
     detail.locks.spec ? `${detail.locks.spec.at.slice(5, 10)} ${detail.locks.spec.by.split("@")[0]}` : "unlocked",

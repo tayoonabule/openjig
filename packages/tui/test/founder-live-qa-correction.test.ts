@@ -101,7 +101,7 @@ describe("founder live-QA correction — mission dashboard", () => {
       const width = cols - explorerWidth(cols) - 2;
       const lines = executionContentLines(snap.execution, snap.scopes, [], null, width) as SemanticLine[];
       const body = lines.map((line) => line.text).join("\n");
-      const mission = lines.findIndex((line) => line.text.includes("release-0.5.9") && /OUTCOMES (OPEN|COMPLETE)/.test(line.text));
+      const mission = lines.findIndex((line) => line.text.includes("release-0.5.9") && /(?:OUTCOMES (?:OPEN|COMPLETE)|DECLARED WORK)/.test(line.text));
       const now = lines.findIndex((line) => /\bNOW\b/.test(line.text));
       const next = lines.findIndex((line) => /\bNEXT\b/.test(line.text));
       const progress = lines.findIndex((line) => /\bPROGRESS\b/.test(line.text));
@@ -116,7 +116,7 @@ describe("founder live-QA correction — mission dashboard", () => {
       expect(wave, `${cols}: wave begins promptly`).toBeLessThan(cols === 84 ? 14 : 10);
       expect(body).not.toContain("declared in slice files");
       expect(body).not.toContain("live now:");
-      if (cols === 84) expect(body).toContain("provenance · evidence gap");
+      if (cols === 84) expect(body).toContain("no item judgments");
       expectTokens(lines, ["accentBright", "bright", "ok", "warn", "dim", "chrome"]);
       expect(lines.every((line) => line.text.length <= width), `${cols}: no content overflow`).toBe(true);
     }

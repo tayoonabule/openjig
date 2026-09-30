@@ -23,6 +23,8 @@ export interface StartupInput {
   nodeId: string;
   sessionId: string;
   binding: NodeBinding;
+  /** Revalidate the durable node identity/model immediately before a restore launch. */
+  modelAuthority?: { rigId: string; logicalId: string; runtime: string | null };
   adapter: RuntimeAdapter;
   plan: ProjectionPlan;
   resolvedStartupFiles: ResolvedStartupFile[];
@@ -142,6 +144,7 @@ export class StartupOrchestrator {
     const claudeManagedBlockFile = new RigRepository(this.db).getRigClaudeManagedBlockFile(input.rigId);
     if (claudeManagedBlockFile) input = { ...input, binding: { ...input.binding, claudeManagedBlockFile } };
     const errors: string[] = [];
+    let restoreModelUsed: string | null | undefined;
     let continuityOutcome: "resumed" | "fresh" | "forked" | "rebuilt" = input.resumeToken
       ? "resumed"
       : input.forkSource
@@ -240,12 +243,40 @@ export class StartupOrchestrator {
         let attemptedFreshFallback = false;
 
         while (true) {
+          let modelAtLaunch: string | null | undefined;
+          if (input.modelAuthority) {
+            const current = this.db.prepare(
+              "SELECT rig_id, logical_id, runtime, model FROM nodes WHERE id = ?",
+            ).get(input.nodeId) as { rig_id: string; logical_id: string; runtime: string | null; model: string | null } | undefined;
+            const expected = input.modelAuthority;
+            if (!current || current.rig_id !== expected.rigId || current.logical_id !== expected.logicalId || current.runtime !== expected.runtime) {
+              return this.fail(input, "attention_required", [`Restore identity changed for node ${input.nodeId}; harness was not launched.`]);
+            }
+            if (input.resumeToken && input.adapter.runtime === "jcode" && current.model) {
+              return this.fail(input, "attention_required", [`Jcode may restore the model saved inside this session rather than current policy ${current.model}; restore is held for native model verification. No new turn was started.`]);
+            }
+            modelAtLaunch = current.model;
+            restoreModelUsed = modelAtLaunch;
+            input = { ...input, binding: { ...input.binding, model: modelAtLaunch ?? undefined } };
+          }
           const launchResult = await input.adapter.launchHarness(input.binding, {
             name: input.sessionName ?? input.binding.tmuxSession ?? "",
             resumeToken: launchResumeToken,
             ...(input.forkSource && !launchResumeToken ? { forkSource: input.forkSource } : {}),
           });
           if (launchResult.ok) {
+            if (input.modelAuthority) {
+              const current = this.db.prepare(
+                "SELECT rig_id, logical_id, runtime, model FROM nodes WHERE id = ?",
+              ).get(input.nodeId) as { rig_id: string; logical_id: string; runtime: string | null; model: string | null } | undefined;
+              const expected = input.modelAuthority;
+              if (!current || current.rig_id !== expected.rigId || current.logical_id !== expected.logicalId || current.runtime !== expected.runtime) {
+                return this.fail(input, "attention_required", [`Restore identity changed during harness launch for node ${input.nodeId}; launched session was preserved.`]);
+              }
+              if (current.model !== modelAtLaunch) {
+                return this.fail(input, "attention_required", [`Model policy changed during restore for node ${input.nodeId}; launched session was preserved and was not restarted.`]);
+              }
+            }
             appliedLaunch = launchResult.appliedLaunch;
             const normalizedResumeToken = launchResult.resumeToken?.trim();
             if (normalizedResumeToken) {
@@ -445,6 +476,19 @@ export class StartupOrchestrator {
         }
       } catch (error) {
         return this.fail(input, "attention_required", [`Post-delivery runtime state is unavailable: ${(error as Error).message}`]);
+      }
+    }
+
+    if (input.modelAuthority && restoreModelUsed !== undefined) {
+      const current = this.db.prepare(
+        "SELECT rig_id, logical_id, runtime, model FROM nodes WHERE id = ?",
+      ).get(input.nodeId) as { rig_id: string; logical_id: string; runtime: string | null; model: string | null } | undefined;
+      const expected = input.modelAuthority;
+      if (!current || current.rig_id !== expected.rigId || current.logical_id !== expected.logicalId || current.runtime !== expected.runtime) {
+        return this.fail(input, "attention_required", [`Restore identity changed before readiness completed for node ${input.nodeId}; launched session was preserved.`]);
+      }
+      if (current.model !== restoreModelUsed) {
+        return this.fail(input, "attention_required", [`Model policy changed during restore for node ${input.nodeId}; launched session was preserved and was not restarted.`]);
       }
     }
 

@@ -107,6 +107,16 @@ describe("passive managed Herdr views", () => {
     expect(f.views.status().transport).toContain("malformed");
     expect(f.calls.some(c => c.method === "pane.close")).toBe(false);
   });
+  it("persists native auto-removal and unbinds even if the follow-on empty layout fails", async () => {
+    const f = fixture(); await f.views.reconcile();
+    const forgotten: string[] = [];
+    (f.views as any).deps.unbind = (id: string) => forgotten.push(id);
+    f.panes.splice(0); f.setSeats([seat("node", "unknown")]);
+    await f.views.reconcile();
+    expect(f.saved.rigs["rig-id"].panes).toEqual([]);
+    expect(forgotten).toEqual(["w:p1"]);
+    expect(f.calls.some(c => c.method === "pane.close")).toBe(false);
+  });
   it("positive direct exec exit is required and shell PID replacement is retained", async () => {
     const f = fixture();
     const deps = (f.views as any).deps, request = deps.transport.request;

@@ -17,7 +17,7 @@ import { workflowOverview, workflowDetail } from "./workflow-model.js";
 import type { Action, SliceDetailSnap } from "../types.js";
 import type { Token } from "../theme.js";
 import { wrapDetailLines, detailPage, listItem, sectionRule, type ContentLine, type Section } from "../detail.js";
-import { scopeContractLines, scopeIdentityLines, proofProvenanceLines, type ReadinessSnap, type MissionScopesSnap, type SliceScopeSnap } from "../scopes/scopes-model.js";
+import { authoredCompletion, scopeContractLines, scopeIdentityLines, proofProvenanceLines, type ReadinessSnap, type MissionScopesSnap, type SliceScopeSnap } from "../scopes/scopes-model.js";
 
 export interface ExecutionViewSnap {
   readiness?: { historicalStatus?: string | null; revision: string; state: string; slices: Array<{ scope: string; readiness: import("../scopes/scopes-model.js").ReadinessSnap }> };
@@ -456,17 +456,19 @@ function overviewLines(execution: ExecutionViewSnap, scopes: readonly MissionSco
   const declaredDone = slices.filter(slice => declaredText(slice) === "done").length;
   const legacy = slices.filter(slice => !!slice.scope && !slice.readiness?.configured).length;
   const reports = slices.filter(slice => slice.scope?.proofReport).length;
+  const declaredCompletion = !active.length && slices.every(slice => !!slice.scope && !slice.readiness?.configured)
+    ? authoredCompletion(slices.map(slice => slice.scope!)) : null;
   const next = slices.find(slice => nextText(slice) === "ready to start") ?? slices.find(slice => !outcomeComplete(slice) && !(slice.scope && !slice.readiness?.configured && declaredText(slice) === "done") && !slice.work.length);
   const unknown = slices.filter(slice => !slice.scope && !slice.readiness?.configured).length;
-  const missionState = allComplete ? "OUTCOMES COMPLETE" : !attributed && legacy === slices.length && slices.length > 0 ? declaredDone === slices.length ? "DECLARED DONE" : "DECLARED WORK" : "OUTCOMES OPEN";
-  const missionToken: Token = problems ? "warn" : allComplete ? "ok" : "dim";
-  const nowText = active.length ? active.map(slice => `${slice.id} · ${assigneeText(slice) ?? "owner unknown"} · ${stateWord(slice)}`).join("; ") : "no open slice work in this read";
-  const nextValue = next ? `${next.id} · ${nextText(next) ?? "dependency eligibility unknown"}`
+  const missionState = allComplete ? "OUTCOMES COMPLETE" : declaredCompletion ?? (!attributed && legacy === slices.length && slices.length > 0 ? declaredDone === slices.length ? "DECLARED DONE" : "DECLARED WORK" : "OUTCOMES OPEN");
+  const missionToken: Token = problems ? "warn" : allComplete || declaredCompletion ? "ok" : "dim";
+  const nowText = active.length ? active.map(slice => `${slice.id} · ${assigneeText(slice) ?? "owner unknown"} · ${stateWord(slice)}`).join("; ") : declaredCompletion ? "nothing left to do" : "no open slice work in this read";
+  const nextValue = declaredCompletion ? "nothing left to do" : next ? `${next.id} · ${nextText(next) ?? "dependency eligibility unknown"}`
     : allComplete ? "outcomes complete; release decision separate"
     : !attributed && declaredDone > 0 && declaredDone === slices.length ? "declared work done; acceptance and release separate"
     : active.length ? "await current work; outcomes remain open"
     : "next eligibility unknown";
-  const progress = `${!attributed && legacy > 0 ? `${declaredDone}/${slices.length} declared done` : `${done}/${slices.length} outcomes complete`} · ${live} working${problems ? ` · ${problems} waiting` : ""}${unknown ? ` · ${unknown} proof unknown` : ""}`;
+  const progress = declaredCompletion ?? `${!attributed && legacy > 0 ? `${declaredDone}/${slices.length} declared done` : `${done}/${slices.length} outcomes complete`} · ${live} working${problems ? ` · ${problems} waiting` : ""}${unknown ? ` · ${unknown} proof unknown` : ""}`;
   const fact = (label: string, value: string, token: Token): ContentLine => semantic([
     { text: `  ${label.padEnd(10)}`, token: "dim", bold: true },
     { text: value, token },
@@ -487,9 +489,10 @@ function overviewLines(execution: ExecutionViewSnap, scopes: readonly MissionSco
   }
   lines.push(fact("NEXT", nextValue, next ? "accentBright" : "dim"));
   lines.push(fact("PROGRESS", progress, "bright"));
+  if (declaredCompletion) lines.push(semantic([{ text: "  formal item proof not recorded", token: "dim" }], width));
   const declaration = scopes?.find(scope => scope.mission === execution.mission)?.declaration;
   const lifecycle = execution.readiness?.historicalStatus ?? declaration?.status ?? declaration?.stage ?? "not declared";
-  lines.push(fact("LIFECYCLE", `${lifecycle} · separate from outcomes`, "dim"));
+  if (!declaredCompletion) lines.push(fact("LIFECYCLE", `${lifecycle} · separate from outcomes`, "dim"));
   if (needsHuman.length) {
     const first = needsHuman[0]!;
     lines.push(semanticAction([

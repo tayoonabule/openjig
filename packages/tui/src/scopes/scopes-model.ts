@@ -41,6 +41,15 @@ export interface SliceScopeSnap {
 }
 export interface MissionScopesSnap { mission: string; slices: SliceScopeSnap[]; error?: string; declaration?: { stage: string | null; status: string | null; sourcePath: string } | null }
 
+/** Human completion from authored declarations/reports, never formal acceptance.
+ * Configured item proof keeps its own authority, including pending/reopened items. */
+export function authoredCompletion(slices: readonly SliceScopeSnap[]): string | null {
+  if (!slices.length || slices.some(s => s.error || s.status?.trim().toLowerCase() !== "done" || s.readiness?.configured)) return null;
+  const verdicts = slices.map(s => s.proofReport?.verdict?.trim().toLowerCase());
+  if (verdicts.some(verdict => verdict !== "pass" && verdict !== "pass-with-residue")) return null;
+  return `${slices.length} of ${slices.length} done, ${verdicts.includes("pass-with-residue") ? "closed with residue" : "pass"}`;
+}
+
 /** Slice state glyph (mock: ● building/spec · ✓ delivery-locked · ⊙ other/idle). */
 export function sliceGlyph(s: SliceScopeSnap): string {
   if (s.error) return "!";
@@ -70,7 +79,7 @@ export function scopesExplorerRows(
     const key = `scopes-mission:${m.mission}`;
     const open = expanded.has(key);
     rows.push({
-      label: `${indent}${open ? "▾" : "▸"} ${m.mission}${m.error ? " · unavailable" : ""}`,
+      label: `${indent}${open ? "▾" : "▸"} ${m.mission}${m.error ? " · unavailable" : authoredCompletion(m.slices) ? ` · ${authoredCompletion(m.slices)}` : ""}`,
       action: { type: "scopes-mission-open", mission: m.mission },
       disclosureAction: { type: "toggle-expand", key },
       key,

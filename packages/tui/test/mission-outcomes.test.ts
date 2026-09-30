@@ -15,12 +15,17 @@ it("shows declared completion and authored report verdict without pretending leg
     proofReport: { file: "PROOF.md", verdict: id === "one" ? "pass" : "pass-with-residue" } })) }];
   const execution: ExecutionViewSnap = { view: "execution", mission: "cleanup", sources: {}, q1_lanes: [], q2_sequencing: [], q4_ladder: ["one", "two"].map(id => ({ slice_id: id, dir: id })), q5_park: [] };
   const text = executionContentLines(execution, scopes, [], null, 140).map(line => line.text).join("\n");
-  expect(text).toContain("2/2 declared done");
-  expect(text).toContain("2 reports · no item judgments");
-  expect(text).toContain("LIFECYCLE wip · separate from outcomes");
+  expect(text).toContain("2 of 2 done, closed with residue");
+  expect(text).toContain("formal item proof not recorded");
+  expect(text).toContain("NOW       nothing left to do");
+  expect(text).toContain("NEXT      nothing left to do");
+  expect(text).not.toContain("LIFECYCLE");
   expect(text).not.toContain("proof unknown");
   expect(text).not.toContain("OUTCOMES COMPLETE");
+  expect(text).not.toContain("OUTCOMES OPEN");
   expect(text).toContain("pass-with-residue");
+  const note = executionContentLines(execution, scopes, [], null, 140).find(line => line.text.includes("formal item proof not recorded"));
+  expect(note?.segs?.every(seg => seg.token === "dim")).toBe(true);
 });
 
 it.each([[140, 42], [80, 24]])("native judgments drive outcomes, queue drives work, and first-screen boxes survive at %ix%i", (cols, rows) => {

@@ -45,6 +45,25 @@ beforeEach(() => {
 afterEach(() => { db.close(); fs.rmSync(root, { recursive: true, force: true }); });
 async function get(url: string) { const response = await app.request(url); return { status: response.status, body: await response.json() as any }; }
 describe("catalog project identity across work reads", () => {
+  it("opens the exact mission slice even when an earlier mission uses the same directory name", async () => {
+    file(path.join(root, "a/missions/earlier/SPEC.md"), source("earlier mission"));
+    file(path.join(root, "a/missions/earlier/slices/04-release/SPEC.md"), source("wrong release"));
+    file(path.join(root, "a/missions/release-x/slices/04-release/SPEC.md"), source("right release").replace("status: active", "status: gated"));
+    const detail = await get("/api/slices/04-release?mission=release-x&project=a");
+    expect(detail.status).toBe(200);
+    expect(detail.body.slicePath).toBe(path.join(root, "a/missions/release-x/slices/04-release"));
+    expect(detail.body.rawStatus).toBe("gated");
+  });
+  it("refuses an authored proof report that escapes the selected project", async () => {
+    const proof = path.join(root, "a/missions/release-x/slices/01-story/PROOF.md");
+    const outside = path.join(root, "b/PROOF.md"); file(outside, "Verdict: pass\n"); fs.symlinkSync(outside, proof);
+    const detail = await get("/api/scopes/slice?mission=release-x&slice=01-story&project=a");
+    expect(detail.status).toBe(409);
+    expect(detail.body.error).toBe("project_path_escape");
+    const overview = await get("/api/scopes?detail=1&project=a");
+    expect(overview.body.missions[0].slices[0].error).toContain("outside selected project");
+    expect(overview.body.missions[0].slices[0].proofReport).toBeUndefined();
+  });
   it("keeps healthy missions and children reachable beside malformed source, then recovers", async () => {
     const bad = path.join(root, "a/missions/release-x/slices/02-bad/SPEC.md");
     file(bad, "---\nstatus: retired by another slice\n  kept for REASONING: preserve the original decision.\n---\n# Bad source\n");

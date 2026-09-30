@@ -125,6 +125,8 @@ export interface PassiveCeremony {
   origin: "passive";
   stage: "needs-diagnosis" | "confirmed" | "cleared" | "indeterminate";
   lineageId: string;
+  /** The queue root's lifecycle, not an assessment of the product outcome. */
+  workState?: string;
   basis: string;
   transitionIds: number[];
   context: Array<{ path: string; state: "available" | "unavailable"; sha256?: string; role: string }>;

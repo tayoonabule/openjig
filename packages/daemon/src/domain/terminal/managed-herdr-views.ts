@@ -269,7 +269,12 @@ export class ManagedHerdrViews {
       if (live && (live.terminal_id !== pane.terminalId || live.tab_id !== pane.tabId)) throw new Error("owned pane identity changed, human view retained");
     }
     if (native.some(p => owned!.tabs.includes(p.tab_id) && !owned!.panes.some(own => own.paneId === p.pane_id) && p.pane_id !== owned!.empty?.pane_id)) throw new Error("unowned pane in managed tab, retained");
-    owned.panes = owned.panes.filter(pane => native.some(p => p.pane_id === pane.paneId));
+    const vanished = owned.panes.filter(pane => !native.some(p => p.pane_id === pane.paneId));
+    if (vanished.length) {
+      for (const pane of vanished) this.deps.unbind?.(pane.paneId);
+      owned.panes = owned.panes.filter(pane => !vanished.includes(pane));
+      this.persist();
+    }
     if (owned.empty) {
       const empty = native.find(p => p.pane_id === owned!.empty!.pane_id);
       if (empty && empty.terminal_id !== owned.empty.terminal_id) throw new Error("empty pane identity changed, human view retained");

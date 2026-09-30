@@ -49,6 +49,22 @@ it("does not say nothing left to do when live correction work remains", () => {
   expect(text).toContain("assigned");
 });
 
+it("retains residue from an explicit report detail when its short verdict is pass", () => {
+  const { mission } = fixture("pass");
+  mission.slices[0]!.proofReport = { file: "PROOF.md", verdict: "pass", detail: "PASS with residue: owner confirmation remains" };
+  expect(authoredCompletion(mission.slices)).toBe("2 of 2 done, closed with residue");
+});
+
+it.each(["subset", "duplicate", "mission-error"])("does not certify the whole mission from a %s projection", edge => {
+  const { mission, execution } = fixture();
+  if (edge === "subset") execution.q4_ladder = [execution.q4_ladder[0]!];
+  if (edge === "duplicate") execution.q4_ladder = [execution.q4_ladder[0]!, execution.q4_ladder[0]!];
+  if (edge === "mission-error") mission.error = "incomplete read";
+  const text = executionContentLines(execution, [mission], [], null, 140).map(l => l.text).join("\n");
+  expect(text).not.toContain("closed with residue");
+  expect(text).not.toContain("nothing left to do");
+});
+
 it.each([[140, 42], [84, 28]])("uses the same wording on project mission rows and opened mission at %ix%i", (cols, rows) => {
   const { snap, mission, execution } = fixture();
   snap.scopes = [mission];

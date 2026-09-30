@@ -24,6 +24,7 @@ import { NodeLauncher } from "../src/domain/node-launcher.js";
 import { RestoreOrchestrator, rollupRestoreRigResult } from "../src/domain/restore-orchestrator.js";
 import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
 import { ClaudeResumeAdapter } from "../src/adapters/claude-resume.js";
+import { JcodeResumeAdapter } from "../src/adapters/jcode-resume.js";
 import { TmuxAdapter, type TmuxResult } from "../src/adapters/tmux.js";
 import type { CodexResumeAdapter } from "../src/adapters/codex-resume.js";
 import type { PiResumeAdapter } from "../src/adapters/pi-resume.js";
@@ -114,6 +115,7 @@ describe("RestoreOrchestrator", () => {
     tmux?: TmuxAdapter;
     claude?: ClaudeResumeAdapter;
     codex?: CodexResumeAdapter;
+    jcode?: JcodeResumeAdapter;
     pi?: PiResumeAdapter;
     omp?: OmpResumeAdapter;
     listProcesses?: () => Promise<Array<{ pid: number; ppid: number; command: string }>>;
@@ -125,6 +127,7 @@ describe("RestoreOrchestrator", () => {
       checkpointStore, nodeLauncher, tmuxAdapter: tmux,
       claudeResume: opts?.claude ?? mockClaudeResume(),
       codexResume: opts?.codex ?? mockCodexResume(),
+      jcodeResume: opts?.jcode,
       piResume: opts?.pi,
       ompResume: opts?.omp,
       listProcesses: opts?.listProcesses,
@@ -133,7 +136,7 @@ describe("RestoreOrchestrator", () => {
 
   function seedRigAndSnapshot(opts?: {
     edges?: { sourceLogical: string; targetLogical: string; kind: string }[];
-    nodes?: { logicalId: string; role: string; runtime: string; cwd?: string }[];
+    nodes?: { logicalId: string; role: string; runtime: string; cwd?: string; model?: string }[];
     resumeType?: string;
     resumeToken?: string;
     restorePolicy?: string;
@@ -148,7 +151,7 @@ describe("RestoreOrchestrator", () => {
     const rig = rigRepo.createRig("r99");
     const nodeMap: Record<string, string> = {};
     for (const n of nodes) {
-      const node = rigRepo.addNode(rig.id, n.logicalId, { role: n.role, runtime: n.runtime, cwd: n.cwd });
+      const node = rigRepo.addNode(rig.id, n.logicalId, { role: n.role, runtime: n.runtime, cwd: n.cwd, model: n.model });
       nodeMap[n.logicalId] = node.id;
     }
 
@@ -271,6 +274,165 @@ describe("RestoreOrchestrator", () => {
     expect(tmux.createSession).not.toHaveBeenCalled();
     expect(tmux.sendText).not.toHaveBeenCalled();
     expect(tmux.sendKeys).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { currentModel: "current-model-B", expectedModel: "current-model-B", label: "explicit current model" },
+    { currentModel: null, expectedModel: null, label: "unconfigured current model" },
+  ])("legacy restore uses $label instead of the snapshot model", async ({ currentModel, expectedModel }) => {
+    const snap = seedRigAndSnapshot({
+      nodes: [{ logicalId: "worker", role: "worker", runtime: "claude-code", model: "snapshot-model-A" }],
+      edges: [],
+      resumeType: "claude_id",
+      resumeToken: "saved-thread",
+    });
+    const node = snap.data.nodes[0]!;
+    rigRepo.db.prepare("UPDATE nodes SET model = ? WHERE id = ?").run(currentModel, node.id);
+
+    const resume = vi.fn(async (..._args: Parameters<ClaudeResumeAdapter["resume"]>) => ({ ok: true as const }));
+    const claude = { canResume: vi.fn(() => true), resume } as unknown as ClaudeResumeAdapter;
+    const result = await createOrchestrator({ claude }).restore(snap.id);
+
+    expect(result.ok).toBe(true);
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(resume.mock.calls[0]?.[5]).toBe(expectedModel);
+    expect(snapshotRepo.getSnapshot(snap.id)?.data.nodes[0]?.model).toBe("snapshot-model-A");
+    expect(rigRepo.getRig(snap.rigId)?.nodes.find((candidate) => candidate.id === node.id)?.model).toBe(currentModel);
+  });
+
+  it("single-node restore uses current durable model while keeping snapshot membership", async () => {
+    const snap = seedRigAndSnapshot({
+      nodes: [
+        { logicalId: "worker", role: "worker", runtime: "claude-code", model: "snapshot-model-A" },
+        { logicalId: "excluded", role: "worker", runtime: "claude-code", model: "other-model" },
+      ],
+      edges: [],
+      resumeType: "claude_id",
+      resumeToken: "saved-thread",
+    });
+    const node = snap.data.nodes.find((candidate) => candidate.logicalId === "worker")!;
+    rigRepo.setNodeModel(node.id, "current-model-B");
+    const resume = vi.fn(async (..._args: Parameters<ClaudeResumeAdapter["resume"]>) => ({ ok: true as const }));
+    const claude = { canResume: vi.fn(() => true), resume } as unknown as ClaudeResumeAdapter;
+    const orch = createOrchestrator({ claude });
+
+    const result = await orch.launchSingleNode(snap.rigId, "worker", { snapshotId: snap.id });
+
+    expect(result.ok).toBe(true);
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(resume.mock.calls[0]?.[5]).toBe("current-model-B");
+    expect(result.ok && result.launched.map((entry) => entry.logicalId)).toEqual(["worker"]);
+    expect(snapshotRepo.getSnapshot(snap.id)?.data.nodes.map((candidate) => candidate.logicalId).sort()).toEqual(["excluded", "worker"]);
+  });
+
+  it("reports a model change during resume without restarting or rewriting the snapshot", async () => {
+    const snap = seedRigAndSnapshot({
+      nodes: [{ logicalId: "worker", role: "worker", runtime: "claude-code", model: "snapshot-model-A" }],
+      edges: [],
+      resumeType: "claude_id",
+      resumeToken: "saved-thread",
+    });
+    const node = snap.data.nodes[0]!;
+    rigRepo.setNodeModel(node.id, "current-model-B");
+    const resume = vi.fn(async (..._args: Parameters<ClaudeResumeAdapter["resume"]>) => {
+      rigRepo.setNodeModel(node.id, "changed-during-resume-C");
+      return { ok: true as const };
+    });
+    const claude = { canResume: vi.fn(() => true), resume } as unknown as ClaudeResumeAdapter;
+
+    const result = await createOrchestrator({ claude }).restore(snap.id);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.result.nodes.find((entry) => entry.nodeId === node.id)).toMatchObject({
+      status: "attention_required",
+      error: expect.stringContaining("changed during restore"),
+    });
+    expect(resume.mock.calls[0]?.[5]).toBe("current-model-B");
+    expect(snapshotRepo.getSnapshot(snap.id)?.data.nodes[0]?.model).toBe("snapshot-model-A");
+    expect(rigRepo.getRig(snap.rigId)?.nodes.find((candidate) => candidate.id === node.id)?.model).toBe("changed-during-resume-C");
+  });
+
+  it("does not invoke resume if the durable runtime identity changes during launch preparation", async () => {
+    const snap = seedRigAndSnapshot({
+      nodes: [{ logicalId: "worker", role: "worker", runtime: "claude-code", model: "snapshot-model-A" }],
+      edges: [],
+      resumeType: "claude_id",
+      resumeToken: "saved-thread",
+    });
+    const node = snap.data.nodes[0]!;
+    const resume = vi.fn(async (..._args: Parameters<ClaudeResumeAdapter["resume"]>) => ({ ok: true as const }));
+    const claude = { canResume: vi.fn(() => true), resume } as unknown as ClaudeResumeAdapter;
+    const tmux = {
+      ...mockTmux(),
+      createSession: vi.fn(async () => {
+        rigRepo.db.prepare("UPDATE nodes SET runtime = 'codex' WHERE id = ?").run(node.id);
+        return { ok: true as const };
+      }),
+    } as unknown as TmuxAdapter;
+
+    const result = await createOrchestrator({ claude, tmux }).restore(snap.id);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.result.nodes.find((entry) => entry.nodeId === node.id)).toMatchObject({
+      status: "attention_required",
+      error: expect.stringContaining("identity changed"),
+    });
+    expect(resume).not.toHaveBeenCalled();
+    expect(snapshotRepo.getSnapshot(snap.id)?.data.nodes[0]?.runtime).toBe("claude-code");
+  });
+
+  it("holds a Jcode resume when the current model differs from the saved snapshot model", async () => {
+    const snap = seedRigAndSnapshot({
+      nodes: [{ logicalId: "worker", role: "worker", runtime: "jcode", model: "snapshot-model-A" }],
+      edges: [],
+      resumeType: "jcode_id",
+      resumeToken: "saved-jcode-session",
+    });
+    const node = snap.data.nodes[0]!;
+    rigRepo.setNodeModel(node.id, "current-model-B");
+    const jcode = {
+      canResume: vi.fn(() => true),
+      resume: vi.fn(async () => ({ ok: true as const })),
+    } as unknown as JcodeResumeAdapter;
+
+    const result = await createOrchestrator({ jcode }).restore(snap.id);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.result.nodes.find((entry) => entry.nodeId === node.id)).toMatchObject({
+      status: "attention_required",
+      error: expect.stringContaining("held for native model verification"),
+    });
+    expect(jcode.resume).not.toHaveBeenCalled();
+    expect(snapshotRepo.getSnapshot(snap.id)?.data.nodes[0]?.model).toBe("snapshot-model-A");
+  });
+
+  it("leaves a null Jcode policy unpinned and reports the runtime-selected model as unobserved", async () => {
+    const snap = seedRigAndSnapshot({
+      nodes: [{ logicalId: "worker", role: "worker", runtime: "jcode", model: "snapshot-model-A" }],
+      edges: [],
+      resumeType: "jcode_id",
+      resumeToken: "saved-jcode-session",
+    });
+    const node = snap.data.nodes[0]!;
+    rigRepo.db.prepare("UPDATE nodes SET model = NULL WHERE id = ?").run(node.id);
+    const jcode = {
+      canResume: vi.fn(() => true),
+      resume: vi.fn(async (_session: string, _type: string | null, _token: string | null, _cwd: string, model?: string | null) => {
+        expect(model).toBeNull();
+        return { ok: true as const };
+      }),
+    } as unknown as JcodeResumeAdapter;
+
+    const result = await createOrchestrator({ jcode }).restore(snap.id);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(jcode.resume).toHaveBeenCalledTimes(1);
+    expect(result.result.warnings).toContain("Jcode restore has no OpenRig model pin; the native saved/runtime-selected model was not observed.");
+    expect(snapshotRepo.getSnapshot(snap.id)?.data.nodes[0]?.model).toBe("snapshot-model-A");
   });
 
   it("constructor throws on mismatched db handles", () => {

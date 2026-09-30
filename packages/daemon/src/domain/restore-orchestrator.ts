@@ -1035,7 +1035,19 @@ export class RestoreOrchestrator {
         await this.rollbackToZeroSession(node.id, sessionName, launchResult?.session.id, priorState);
         return { nodeId: node.id, logicalId: node.logicalId, status: "awaiting-decision", error: `Original session unresumable: resume requested but no token available. No session is running. Re-run with --fresh ${node.logicalId} for a deliberate fresh-primed seat, or restore the original session manually.` };
       } else {
-        const resumeOutcome = await this.attemptResume(node.id, sessionName, resumeType, resumeToken, node.cwd ?? "/", node.codexConfigProfile, node.model, this.resolveRestorePosture(node.id, rigId), node.effort, warnings);
+        const resumeOutcome = await this.attemptResume(
+          node.id,
+          sessionName,
+          resumeType,
+          resumeToken,
+          node.cwd ?? "/",
+          node.codexConfigProfile,
+          node.model,
+          this.resolveRestorePosture(node.id, rigId),
+          node.effort,
+          { rigId, logicalId: node.logicalId, runtime: node.runtime },
+          warnings,
+        );
         if (resumeOutcome.kind === "resumed") {
           baseStatus = "resumed";
         } else if (resumeOutcome.kind === "attention_required") {
@@ -1223,6 +1235,7 @@ export class RestoreOrchestrator {
               skipHarnessLaunch: !shouldLaunchHarness,
               resumeToken: (isPodAware && resumeRequested) ? resumeToken ?? undefined : undefined,
               resumeType: (isPodAware && resumeRequested) ? resumeType ?? undefined : undefined,
+              modelAuthority: { rigId, logicalId: node.logicalId, runtime: node.runtime },
               sessionName: sessionName,
               allowFreshFallback: !(isPodAware && resumeRequested),
             });
@@ -1480,6 +1493,7 @@ export class RestoreOrchestrator {
     // custom policies re-validated when readable). Absent = env decision.
     resolvedPosture?: "floor" | "full_bypass" | "auto",
     effort?: string | null,
+    modelAuthority?: { rigId: string; logicalId: string; runtime: string | null },
     warnings?: string[],
   ): Promise<
     | { kind: "resumed" }
@@ -1501,8 +1515,16 @@ export class RestoreOrchestrator {
       resolvedPosture = override.launchPosture ?? resolvedPosture;
       permissionMode = override.permissionMode ?? (resolvedPosture === "auto" && runtime === "claude-code" ? "auto" : undefined);
     } catch (error) { return { kind: "failed", message: `Permission selection: ${(error as Error).message}` }; }
+    const currentModel = modelAuthority ? this.readCurrentRestoreModel(nodeId, modelAuthority) : { ok: true as const, model };
+    if (!currentModel.ok) return { kind: "attention_required", message: currentModel.message };
+    model = currentModel.model;
     if (this.claudeResume.canResume(resumeType, resumeToken)) {
       const result = await this.claudeResume.resume(sessionName, resumeType, resumeToken, cwd, resolvedPosture, model, permissionMode, nodeId, ...launchTail);
+      const afterResume = modelAuthority ? this.readCurrentRestoreModel(nodeId, modelAuthority) : currentModel;
+      if (!afterResume.ok) return { kind: "attention_required", message: afterResume.message };
+      if (afterResume.model !== model) {
+        return { kind: "attention_required", message: `Model policy changed during restore for node ${nodeId}; the resumed session was preserved and was not restarted.` };
+      }
       if (result.ok) {
         const notice = nonInterruptiveNotice("claude-code", { nonInterruptive, launchPosture: resolvedPosture, permissionMode });
         if (notice) warnings?.push(`${sessionName}: ${notice}`);
@@ -1523,6 +1545,11 @@ export class RestoreOrchestrator {
 
     if (this.codexResume.canResume(resumeType, resumeToken)) {
       const result = await this.codexResume.resume(sessionName, resumeType, resumeToken, cwd, codexConfigProfile, resolvedPosture, model, ...launchTail);
+      const afterResume = modelAuthority ? this.readCurrentRestoreModel(nodeId, modelAuthority) : currentModel;
+      if (!afterResume.ok) return { kind: "attention_required", message: afterResume.message };
+      if (afterResume.model !== model) {
+        return { kind: "attention_required", message: `Model policy changed during restore for node ${nodeId}; the resumed session was preserved and was not restarted.` };
+      }
       if (result.ok) {
         const notice = nonInterruptiveNotice("codex", { nonInterruptive, launchPosture: resolvedPosture, permissionMode });
         if (notice) warnings?.push(`${sessionName}: ${notice}`);
@@ -1545,7 +1572,19 @@ export class RestoreOrchestrator {
     }
 
     if (this.jcodeResume?.canResume(resumeType, resumeToken)) {
+      if (model) {
+        return {
+          kind: "attention_required",
+          message: `Jcode may restore the model saved inside this session rather than current policy ${model}; restore is held for native model verification. No new turn was started.`,
+        };
+      }
+      warnings?.push("Jcode restore has no OpenRig model pin; the native saved/runtime-selected model was not observed.");
       const result = await this.jcodeResume.resume(sessionName, resumeType, resumeToken, cwd, model);
+      const afterResume = modelAuthority ? this.readCurrentRestoreModel(nodeId, modelAuthority) : currentModel;
+      if (!afterResume.ok) return { kind: "attention_required", message: afterResume.message };
+      if (afterResume.model !== model) {
+        return { kind: "attention_required", message: `Model policy changed during restore for node ${nodeId}; the resumed session was preserved and was not restarted.` };
+      }
       if (result.ok) {
         if (result.appliedLaunch && launchGeneration) this.appliedLaunchStore.recordGeneration(launchGeneration, result.appliedLaunch);
         return { kind: "resumed" };
@@ -1558,6 +1597,11 @@ export class RestoreOrchestrator {
     // Pi's missing session file returns retry_fresh for operator decision.
     if (this.piResume?.canResume(resumeType, resumeToken)) {
       const result = await this.piResume.resume(sessionName, resumeType, resumeToken, cwd, model, resolvedPosture);
+      const afterResume = modelAuthority ? this.readCurrentRestoreModel(nodeId, modelAuthority) : currentModel;
+      if (!afterResume.ok) return { kind: "attention_required", message: afterResume.message };
+      if (afterResume.model !== model) {
+        return { kind: "attention_required", message: `Model policy changed during restore for node ${nodeId}; the resumed session was preserved and was not restarted.` };
+      }
       if (result.ok) {
         if (result.appliedLaunch && launchGeneration) this.appliedLaunchStore.recordGeneration(launchGeneration, result.appliedLaunch);
         return { kind: "resumed" };
@@ -1587,6 +1631,19 @@ export class RestoreOrchestrator {
 
 
     return { kind: "failed", message: "No resume adapter available for this runtime/token combination." };
+  }
+
+  private readCurrentRestoreModel(
+    nodeId: string,
+    expected: { rigId: string; logicalId: string; runtime: string | null },
+  ): { ok: true; model: string | null | undefined } | { ok: false; message: string } {
+    const row = this.db.prepare(
+      "SELECT rig_id, logical_id, runtime, model FROM nodes WHERE id = ?",
+    ).get(nodeId) as { rig_id: string; logical_id: string; runtime: string | null; model: string | null } | undefined;
+    if (!row || row.rig_id !== expected.rigId || row.logical_id !== expected.logicalId || row.runtime !== expected.runtime) {
+      return { ok: false, message: `Restore identity changed for node ${nodeId}; no stale snapshot model was used.` };
+    }
+    return { ok: true, model: row.model };
   }
 
   /**

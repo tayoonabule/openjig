@@ -10,6 +10,11 @@ describe("managed observer process truth", () => {
     expect(observerRuntimeLife([shell, { pid: 11, ppid: 10, command: "jcode --resume another" }], 10, "jcode", "native-token")).toBe("unknown");
     expect(observerRuntimeLife([{ pid: 10, ppid: 1, command: "jcode serve", executableName: "jcode" }], 10, "jcode")).toBe("unknown");
   });
+  it("recognizes fresh option-based Jcode UI after its saved token is recorded", () => {
+    expect(observerRuntimeLife([shell, { pid: 11, ppid: 10, command: "jcode --no-update --no-selfdev -C /project -m model" }], 10, "jcode", "saved-after-launch")).toBe("running");
+    expect(observerRuntimeLife([shell, { pid: 11, ppid: 10, command: "jcode --resume=other -C /project" }], 10, "jcode", "saved-after-launch")).toBe("unknown");
+    expect(observerRuntimeLife([shell, { pid: 11, ppid: 10, command: "jcode server reload" }], 10, "jcode", "saved-after-launch")).toBe("unknown");
+  });
   it("proves a natural return to bare shell but retains ambiguous/transient observations", () => {
     expect(observerRuntimeLife([shell], 10, "jcode")).toBe("absent");
     expect(observerRuntimeLife([], 10, "jcode")).toBe("unknown");

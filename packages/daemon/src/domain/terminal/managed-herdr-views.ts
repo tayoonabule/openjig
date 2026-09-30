@@ -324,6 +324,9 @@ export class ManagedHerdrViews {
         if (!this.current(seat)) throw new Error("seat changed before observer move");
         const windows = list<{ workspace_id: string; active_tab_id?: string; focused?: boolean }>((await this.rpc("workspace.list", {})).workspaces);
         if (!windows.some(w => w.focused) || windows.find(w => w.workspace_id === owned.workspaceId)?.active_tab_id === created.tabId) throw new Error("new observer tab selected by user, retained without moving");
+        const latest = list<NativePane>((await this.rpc("pane.list", { workspace_id: owned.workspaceId })).panes);
+        if ([anchor, created].some(expected => !latest.some(p => p.pane_id === expected.paneId && p.terminal_id === expected.terminalId && p.tab_id === expected.tabId))) throw new Error("move source or destination changed after focus observation");
+        if (!this.current(seat)) throw new Error("seat changed after focus observation");
         created.movingToTab = tab; this.persist();
         const moved = await this.rpc("pane.move", { pane_id: created.paneId, destination: { type: "tab", tab_id: tab, target_pane_id: anchor.paneId, split: peers.length % 2 ? "down" : "right", ratio: 0.5 }, focus: false });
         const outcome = record(moved.move_result);

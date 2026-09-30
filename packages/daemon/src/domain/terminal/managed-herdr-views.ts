@@ -8,7 +8,7 @@ import type { EventBus } from "../event-bus.js";
 import type { HerdrTransport } from "./herdr-transport.js";
 import { equalStrip, type HerdrLayoutNode } from "./herdr-adapter.js";
 
-export interface ObserverSeat { nodeId: string; target: string; label: string; life: "running" | "absent" | "unknown" }
+export interface ObserverSeat { nodeId: string; target: string; label: string; writable: boolean; life: "running" | "absent" | "unknown" }
 export interface ObserverRig { id: string; name: string; seats: ObserverSeat[] }
 interface Pane { pane_id: string; terminal_id: string; tab_id: string }
 export interface ObserverClient { pid: number; target: string; readOnly: boolean; ignoreSize: boolean }
@@ -31,33 +31,35 @@ const array = <T>(value: unknown): T[] => {
 const object = (value: unknown): Record<string, any> => value && typeof value === "object" ? value as Record<string, any> : {};
 
 export function observerGrid(seats: ObserverSeat[]): HerdrLayoutNode {
-  const panes: HerdrLayoutNode[] = seats.map(seat => ({ type: "pane", label: seat.label, command: ["tmux", "attach", "-r", "-E", "-t", seat.target] }));
+  const panes: HerdrLayoutNode[] = seats.map(seat => ({ type: "pane", label: seat.label, command: ["tmux", "attach", ...(seat.writable ? ["-f", "ignore-size"] : ["-r"]), "-E", "-t", seat.target] }));
   if (!panes.length) return { type: "pane", label: "no running seats", command: EMPTY };
   const columns: HerdrLayoutNode[] = [];
   for (let i = 0; i < panes.length; i += 2) columns.push(equalStrip(panes.slice(i, i + 2), "down"));
   return equalStrip(columns, "right");
 }
 
-/** Only a direct read-only attach is replaceable. Labels are not authority. */
-export function readonlyAttachTarget(argv: unknown): string | null {
+/** Only a direct observer attach is replaceable. Labels are not authority. */
+export function observerAttach(argv: unknown): { target: string; writable: boolean } | null {
   if (!Array.isArray(argv) || !argv.every(v => typeof v === "string") || path.basename(argv[0] ?? "") !== "tmux" || !["attach", "attach-session"].includes(argv[1] ?? "")) return null;
-  let target: string | null = null, readonly = false;
+  let target: string | null = null, readonly = false, noEnvUpdate = false, ignoreSize = false;
   for (let i = 2; i < argv.length; i++) {
     if (argv[i] === "-r") readonly = true;
-    else if (argv[i] === "-E") continue;
+    else if (argv[i] === "-E") noEnvUpdate = true;
+    else if (argv[i] === "-f" && argv[i + 1] === "ignore-size") { ignoreSize = true; i++; }
     else if (argv[i] === "-t" && target === null) target = argv[++i] ?? null;
     else return null;
   }
-  return readonly && target ? target : null;
+  return target && noEnvUpdate && (readonly || ignoreSize) ? { target, writable: !readonly } : null;
 }
 
-/** One disposable view tab. Seat terminals, inputs, models and bindings are never written. */
+/** Observer reconciliation mutates its disposable pane layout only; lead panes remain interactively attachable. */
 export class ManagedHerdrViews {
   private findings: Record<string, string> = {};
   private sweep: Promise<void> | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private unsubscribe: (() => void) | undefined;
   private stopped = false;
+  private readonly landedWorkspaces = new Set<string>();
   constructor(private readonly deps: Deps) {}
   status(): Record<string, string> { return { ...this.findings }; }
   start(): void {
@@ -87,12 +89,12 @@ export class ManagedHerdrViews {
     if (this.findings[id] !== text) this.deps.log?.(`[herdr-views] ${id}: ${text}`);
     this.findings[id] = text;
   }
-  private async inspect(panes: Pane[], clients: ObserverClient[]): Promise<Array<string | null>> {
+  private async inspect(panes: Pane[], clients: ObserverClient[]): Promise<Array<{ target: string; writable: boolean } | null>> {
     return Promise.all(panes.map(async pane => {
       const info = object((await this.rpc("pane.process_info", { pane_id: pane.pane_id })).process_info);
       for (const process of array<Record<string, any>>(info.foreground_processes)) {
-        const target = readonlyAttachTarget(process.argv);
-        if (target && clients.some(client => client.pid === process.pid && client.target === target && client.readOnly && client.ignoreSize)) return target;
+        const attach = observerAttach(process.argv);
+        if (attach && clients.some(client => client.pid === process.pid && client.target === attach.target && client.readOnly !== attach.writable && client.ignoreSize)) return attach;
         if (process.pid === info.shell_pid && Array.isArray(process.argv) && path.basename(process.argv[0] ?? "") === "sleep" && process.argv[1] === "2147483647") return null;
       }
       throw new Error("seats tab contains an unverified or human pane, retained");
@@ -102,7 +104,7 @@ export class ManagedHerdrViews {
     try {
       const rigs = await this.deps.listRigs();
       const clients = await this.deps.listClients();
-      const workspaces = array<{ workspace_id: string; label: string }>((await this.rpc("workspace.list", {})).workspaces);
+      const workspaces = array<{ workspace_id: string; label: string; focused?: boolean }>((await this.rpc("workspace.list", {})).workspaces);
       delete this.findings.transport;
       for (const rig of rigs) {
         if (this.stopped) break;
@@ -116,10 +118,11 @@ export class ManagedHerdrViews {
           const tab = tabs[0];
           const panes = tab ? array<Pane>((await this.rpc("pane.list", { workspace_id: workspace.workspace_id })).panes).filter(p => p.tab_id === tab.tab_id) : [];
           const targets = await this.inspect(panes, clients);
-          const desired = rig.seats.filter(s => s.life === "running" || (s.life === "unknown" && targets.includes(s.target)));
-          const existing = targets.filter((target): target is string => target !== null);
-          if (tab && existing.length === desired.length && desired.every(s => existing.includes(s.target))) {
-            for (const seat of desired) if (this.deps.isCurrent(seat)) this.deps.bind?.(seat, panes[targets.indexOf(seat.target)]!.pane_id);
+          const desired = rig.seats.filter(s => s.life === "running" || (s.life === "unknown" && targets.some(t => t?.target === s.target)));
+          const existing = targets.filter((target): target is { target: string; writable: boolean } => target !== null);
+          let selectedTabId = tab?.tab_id;
+          if (tab && existing.length === desired.length && desired.every(s => existing.some(e => e.target === s.target && e.writable === s.writable))) {
+            for (const seat of desired) if (this.deps.isCurrent(seat)) this.deps.bind?.(seat, panes[targets.findIndex(t => t?.target === seat.target)]!.pane_id);
           } else {
             // Re-check the complete view after awaits. Replacement affects only
             // these positively verified observer terminals, never a seat pane.
@@ -129,11 +132,16 @@ export class ManagedHerdrViews {
             const result = await this.rpc("layout.apply", { ...(tab ? { tab_id: tab.tab_id } : { workspace_id: workspace.workspace_id }), tab_label: "seats", focus: false, root: observerGrid(desired) });
             for (const pane of panes) this.deps.unbind?.(pane.pane_id);
             const newTab = object(result.layout).tab_id;
+            selectedTabId = newTab;
             const created = array<Pane>((await this.rpc("pane.list", { workspace_id: workspace.workspace_id })).panes).filter(p => p.tab_id === newTab);
             const attached = await this.inspect(created, await this.deps.listClients());
-            for (const seat of desired) if (this.deps.isCurrent(seat) && attached.includes(seat.target)) this.deps.bind?.(seat, created[attached.indexOf(seat.target)]!.pane_id);
+            for (const seat of desired) if (this.deps.isCurrent(seat) && attached.some(a => a?.target === seat.target && a.writable === seat.writable)) this.deps.bind?.(seat, created[attached.findIndex(a => a?.target === seat.target)]!.pane_id);
           }
-          this.note(rig.id, `${desired.length} read-only seats${rig.seats.some(s => s.life === "unknown") ? ", some runtime status unknown" : ""}`);
+          if (workspace.focused && !this.landedWorkspaces.has(workspace.workspace_id) && selectedTabId) {
+            await this.rpc("tab.focus", { tab_id: selectedTabId });
+            this.landedWorkspaces.add(workspace.workspace_id);
+          }
+          this.note(rig.id, `${desired.length} seats${rig.seats.some(s => s.life === "unknown") ? ", some runtime status unknown" : ""}`);
         } catch (error) { this.note(rig.id, String(error)); }
       }
     } catch (error) { this.note("transport", String(error)); }
@@ -163,7 +171,7 @@ export function managedViewInventory(db: Database.Database, tmux: Pick<TmuxAdapt
           if (row.runtime === "terminal" && tree.length || tree.some(p => path.basename(p.executableName ?? p.command.split(/\s+/)[0] ?? "") === executable && !p.command.includes(" serve"))) life = "running";
           else if (tree.length === 1 && /(?:^|\/)(?:sh|bash|zsh|fish)(?:\s|$)/.test(tree[0]!.command)) life = "absent";
         }
-        return { nodeId: row.node_id, target: target(row), label: target(row).split("@")[0] || row.logical_id, life };
+        return { nodeId: row.node_id, target: target(row), label: target(row).split("@")[0] || row.logical_id, writable: String(row.logical_id).endsWith(".lead"), life };
       }));
       return rigs.map(rig => ({ ...rig, seats: seats.filter((_, i) => rows[i].rig_id === rig.id) }));
     },

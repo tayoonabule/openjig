@@ -9,6 +9,20 @@ import { demoSnapshot } from "../src/demo-data.js";
 import { createViewState } from "../src/state.js";
 import { renderScreen } from "../src/render.js";
 
+it("shows declared completion and authored report verdict without pretending legacy reports are judgments", () => {
+  const snap = demoSnapshot(), template = snap.scopes![0]!.slices[0]!;
+  const scopes = [{ mission: "cleanup", declaration: { stage: "wip", status: null, sourcePath: "/cleanup/SPEC.md" }, slices: ["one", "two"].map(id => ({ ...template, id, dirName: id, status: "done", stage: "closed",
+    proofReport: { file: "PROOF.md", verdict: id === "one" ? "pass" : "pass-with-residue" } })) }];
+  const execution: ExecutionViewSnap = { view: "execution", mission: "cleanup", sources: {}, q1_lanes: [], q2_sequencing: [], q4_ladder: ["one", "two"].map(id => ({ slice_id: id, dir: id })), q5_park: [] };
+  const text = executionContentLines(execution, scopes, [], null, 140).map(line => line.text).join("\n");
+  expect(text).toContain("2/2 declared done");
+  expect(text).toContain("2 reports · no item judgments");
+  expect(text).toContain("LIFECYCLE wip · separate from outcomes");
+  expect(text).not.toContain("proof unknown");
+  expect(text).not.toContain("OUTCOMES COMPLETE");
+  expect(text).toContain("pass-with-residue");
+});
+
 it.each([[140, 42], [80, 24]])("native judgments drive outcomes, queue drives work, and first-screen boxes survive at %ix%i", (cols, rows) => {
   const root = mkdtempSync(join(tmpdir(), "ux-outcomes-"));
   const missions = join(root, "missions"), mission = join(missions, "trial");
@@ -84,7 +98,7 @@ it.each(["empty", "unknown-assigned", "unknown-unassigned"])("does not infer com
   const text = executionContentLines(execution, undefined, [], null, 120).map(line => line.text).join("\n");
   expect(text).toContain("OUTCOMES OPEN");
   expect(text).toContain(`PROGRESS  0/${empty ? 0 : 1} outcomes complete`);
-  expect(text).toContain("LIFECYCLE unknown · separate from outcomes");
+  expect(text).toContain("LIFECYCLE not declared · separate from outcomes");
   expect(text).toContain(assigned ? "NOW       one · actual · assigned" : "NOW       no open slice work in this read");
   expect(text).toContain(empty ? "NEXT      next eligibility unknown" : assigned ? "NEXT      await current work; outcomes remain open" : "NEXT      one · dependency eligibility unknown");
   if (!empty) expect(text).toContain("1 proof unknown");

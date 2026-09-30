@@ -171,7 +171,7 @@ export function managedViewInventory(db: Database.Database, tmux: Pick<TmuxAdapt
           if (row.runtime === "terminal" && tree.length || tree.some(p => path.basename(p.executableName ?? p.command.split(/\s+/)[0] ?? "") === executable && !p.command.includes(" serve"))) life = "running";
           else if (tree.length === 1 && /(?:^|\/)(?:sh|bash|zsh|fish)(?:\s|$)/.test(tree[0]!.command)) life = "absent";
         }
-        return { nodeId: row.node_id, target: target(row), label: target(row).split("@")[0] || row.logical_id, writable: String(row.logical_id).endsWith(".lead"), life };
+        return { nodeId: row.node_id, target: target(row), label: target(row).split("@")[0] || row.logical_id, writable: true, life };
       }));
       return rigs.map(rig => ({ ...rig, seats: seats.filter((_, i) => rows[i].rig_id === rig.id) }));
     },

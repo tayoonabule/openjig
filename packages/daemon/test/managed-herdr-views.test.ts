@@ -43,12 +43,14 @@ describe("automatic rig seats views", () => {
     expect(f.panes[0].argv).toEqual(["tmux", "attach", "-f", "ignore-size", "-E", "-t", "lead@rig"]);
     expect(f.calls.some(c => c.method === "tab.focus")).toBe(false);
   });
-  it("converts an existing read-only lead observer to writable without changing other tabs", async () => {
+  it("recreates an existing read-only non-lead observer as writable without changing other tabs", async () => {
     const f = fixture(); await f.views.reconcile();
-    f.panes[0].argv = ["tmux", "attach", "-r", "-E", "-t", "lead@rig"];
+    f.setSeats([{ nodeId: "helper", target: "martech-email@bavarian-nordic", label: "martech-email", writable: true, life: "running" }]);
     await f.views.reconcile();
-    expect(f.calls.filter(c => c.method === "layout.apply")).toHaveLength(2);
-    expect(f.panes[0].argv).toEqual(["tmux", "attach", "-f", "ignore-size", "-E", "-t", "lead@rig"]);
+    f.panes[0].argv = ["tmux", "attach", "-r", "-E", "-t", "martech-email@bavarian-nordic"];
+    await f.views.reconcile();
+    expect(f.calls.filter(c => c.method === "layout.apply")).toHaveLength(3);
+    expect(f.panes[0].argv).toEqual(["tmux", "attach", "-f", "ignore-size", "-E", "-t", "martech-email@bavarian-nordic"]);
     expect(f.human).toEqual({ pane_id: "human", terminal_id: "human-terminal", tab_id: "mission-control" });
   });
   it("selects the seats tab once when it is in the currently focused workspace", async () => {
@@ -58,10 +60,10 @@ describe("automatic rig seats views", () => {
   });
   it("adds and removes running seats by replacing only the disposable view tab", async () => {
     const f = fixture(); await f.views.reconcile();
-    f.setSeats([{ nodeId: "lead", target: "lead@rig", label: "lead", writable: true, life: "running" }, { nodeId: "helper", target: "helper@rig", label: "helper", writable: false, life: "running" }]);
+    f.setSeats([{ nodeId: "lead", target: "lead@rig", label: "lead", writable: true, life: "running" }, { nodeId: "helper", target: "helper@rig", label: "helper", writable: true, life: "running" }]);
     await f.views.reconcile(); expect(f.panes).toHaveLength(2); expect(f.tabs).toHaveLength(1);
     expect(f.panes.map(p => p.argv)).toContainEqual(["tmux", "attach", "-f", "ignore-size", "-E", "-t", "lead@rig"]);
-    expect(f.panes.map(p => p.argv)).toContainEqual(["tmux", "attach", "-r", "-E", "-t", "helper@rig"]);
+    expect(f.panes.map(p => p.argv)).toContainEqual(["tmux", "attach", "-f", "ignore-size", "-E", "-t", "helper@rig"]);
     f.setSeats([]); await f.views.reconcile(); expect(f.tabs).toHaveLength(1); expect(f.panes[0].argv).toEqual(["sleep", "2147483647"]);
     expect(f.human).toEqual({ pane_id: "human", terminal_id: "human-terminal", tab_id: "mission-control" });
     expect(f.calls.filter(c => !["workspace.create", "layout.apply", "pane.process_info", "tab.focus"].includes(c.method) && !c.method.endsWith(".list"))).toEqual([]);
@@ -91,7 +93,7 @@ describe("automatic rig seats views", () => {
       return result;
     };
     f.setSeats([]); await f.views.reconcile(); expect(f.calls.filter(c => c.method === "layout.apply")).toHaveLength(1);
-    f.setCurrent(false); f.setSeats([{ nodeId: "helper", target: "helper@rig", label: "helper", writable: false, life: "running" }]);
+    f.setCurrent(false); f.setSeats([{ nodeId: "helper", target: "helper@rig", label: "helper", writable: true, life: "running" }]);
     await f.views.reconcile(); expect(f.calls.filter(c => c.method === "layout.apply")).toHaveLength(1);
   });
 });

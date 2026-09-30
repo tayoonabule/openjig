@@ -456,8 +456,11 @@ function overviewLines(execution: ExecutionViewSnap, scopes: readonly MissionSco
   const declaredDone = slices.filter(slice => declaredText(slice) === "done").length;
   const legacy = slices.filter(slice => !!slice.scope && !slice.readiness?.configured).length;
   const reports = slices.filter(slice => slice.scope?.proofReport).length;
-  const declaredCompletion = !active.length && slices.every(slice => !!slice.scope && !slice.readiness?.configured)
-    ? authoredCompletion(slices.map(slice => slice.scope!)) : null;
+  const missionScope = scopes?.find(scope => scope.mission === execution.mission);
+  const fullMission = !!missionScope && !missionScope.error && slices.length === missionScope.slices.length
+    && new Set(slices.map(slice => slice.scope)).size === missionScope.slices.length
+    && slices.every(slice => !!slice.scope && !slice.readiness?.configured);
+  const declaredCompletion = !active.length && fullMission ? authoredCompletion(missionScope!.slices) : null;
   const next = slices.find(slice => nextText(slice) === "ready to start") ?? slices.find(slice => !outcomeComplete(slice) && !(slice.scope && !slice.readiness?.configured && declaredText(slice) === "done") && !slice.work.length);
   const unknown = slices.filter(slice => !slice.scope && !slice.readiness?.configured).length;
   const missionState = allComplete ? "OUTCOMES COMPLETE" : declaredCompletion ?? (!attributed && legacy === slices.length && slices.length > 0 ? declaredDone === slices.length ? "DECLARED DONE" : "DECLARED WORK" : "OUTCOMES OPEN");

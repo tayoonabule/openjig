@@ -230,7 +230,7 @@ describe("AS-T09: Continuity + snapshot/restore evolution", () => {
   });
 
   // T11: restore with nodeStartupContext calls startNode with isRestore=true
-  it("restore with startup context replays via startNode isRestore=true", async () => {
+  it("restore with startup context replays using current durable model, not the snapshot model", async () => {
     const { RestoreOrchestrator } = await import("../src/domain/restore-orchestrator.js");
     const { NodeLauncher } = await import("../src/domain/node-launcher.js");
     const { ClaudeResumeAdapter } = await import("../src/adapters/claude-resume.js");
@@ -239,6 +239,7 @@ describe("AS-T09: Continuity + snapshot/restore evolution", () => {
 
     const ctx = setup();
     const { rig, node, session } = seedRigWithPod(ctx);
+    ctx.rigRepo.setNodeModel(node.id, "snapshot-model-A");
 
     // Persist startup context (as StartupOrchestrator would)
     ctx.db.prepare(
@@ -252,6 +253,7 @@ describe("AS-T09: Continuity + snapshot/restore evolution", () => {
 
     // Capture the exactly-one-running occupant, then simulate the stopped rig.
     const snapshot = ctx.snapshotCapture.captureSnapshot(rig.id, "manual");
+    ctx.rigRepo.setNodeModel(node.id, "current-model-B");
     ctx.sessionRegistry.updateStatus(session.id, "exited");
     expect(snapshot.data.nodeStartupContext![node.id]).toBeDefined();
 
@@ -286,6 +288,11 @@ describe("AS-T09: Continuity + snapshot/restore evolution", () => {
     if (result.ok) {
       // Startup replay should have called adapter.project (via StartupOrchestrator)
       expect(mockAdapter.project).toHaveBeenCalled();
+      expect(mockAdapter.launchHarness).toHaveBeenCalledWith(
+        expect.objectContaining({ model: "current-model-B" }),
+        expect.any(Object),
+      );
+      expect(snapshot.data.nodes.find((candidate) => candidate.id === node.id)?.model).toBe("snapshot-model-A");
       expect(mockAdapter.checkReady).toHaveBeenCalled();
       // Node honestly reports its restore outcome (mock resume didn't actually resume)
       const nodeResult = result.result.nodes.find((n) => n.nodeId === node.id);
@@ -293,6 +300,56 @@ describe("AS-T09: Continuity + snapshot/restore evolution", () => {
       // OPR.0.3.4.2: deliberate fresh launches report fresh-primed.
       expect(["resumed", "fresh-primed", "rebuilt"]).toContain(nodeResult!.status);
     }
+    ctx.db.close();
+  });
+
+  it("marks pod-aware restore attention-required if durable model changes while harness launch is awaiting", async () => {
+    const { RestoreOrchestrator } = await import("../src/domain/restore-orchestrator.js");
+    const { NodeLauncher } = await import("../src/domain/node-launcher.js");
+    const { ClaudeResumeAdapter } = await import("../src/adapters/claude-resume.js");
+    const { CodexResumeAdapter } = await import("../src/adapters/codex-resume.js");
+    const { vi } = await import("vitest");
+    const ctx = setup();
+    const { rig, node, session } = seedRigWithPod(ctx);
+    ctx.rigRepo.setNodeModel(node.id, "snapshot-model-A");
+    ctx.db.prepare(
+      "INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, ?, ?, ?)",
+    ).run(node.id, "[]", "[]", "[]", "claude-code");
+    ctx.db.prepare("UPDATE sessions SET restore_policy = 'relaunch_fresh' WHERE id = ?").run(session.id);
+    const snapshot = ctx.snapshotCapture.captureSnapshot(rig.id, "manual");
+    ctx.rigRepo.setNodeModel(node.id, "current-model-B");
+    ctx.sessionRegistry.updateStatus(session.id, "exited");
+
+    const mockAdapter = {
+      runtime: "claude-code",
+      listInstalled: vi.fn(async () => []),
+      project: vi.fn(async () => ({ projected: [], skipped: [], failed: [] })),
+      deliverStartup: vi.fn(async () => ({ delivered: 0, failed: [] })),
+      checkReady: vi.fn(async () => ({ ready: true })),
+      launchHarness: vi.fn(async (binding: { model?: string }) => {
+        ctx.rigRepo.setNodeModel(node.id, "changed-during-launch-C");
+        return { ok: true as const, appliedLaunch: { runtime: "claude-code", axis: "not_applicable" as const, state: "unknown" as const, value: null } };
+      }),
+    };
+    const mockTmux = { createSession: vi.fn(async () => ({ ok: true })), killSession: vi.fn(async () => ({ ok: true })), listSessions: vi.fn(async () => []), hasSession: vi.fn(async () => false), sendText: vi.fn(async () => ({ ok: true })), sendKeys: vi.fn(async () => ({ ok: true })), listWindows: vi.fn(async () => []), listPanes: vi.fn(async () => []) } as any;
+    const nodeLauncher = new NodeLauncher({ db: ctx.db, rigRepo: ctx.rigRepo, sessionRegistry: ctx.sessionRegistry, eventBus: ctx.eventBus, tmuxAdapter: mockTmux });
+    const restore = new RestoreOrchestrator({
+      db: ctx.db, rigRepo: ctx.rigRepo, sessionRegistry: ctx.sessionRegistry, eventBus: ctx.eventBus,
+      snapshotRepo: ctx.snapshotRepo, snapshotCapture: ctx.snapshotCapture, checkpointStore: ctx.checkpointStore,
+      nodeLauncher, tmuxAdapter: mockTmux, claudeResume: new ClaudeResumeAdapter(mockTmux), codexResume: new CodexResumeAdapter(mockTmux),
+    });
+
+    const result = await restore.restore(snapshot.id, { adapters: { "claude-code": mockAdapter as any }, fsOps: { exists: () => true } });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(mockAdapter.launchHarness).toHaveBeenCalledTimes(1);
+    expect(mockAdapter.launchHarness).toHaveBeenCalledWith(expect.objectContaining({ model: "current-model-B" }), expect.any(Object));
+    expect(result.result.nodes.find((entry) => entry.nodeId === node.id)).toMatchObject({
+      status: "attention_required",
+      error: expect.stringContaining("changed during restore"),
+    });
+    expect(snapshot.data.nodes.find((candidate) => candidate.id === node.id)?.model).toBe("snapshot-model-A");
     ctx.db.close();
   });
 

@@ -89,7 +89,16 @@ export function readAuthoredProofReport(fs: ScopeFsDeps, dir: string): SliceScop
   if (content === null) return null;
   const fm = extractFrontmatterRaw(content);
   // Example commands and quoted examples do not constitute the author's verdict.
-  const body = content.replace(/^(?:`{3,}|~{3,})[^\n]*\n[\s\S]*?^(?:`{3,}|~{3,})[^\n]*$/gm, "").replace(/^>.*$/gm, "");
+  let fence: string | null = null;
+  const body = content.split(/\r?\n/).map(line => {
+    const marker = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
+    if (marker) {
+      if (!fence) fence = marker[1]!;
+      else if (marker[1]![0] === fence[0] && marker[1]!.length >= fence.length && !marker[2]!.trim()) fence = null;
+      return "";
+    }
+    return fence || /^\s*>|^(?: {4}|\t)/.test(line) ? "" : line;
+  }).join("\n");
   const labeled = /(?:^|\s)(?:\*\*)?(?:Final\s+)?Verdict(?:\*\*)?\s*:\s*([^\r\n]+)/im.exec(body)?.[1];
   const section = sectionBody(body, "(?:Final )?Verdict").split(/\r?\n/).find(line => line.trim());
   const value = (fm && fmValue(fm, "verdict")) || labeled || section;

@@ -8,7 +8,7 @@ import type { EventBus } from "../event-bus.js";
 import type { HerdrTransport } from "./herdr-transport.js";
 import { equalStrip, type HerdrLayoutNode } from "./herdr-adapter.js";
 
-export interface ObserverSeat { nodeId: string; target: string; label: string; writable: boolean; life: "running" | "absent" | "unknown" }
+export interface ObserverSeat { nodeId: string; target: string; label: string; writable: boolean; life: "running" | "absent" | "unknown"; pod?: string | null; lead?: boolean }
 export interface ObserverRig { id: string; name: string; seats: ObserverSeat[] }
 interface Pane { pane_id: string; terminal_id: string; tab_id: string }
 export interface ObserverClient { pid: number; target: string; readOnly: boolean; ignoreSize: boolean }
@@ -29,6 +29,24 @@ const array = <T>(value: unknown): T[] => {
   return value;
 };
 const object = (value: unknown): Record<string, any> => value && typeof value === "object" ? value as Record<string, any> : {};
+
+const LEAD_TAB = "lead";
+const LEGACY_TAB = "seats";
+const podTabLabel = (seat: ObserverSeat) => seat.lead ? LEAD_TAB : seat.pod || "other";
+
+/** One `lead` tab (all lead seats, else the first seat) and one tab per pod holding its other seats. */
+export function observerTabs(seats: ObserverSeat[]): Map<string, ObserverSeat[]> {
+  const groups = new Map<string, ObserverSeat[]>();
+  const add = (label: string, seat: ObserverSeat) => groups.set(label, [...(groups.get(label) ?? []), seat]);
+  const leads = seats.filter(s => s.lead);
+  const fallback = !leads.length && seats[0] ? seats[0] : null;
+  if (fallback) add(LEAD_TAB, fallback);
+  for (const seat of seats) { if (seat !== fallback) add(podTabLabel(seat), seat); }
+  const ordered = new Map<string, ObserverSeat[]>();
+  if (groups.has(LEAD_TAB)) ordered.set(LEAD_TAB, groups.get(LEAD_TAB)!);
+  for (const [label, members] of groups) if (label !== LEAD_TAB) ordered.set(label, members);
+  return ordered;
+}
 
 export function observerGrid(seats: ObserverSeat[]): HerdrLayoutNode {
   const panes: HerdrLayoutNode[] = seats.map(seat => ({ type: "pane", label: seat.label, command: ["tmux", "attach", ...(seat.writable ? ["-f", "ignore-size"] : ["-r"]), "-E", "-t", seat.target] }));
@@ -113,50 +131,99 @@ export class ManagedHerdrViews {
       delete this.findings.transport;
       for (const rig of rigs) {
         if (this.stopped) break;
-        try {
-          const matches = workspaces.filter(w => w.label === rig.name);
-          if (matches.length > 1) throw new Error("duplicate workspace name, retained");
-          const workspace = matches[0] ?? object((await this.rpc("workspace.create", { label: rig.name, focus: false })).workspace);
-          if (!workspace.workspace_id) throw new Error("workspace identity unavailable");
-          const tabs = array<{ tab_id: string; label: string }>((await this.rpc("tab.list", { workspace_id: workspace.workspace_id })).tabs).filter(t => t.label === "seats");
-          if (tabs.length > 1) throw new Error("duplicate seats tabs, retained");
-          const tab = tabs[0];
-          const panes = tab ? array<Pane>((await this.rpc("pane.list", { workspace_id: workspace.workspace_id })).panes).filter(p => p.tab_id === tab.tab_id) : [];
-          const targets = await this.inspect(panes, clients);
-          const desired = rig.seats.filter(s => s.life === "running" || (s.life === "unknown" && targets.some(t => t?.target === s.target)));
-          const existing = targets.filter((target): target is { target: string; writable: boolean } => target !== null);
-          let selectedTabId = tab?.tab_id;
-          if (tab && existing.length === desired.length && desired.every(s => existing.some(e => e.target === s.target && e.writable === s.writable))) {
-            for (const seat of desired) if (this.deps.isCurrent(seat)) this.deps.bind?.(seat, panes[targets.findIndex(t => t?.target === seat.target)]!.pane_id);
-          } else {
-            // Re-check the complete view after awaits. Replacement affects only
-            // these positively verified observer terminals, never a seat pane.
-            const latest = tab ? array<Pane>((await this.rpc("pane.list", { workspace_id: workspace.workspace_id })).panes).filter(p => p.tab_id === tab.tab_id) : [];
-            if (JSON.stringify(latest.map(p => [p.pane_id, p.terminal_id])) !== JSON.stringify(panes.map(p => [p.pane_id, p.terminal_id]))) throw new Error("view changed during observation, retained");
-            if (desired.some(s => !this.deps.isCurrent(s))) throw new Error("seat changed during observation, retry later");
-            const result = await this.rpc("layout.apply", { ...(tab ? { tab_id: tab.tab_id } : { workspace_id: workspace.workspace_id }), tab_label: "seats", focus: false, root: observerGrid(desired) });
-            for (const pane of panes) this.deps.unbind?.(pane.pane_id);
-            const newTab = object(result.layout).tab_id;
-            selectedTabId = newTab;
-            const created = array<Pane>((await this.rpc("pane.list", { workspace_id: workspace.workspace_id })).panes).filter(p => p.tab_id === newTab);
-            const attached = await this.inspect(created, await this.deps.listClients());
-            for (const seat of desired) if (this.deps.isCurrent(seat) && attached.some(a => a?.target === seat.target && a.writable === seat.writable)) this.deps.bind?.(seat, created[attached.findIndex(a => a?.target === seat.target)]!.pane_id);
-          }
-          if (workspace.focused && !this.landedWorkspaces.has(workspace.workspace_id) && selectedTabId) {
-            await this.rpc("tab.focus", { tab_id: selectedTabId });
-            this.landedWorkspaces.add(workspace.workspace_id);
-          }
-          this.note(rig.id, `${desired.length} seats${rig.seats.some(s => s.life === "unknown") ? ", some runtime status unknown" : ""}`);
-        } catch (error) { this.note(rig.id, String(error)); }
+        try { await this.syncRig(rig, workspaces, clients); } catch (error) { this.note(rig.id, String(error)); }
       }
     } catch (error) { this.note("transport", String(error)); }
+  }
+  /** A space exists only while its rig is up: a `lead` tab plus one tab per pod with live seats. */
+  private async syncRig(rig: ObserverRig, workspaces: Array<{ workspace_id: string; label: string; focused?: boolean }>, clients: ObserverClient[]): Promise<void> {
+    const matches = workspaces.filter(w => w.label === rig.name);
+    if (matches.length > 1) throw new Error("duplicate workspace name, retained");
+    const up = rig.seats.some(s => s.life !== "absent");
+    if (!up && !matches[0]) { this.note(rig.id, "rig down, no space"); return; }
+    const workspace = matches[0] ?? object((await this.rpc("workspace.create", { label: rig.name, focus: false })).workspace);
+    if (!workspace.workspace_id) throw new Error("workspace identity unavailable");
+    const tabs = array<{ tab_id: string; label: string }>((await this.rpc("tab.list", { workspace_id: workspace.workspace_id })).tabs);
+    const groups = observerTabs(rig.seats.filter(s => s.life !== "absent"));
+    let running = 0;
+    const kept = new Set<string>();
+    let leadTabId: string | undefined;
+    if (up) {
+      for (const [label, members] of groups) {
+        const tabId = await this.syncTab(workspace.workspace_id, tabs, label, members, clients);
+        if (tabId !== undefined) { running += 1; kept.add(label); }
+        if (label === LEAD_TAB) leadTabId = tabId;
+      }
+    }
+    // Close stale view tabs, but only tabs whose every pane is positively one of our observer attaches.
+    for (const tab of tabs.filter(t => !kept.has(t.label))) {
+      const panes = array<Pane>((await this.rpc("pane.list", { workspace_id: workspace.workspace_id })).panes).filter(p => p.tab_id === tab.tab_id);
+      if (!panes.length || !(await this.allObservers(panes, clients))) continue;
+      for (const pane of panes) this.deps.unbind?.(pane.pane_id);
+      await this.rpc("tab.close", { tab_id: tab.tab_id });
+    }
+    if (!up) {
+      // Rig is down: close the space unless a human tab still lives in it.
+      const left = array<{ tab_id: string; label: string }>((await this.rpc("tab.list", { workspace_id: workspace.workspace_id })).tabs);
+      if (left.length) { this.note(rig.id, "rig down, space retained (other tabs present)"); return; }
+      await this.rpc("workspace.close", { workspace_id: workspace.workspace_id });
+      this.landedWorkspaces.delete(workspace.workspace_id);
+      this.note(rig.id, "rig down, space closed");
+      return;
+    }
+    if (workspace.focused && !this.landedWorkspaces.has(workspace.workspace_id) && leadTabId) {
+      await this.rpc("tab.focus", { tab_id: leadTabId });
+      this.landedWorkspaces.add(workspace.workspace_id);
+    }
+    this.note(rig.id, `${running} tabs, ${rig.seats.filter(s => s.life === "running").length} seats${rig.seats.some(s => s.life === "unknown") ? ", some runtime status unknown" : ""}`);
+  }
+  private async allObservers(panes: Pane[], clients: ObserverClient[]): Promise<boolean> {
+    try {
+      const results = await Promise.all(panes.map(async pane => {
+        const info = object((await this.rpc("pane.process_info", { pane_id: pane.pane_id })).process_info);
+        return array<Record<string, any>>(info.foreground_processes).some(p => {
+          const attach = observerAttach(p.argv);
+          if (attach) return clients.some(c => c.pid === p.pid && c.target === attach.target);
+          return p.pid === info.shell_pid && Array.isArray(p.argv) && path.basename(p.argv[0] ?? "") === "sleep" && p.argv[1] === "2147483647";
+        });
+      }));
+      return results.every(Boolean);
+    } catch { return false; }
+  }
+  /** Reconcile one labelled tab; returns its tab id, or undefined when it has nothing running. */
+  private async syncTab(workspaceId: string, tabs: Array<{ tab_id: string; label: string }>, label: string, members: ObserverSeat[], clients: ObserverClient[]): Promise<string | undefined> {
+    const same = tabs.filter(t => t.label === label);
+    if (same.length > 1) throw new Error("duplicate seats tabs, retained");
+    const tab = same[0];
+    const panes = tab ? array<Pane>((await this.rpc("pane.list", { workspace_id: workspaceId })).panes).filter(p => p.tab_id === tab.tab_id) : [];
+    const targets = await this.inspect(panes, clients);
+    const desired = members.filter(s => s.life === "running" || (s.life === "unknown" && targets.some(t => t?.target === s.target)));
+    if (!desired.length) return undefined;
+    const existing = targets.filter((target): target is { target: string; writable: boolean } => target !== null);
+    if (tab && existing.length === desired.length && desired.every(s => existing.some(e => e.target === s.target && e.writable === s.writable))) {
+      for (const seat of desired) if (this.deps.isCurrent(seat)) this.deps.bind?.(seat, panes[targets.findIndex(t => t?.target === seat.target)]!.pane_id);
+      return tab.tab_id;
+    }
+    // Re-check the complete view after awaits. Replacement affects only
+    // these positively verified observer terminals, never a seat pane.
+    const latest = tab ? array<Pane>((await this.rpc("pane.list", { workspace_id: workspaceId })).panes).filter(p => p.tab_id === tab.tab_id) : [];
+    if (JSON.stringify(latest.map(p => [p.pane_id, p.terminal_id])) !== JSON.stringify(panes.map(p => [p.pane_id, p.terminal_id]))) throw new Error("view changed during observation, retained");
+    if (desired.some(s => !this.deps.isCurrent(s))) throw new Error("seat changed during observation, retry later");
+    const result = await this.rpc("layout.apply", { ...(tab ? { tab_id: tab.tab_id } : { workspace_id: workspaceId }), tab_label: label, focus: false, root: observerGrid(desired) });
+    for (const pane of panes) this.deps.unbind?.(pane.pane_id);
+    const newTab = object(result.layout).tab_id;
+    const created = array<Pane>((await this.rpc("pane.list", { workspace_id: workspaceId })).panes).filter(p => p.tab_id === newTab);
+    const attached = await this.inspect(created, await this.deps.listClients());
+    for (const seat of desired) if (this.deps.isCurrent(seat) && attached.some(a => a?.target === seat.target && a.writable === seat.writable)) this.deps.bind?.(seat, created[attached.findIndex(a => a?.target === seat.target)]!.pane_id);
+    if (tab) tab.tab_id = newTab;
+    return newTab;
   }
 }
 
 /** Use existing DB bindings plus one host process census, without a second state store. */
 export function managedViewInventory(db: Database.Database, tmux: Pick<TmuxAdapter, "listSessions" | "getPanePid">) {
-  const sql = `SELECT n.rig_id,n.id node_id,n.logical_id,n.runtime,s.status,s.session_name,b.tmux_session,b.tmux_pane
-    FROM nodes n LEFT JOIN sessions s ON s.id=(SELECT id FROM sessions WHERE node_id=n.id ORDER BY (status='running') DESC,id DESC LIMIT 1)
+  const sql = `SELECT n.rig_id,n.id node_id,n.logical_id,n.runtime,s.status,s.session_name,b.tmux_session,b.tmux_pane,COALESCE(NULLIF(p.namespace,''),p.label) pod
+    FROM nodes n LEFT JOIN pods p ON p.id=n.pod_id LEFT JOIN sessions s ON s.id=(SELECT id FROM sessions WHERE node_id=n.id ORDER BY (status='running') DESC,id DESC LIMIT 1)
     LEFT JOIN bindings b ON b.node_id=n.id`;
   const target = (row: any) => row.tmux_session ?? row.session_name ?? "";
   return {
@@ -176,7 +243,7 @@ export function managedViewInventory(db: Database.Database, tmux: Pick<TmuxAdapt
           if (row.runtime === "terminal" && tree.length || tree.some(p => path.basename(p.executableName ?? p.command.split(/\s+/)[0] ?? "") === executable && !p.command.includes(" serve"))) life = "running";
           else if (tree.length === 1 && /(?:^|\/)(?:sh|bash|zsh|fish)(?:\s|$)/.test(tree[0]!.command)) life = "absent";
         }
-        return { nodeId: row.node_id, target: target(row), label: target(row).split("@")[0] || row.logical_id, writable: true, life };
+        return { nodeId: row.node_id, target: target(row), label: target(row).split("@")[0] || row.logical_id, writable: true, life, pod: row.pod ?? null, lead: /(?:^|[.-])lead$/.test(row.logical_id ?? "") };
       }));
       return rigs.map(rig => ({ ...rig, seats: seats.filter((_, i) => rows[i].rig_id === rig.id) }));
     },

@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { scanJcodeSessions, type JcodeSessionFs } from "../src/adapters/jcode-session.js";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { scanJcodeSessions, readSavedJcodeModel, type JcodeSessionFs } from "../src/adapters/jcode-session.js";
 
 const HOME = "/home/u";
 const dir = `${HOME}/.jcode/sessions`;
@@ -30,5 +33,23 @@ describe("scanJcodeSessions never reads transcripts it does not need", () => {
   it("still parses files whose names do not follow the convention", () => {
     const { ops } = fsOf({ [`${dir}/odd.json`]: JSON.stringify({ id: "odd", working_dir: "/x", created_at: 1790000000000 }) });
     expect(scanJcodeSessions(ops, HOME, { since: 1 })).toHaveLength(1);
+  });
+});
+
+describe("readSavedJcodeModel", () => {
+  const home = mkdtempSync(join(tmpdir(), "saved-model-"));
+  const dir = join(home, ".jcode", "sessions"); mkdirSync(dir, { recursive: true });
+  const write = (id: string, body: string) => writeFileSync(join(dir, `${id}.json`), body);
+  it("reads the saved model from the tail of a session without loading the transcript", () => {
+    const huge = JSON.stringify({ messages: Array.from({ length: 30000 }, (_, i) => ({ role: "user", content: "x".repeat(60), i })) });
+    write("session_big_1790000000000_aa", `{"id":"session_big_1790000000000_aa","messages":${huge.slice(12, -1)},"provider_key":"openai","model":"claude-sonnet-5-5","is_canary":false}`);
+    expect(readSavedJcodeModel(home, "session_big_1790000000000_aa")).toBe("claude-sonnet-5-5");
+  });
+  it("returns null for a missing session, a bad token or no model, keeping the safe hold", () => {
+    write("session_nomodel_1790000000000_bb", '{"messages":[],"provider_key":null}');
+    expect(readSavedJcodeModel(home, "session_nomodel_1790000000000_bb")).toBeNull();
+    expect(readSavedJcodeModel(home, "session_missing_1790000000000_cc")).toBeNull();
+    expect(readSavedJcodeModel(home, "../../etc/passwd")).toBeNull();
+    rmSync(home, { recursive: true, force: true });
   });
 });

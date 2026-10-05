@@ -4,6 +4,8 @@ import { restoreRuntimeCompatibilityError } from "./restore-runtime-compatibilit
 import { leftAttachedReason } from "./restore-plan-preview.js";
 import { assessSnapshotCurrentOccupants, stoppedSnapshotReason } from "./rehydrate-eligibility.js";
 import { nonInterruptiveNotice, nonInterruptiveSummary } from "../adapters/non-interruptive.js";
+import os from "node:os";
+import { readSavedJcodeModel } from "../adapters/jcode-session.js";
 import { planModelAliasNotice } from "../adapters/yolo-mode.js";
 import { effortPrecedence, readSeatEffort } from "./seat-effort.js";
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
@@ -2345,7 +2347,9 @@ export class RestoreOrchestrator {
     }
 
     if (this.jcodeResume?.canResume(resumeType, resumeToken)) {
-      if (model) {
+      // Only hold when the session's saved model could differ from policy; if it already equals policy,
+      // jcode restoring it is exactly what policy wants.
+      if (model && readSavedJcodeModel(os.homedir(), resumeToken!) !== model) {
         return {
           kind: "attention_required",
           message: `Jcode may restore the model saved inside this session rather than current policy ${model}; restore is held for native model verification. No new turn was started.`,

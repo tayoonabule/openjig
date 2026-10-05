@@ -164,7 +164,7 @@ export class JcodeRuntimeAdapter implements RuntimeAdapter {
     }
     this.launchIds.delete(opts.name);
     const since = this.now();
-    const priorIds = new Set(scanJcodeSessions(this.options.fsOps, this.options.home ?? os.homedir()).map((row) => row.id));
+    const priorIds = new Set(scanJcodeSessions(this.options.fsOps, this.options.home ?? os.homedir(), { idsOnly: true }).map((row) => row.id));
     for (const row of await this.reader.debug(opts.name)) priorIds.add(row.id);
     this.launchContexts.set(opts.name, { cwd: binding.cwd, since, priorIds });
     const runtimeDir = jcodeRuntimeDir(this.options.stateRoot, opts.name);

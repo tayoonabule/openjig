@@ -107,8 +107,8 @@ describe("config routes (User Settings v0)", () => {
     // + 2 OPR.0.5.10.7 context-pressure policy thresholds → 68 total.
     // + 1 S07 local-time preference.
     // + 1 ui.enabled (web UI and its terminal WebSocket; default off).
-    // + 1 launch.non_interruptive (new-rig launch default; default off), plus the
-    // upstream OMP resume-runtime setting.
+    // + 1 launch.non_interruptive (new-rig launch default; default off), plus the fork-only
+    // kernel.runtime selector.
     expect(Object.keys(body.settings).length).toBe(73);
     expect(body.settings["launch.non_interruptive"]).toMatchObject({ value: false, source: "default" });
     expect(body.settings["runtime.readiness_timeout_seconds"]).toMatchObject({ value: 30, source: "default" });

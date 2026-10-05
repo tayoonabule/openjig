@@ -97,6 +97,11 @@ export class ManagedHerdrViews {
         if (attach && clients.some(client => client.pid === process.pid && client.target === attach.target && client.readOnly !== attach.writable && client.ignoreSize)) return attach;
         if (process.pid === info.shell_pid && Array.isArray(process.argv) && path.basename(process.argv[0] ?? "") === "sleep" && process.argv[1] === "2147483647") return null;
       }
+      // A dead observer (its tmux session ended, so `tmux attach` exited) leaves a bare idle login shell
+      // as the sole foreground process. Nothing human is running there, so it is as disposable as the
+      // placeholder pane; without this the view is retained as stale forever.
+      const fg = array<Record<string, any>>(info.foreground_processes);
+      if (fg.length === 1 && fg[0]!.pid === info.shell_pid && /^(?:-)?(?:zsh|bash|sh|fish)$/.test(path.basename(String(fg[0]!.argv?.[0] ?? "")))) return null;
       throw new Error("seats tab contains an unverified or human pane, retained");
     }));
   }

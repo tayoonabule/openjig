@@ -1,5 +1,7 @@
 import { nonInterruptiveNotice } from "../adapters/non-interruptive.js";
 import { randomUUID } from "node:crypto";
+import os from "node:os";
+import { readSavedJcodeModel } from "../adapters/jcode-session.js";
 import type Database from "better-sqlite3";
 import type { SessionRegistry } from "./session-registry.js";
 import type { EventBus } from "./event-bus.js";
@@ -310,7 +312,7 @@ export class StartupOrchestrator {
             if (!current || current.rig_id !== expected.rigId || current.logical_id !== expected.logicalId || current.runtime !== expected.runtime) {
               return this.fail(input, "attention_required", [`Restore identity changed for node ${input.nodeId}; harness was not launched.`]);
             }
-            if (input.resumeToken && input.adapter.runtime === "jcode" && current.model) {
+            if (input.resumeToken && input.adapter.runtime === "jcode" && current.model && readSavedJcodeModel(os.homedir(), input.resumeToken) !== current.model) {
               return this.fail(input, "attention_required", [`Jcode may restore the model saved inside this session rather than current policy ${current.model}; restore is held for native model verification. No new turn was started.`]);
             }
             modelAtLaunch = current.model;

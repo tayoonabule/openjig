@@ -1,4 +1,6 @@
 import { nonInterruptiveNotice, nonInterruptiveSummary } from "../adapters/non-interruptive.js";
+import os from "node:os";
+import { readSavedJcodeModel } from "../adapters/jcode-session.js";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type Database from "better-sqlite3";
@@ -1572,7 +1574,9 @@ export class RestoreOrchestrator {
     }
 
     if (this.jcodeResume?.canResume(resumeType, resumeToken)) {
-      if (model) {
+      // Only hold when the session's saved model could differ from policy; if it already equals policy,
+      // jcode restoring it is exactly what policy wants.
+      if (model && readSavedJcodeModel(os.homedir(), resumeToken!) !== model) {
         return {
           kind: "attention_required",
           message: `Jcode may restore the model saved inside this session rather than current policy ${model}; restore is held for native model verification. No new turn was started.`,

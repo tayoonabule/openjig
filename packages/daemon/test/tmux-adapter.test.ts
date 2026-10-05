@@ -351,7 +351,7 @@ describe("TmuxAdapter", () => {
 
       expect(exec.mock.calls.map((c) => c[0]).slice(1)).toEqual(["tmux show-environment -g"]); // clean server: nothing to exclude
       expect(exec.mock.calls[0]![0]).toBe(
-        "tmux new-session -d -x 240 -y 70 -s 'r01-dev1-impl' -c '/home/user/code' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
+        "tmux new-session -d -s 'r01-dev1-impl' -c '/home/user/code' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
       );
     });
 
@@ -363,7 +363,7 @@ describe("TmuxAdapter", () => {
 
       expect(exec.mock.calls.map((c) => c[0]).slice(1)).toEqual(["tmux show-environment -g"]); // clean server: nothing to exclude
       expect(exec.mock.calls[0]![0]).toBe(
-        "tmux new-session -d -x 240 -y 70 -s 'r01-dev1-impl' -c '/home/user/my project/code' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
+        "tmux new-session -d -s 'r01-dev1-impl' -c '/home/user/my project/code' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
       );
     });
 
@@ -375,7 +375,7 @@ describe("TmuxAdapter", () => {
 
       expect(exec.mock.calls.map((c) => c[0]).slice(1)).toEqual(["tmux show-environment -g"]); // clean server: nothing to exclude
       expect(exec.mock.calls[0]![0]).toBe(
-        "tmux new-session -d -x 240 -y 70 -s 'r01-dev'\"'\"'s session' -c '/tmp' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
+        "tmux new-session -d -s 'r01-dev'\"'\"'s session' -c '/tmp' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
       );
     });
 
@@ -387,7 +387,7 @@ describe("TmuxAdapter", () => {
 
       expect(exec.mock.calls.map((c) => c[0]).slice(1)).toEqual(["tmux show-environment -g"]); // clean server: nothing to exclude
       expect(exec.mock.calls[0]![0]).toBe(
-        "tmux new-session -d -x 240 -y 70 -s 'r01-dev1-impl' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
+        "tmux new-session -d -s 'r01-dev1-impl' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
       );
     });
 
@@ -421,7 +421,7 @@ describe("TmuxAdapter", () => {
 
       const cmd = exec.mock.calls[0]![0] as string;
       expect(cmd).toContain("-e 'OPENRIG_TRANSCRIPTS_LINES='");
-      expect(cmd).toBe("tmux new-session -d -x 240 -y 70 -s 'r01-test' -c '/tmp' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'");
+      expect(cmd).toBe("tmux new-session -d -s 'r01-test' -c '/tmp' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'");
     });
 
     it("returns { ok: false, code: 'duplicate_session' } on duplicate", async () => {
@@ -734,7 +734,7 @@ describe("TmuxAdapter", () => {
       // createSession with canonical name
       await adapter.createSession("dev-impl@auth-feats", "/home/user/code");
       expect(exec.mock.calls[0]![0]).toBe(
-        "tmux new-session -d -x 240 -y 70 -s 'dev-impl@auth-feats' -c '/home/user/code' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
+        "tmux new-session -d -s 'dev-impl@auth-feats' -c '/home/user/code' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
       );
 
       // sendKeys targeting canonical name

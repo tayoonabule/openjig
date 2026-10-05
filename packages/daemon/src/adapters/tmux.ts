@@ -798,17 +798,16 @@ export class TmuxAdapter {
       OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS: "",
       ...env,
     };
-    const argv = ["tmux", "new-session", "-d", "-x", "240", "-y", "70", "-s", name];
+    const argv = ["tmux", "new-session", "-d", "-s", name];
     if (cwd != null) argv.push("-c", cwd);
     for (const [k, v] of Object.entries(seatEnv)) argv.push("-e", `${k}=${v}`);
     // The pane new-session itself made: an after-new-session hook may select another window.
     argv.push("-P", "-F", "#{pane_id}");
-    const legacyParts = ["tmux", "new-session", "-d", "-x", "240", "-y", "70", "-s", tmuxConfigQuote(name)];
+    const legacyParts = ["tmux", "new-session", "-d", "-s", tmuxConfigQuote(name)];
     if (cwd != null) legacyParts.push("-c", tmuxConfigQuote(cwd));
     for (const [k, v] of Object.entries(seatEnv)) legacyParts.push("-e", tmuxConfigQuote(`${k}=${v}`));
     legacyParts.push("-P", "-F", tmuxConfigQuote("#{pane_id}"));
-    // Observer tiles attach with ignore-size, so nothing else sizes the window: without an explicit size it stays
-    // at tmux's 80x24 default and every herdr tile shows a cut-off pane filled with dots.
+    // Leave sizing to the attached clients: fixed dimensions clipped Herdr observer tiles.
     const warnings: string[] = [];
     const scopedCommand = await this.scopedLaunchCommand(seatEnv, undefined, warnings);
     if (scopedCommand) { argv.push(...scopedCommand); legacyParts.push(...scopedCommand.map(tmuxConfigQuote)); }

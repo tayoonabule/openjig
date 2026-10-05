@@ -315,13 +315,6 @@ export function extractWorkspaceId(result: HerdrResult): string | null {
   return null;
 }
 
-/** The default tab `workspace.create` makes (`result.tab.tab_id`), or null on older builds. */
-export function extractTabId(result: HerdrResult): string | null {
-  const tab = result["tab"];
-  const id = tab && typeof tab === "object" ? (tab as Record<string, unknown>)["tab_id"] : null;
-  return typeof id === "string" && id ? id : null;
-}
-
 export interface HerdrAdapterDeps {
   transportFactory: HerdrTransportFactory;
   /**
@@ -577,6 +570,7 @@ export class HerdrAdapter implements TerminalProvider {
         for (const pane of pagePanes) {
           if (gone.has(pane.seat)) degraded.push({ seat: pane.seat, host: HERDR_SURFACE_HOST, reason: HERDR_PANE_EXITED_REASON });
           else opened.push(pane.seat);
+        }
         // Reporting is deliberately out-of-band from rendering. A reporter
         // rejection must never turn a successfully created terminal view into
         // an open failure.

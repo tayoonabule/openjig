@@ -97,12 +97,20 @@ session id.
 
 ## Getting back to work: `openjig`
 
-`scripts/openjig.py` gets you back to your rigs without remembering `rig` commands. Link it once
-with `ln -s "$PWD/scripts/openjig.py" ~/.local/bin/openjig`, then in any terminal (cmux
-included):
+`scripts/openjig.py` gets you back to your rigs without remembering `rig` commands. Link both launchers once
+from the repository root:
 
+```sh
+ln -s "$PWD/scripts/openjig.py" ~/.local/bin/openjig
+ln -s "$PWD/scripts/openrig" ~/.local/bin/openrig
+```
+
+In any terminal (cmux included):
+
+- `openrig` runs `rig start`, the interactive daemon/kernel startup and restore picker. Add `--last` only when you intend to restore every rig that was previously running.
 - `openjig` opens Herdr with every running rig as a workspace, each with a **mission
   control** pane (`rig tui`, OpenRig's operator view) beside its agents.
+- `openjig` starts a stopped daemon; if its health check finds an unresponsive daemon, it uses the documented daemon-only stop/start recovery before opening Herdr. It does not silently restore every stopped rig; use `openrig` to choose which prior rigs to restore.
 - `openjig <rig>` opens that rig, restarting it first if it is stopped.
 - `openjig menu` is a clickable list (click, arrows and Enter, or type to filter):
 

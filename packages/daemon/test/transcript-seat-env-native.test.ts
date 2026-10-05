@@ -19,7 +19,7 @@ describe.skipIf(process.platform === "win32")("native transcript seat environmen
     const socket = path.join(socketDir, "owned.sock");
     const captured = path.join(temp, "seat.env");
     const config = path.join(temp, "config.json");
-    const env = { ...process.env, HOME: temp, OPENRIG_TRANSCRIPTS_LINES: "777", OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS: "44" };
+    const env = { ...process.env, HOME: temp, SHELL: "/bin/sh", OPENRIG_TRANSCRIPTS_LINES: "777", OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS: "44" };
     delete env.TMUX;
     delete env.TMUX_TMPDIR;
     const prior = keys.map((key) => process.env[key]);

@@ -91,6 +91,13 @@ describe("automatic rig seats views", () => {
     f.setSeats([lead]); await f.views.reconcile();
     expect(f.calls.filter(c => c.method === "workspace.create")).toHaveLength(creates + 1); expect(f.tabs.map(t => t.label)).toEqual(["lead"]);
   });
+  it("closes herdr's default idle-shell tab, but never a numbered tab running something", async () => {
+    const f = fixture(); await f.views.reconcile();
+    f.tabs.push({ tab_id: "t1", label: "1" }); f.panes.push({ pane_id: "p1", terminal_id: "tt1", tab_id: "t1", argv: ["-zsh"], pid: 900 });
+    await f.views.reconcile(); expect(f.tabs.map(t => t.label)).toEqual(["lead"]);
+    f.tabs.push({ tab_id: "t2", label: "2" }); f.panes.push({ pane_id: "p2", terminal_id: "tt2", tab_id: "t2", argv: ["vim"], pid: 901 });
+    await f.views.reconcile(); expect(f.tabs.map(t => t.label)).toContain("2");
+  });
   it("never creates a space for a rig that is down", async () => {
     const f = fixture(); f.setSeats([{ nodeId: "lead", target: "lead@rig", label: "lead", writable: true, life: "absent", lead: true }]);
     await f.views.reconcile(); expect(f.calls.some(c => c.method === "workspace.create")).toBe(false);

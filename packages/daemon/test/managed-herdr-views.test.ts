@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ManagedHerdrViews, observerAttach, type ObserverSeat } from "../src/domain/terminal/managed-herdr-views.js";
 
 function fixture() {
-  let seats: ObserverSeat[] = [{ nodeId: "lead", target: "lead@rig", label: "lead", writable: true, life: "running" }];
+  let seats: ObserverSeat[] = [{ nodeId: "lead", target: "lead@rig", label: "lead", writable: true, life: "running", lead: true }];
   let workspace = false, next = 0, current = true;
   const tabs: any[] = [], panes: any[] = [], calls: any[] = [];
   const human = { pane_id: "human", terminal_id: "human-terminal", tab_id: "mission-control" };
@@ -17,6 +17,8 @@ function fixture() {
       return { process_info: { shell_pid: p.pid, foreground_processes: p.argv ? [{ pid: p.pid, argv: p.argv }] : [] } };
     }
     if (method === "tab.focus") return { ok: true };
+    if (method === "tab.close") { tabs.splice(tabs.findIndex(t => t.tab_id === params.tab_id), 1); for (let i = panes.length - 1; i >= 0; i--) if (panes[i].tab_id === params.tab_id) panes.splice(i, 1); return { ok: true }; }
+    if (method === "workspace.close") { workspace = false; return { ok: true }; }
     if (method === "layout.apply") {
       if (params.tab_id) { tabs.splice(tabs.findIndex(t => t.tab_id === params.tab_id), 1); panes.splice(0); }
       const tab = "tab" + ++next; tabs.push({ tab_id: tab, label: params.tab_label });
@@ -39,7 +41,7 @@ function fixture() {
 describe("automatic rig seats views", () => {
   it("creates a rig workspace and exactly one seats tab with a writable lead pane", async () => {
     const f = fixture(); await f.views.reconcile();
-    expect(f.tabs).toHaveLength(1); expect(f.tabs[0].label).toBe("seats");
+    expect(f.tabs).toHaveLength(1); expect(f.tabs[0].label).toBe("lead");
     expect(f.panes[0].argv).toEqual(["tmux", "attach", "-f", "ignore-size", "-E", "-t", "lead@rig"]);
     expect(f.calls.some(c => c.method === "tab.focus")).toBe(false);
   });
@@ -60,14 +62,44 @@ describe("automatic rig seats views", () => {
   });
   it("adds and removes running seats by replacing only the disposable view tab", async () => {
     const f = fixture(); await f.views.reconcile();
-    f.setSeats([{ nodeId: "lead", target: "lead@rig", label: "lead", writable: true, life: "running" }, { nodeId: "helper", target: "helper@rig", label: "helper", writable: true, life: "running" }]);
-    await f.views.reconcile(); expect(f.panes).toHaveLength(2); expect(f.tabs).toHaveLength(1);
+    f.setSeats([{ nodeId: "lead", target: "lead@rig", label: "lead", writable: true, life: "running", lead: true }, { nodeId: "helper", target: "helper@rig", label: "helper", writable: true, life: "running" }]);
+    await f.views.reconcile(); expect(f.panes).toHaveLength(2); expect(f.tabs.map(t => t.label)).toEqual(["lead", "other"]);
     expect(f.panes.map(p => p.argv)).toContainEqual(["tmux", "attach", "-f", "ignore-size", "-E", "-t", "lead@rig"]);
     expect(f.panes.map(p => p.argv)).toContainEqual(["tmux", "attach", "-f", "ignore-size", "-E", "-t", "helper@rig"]);
-    f.setSeats([]); await f.views.reconcile(); expect(f.tabs).toHaveLength(1); expect(f.panes[0].argv).toEqual(["sleep", "2147483647"]);
+    f.setSeats([{ nodeId: "lead", target: "lead@rig", label: "lead", writable: true, life: "running", lead: true }]); await f.views.reconcile();
+    expect(f.tabs.map(t => t.label)).toEqual(["lead"]); expect(f.panes).toHaveLength(1);
     expect(f.human).toEqual({ pane_id: "human", terminal_id: "human-terminal", tab_id: "mission-control" });
-    expect(f.calls.filter(c => !["workspace.create", "layout.apply", "pane.process_info", "tab.focus"].includes(c.method) && !c.method.endsWith(".list"))).toEqual([]);
+    expect(f.calls.filter(c => !["workspace.create", "layout.apply", "pane.process_info", "tab.focus", "tab.close"].includes(c.method) && !c.method.endsWith(".list"))).toEqual([]);
     expect(f.calls.filter(c => c.method === "tab.focus")).toHaveLength(1);
+  });
+  it("gives each pod with live seats its own tab after the lead tab", async () => {
+    const f = fixture();
+    f.setSeats([
+      { nodeId: "lead", target: "lead@rig", label: "lead", writable: true, life: "running", lead: true },
+      { nodeId: "a", target: "a@rig", label: "a", writable: true, life: "running", pod: "build" },
+      { nodeId: "b", target: "b@rig", label: "b", writable: true, life: "running", pod: "review" },
+      { nodeId: "c", target: "c@rig", label: "c", writable: true, life: "absent", pod: "idle" }]);
+    await f.views.reconcile();
+    expect(f.tabs.map(t => t.label)).toEqual(["lead", "build", "review"]);
+  });
+  it("closes the space when the rig goes down and reopens it when it comes back", async () => {
+    const f = fixture(); await f.views.reconcile(); expect(f.calls.some(c => c.method === "workspace.create")).toBe(true);
+    const lead = { nodeId: "lead", target: "lead@rig", label: "lead", writable: true, life: "running" as const, lead: true };
+    f.setSeats([{ ...lead, life: "absent" }]); await f.views.reconcile();
+    expect(f.calls.some(c => c.method === "workspace.close")).toBe(true); expect(f.tabs).toHaveLength(0);
+    const creates = f.calls.filter(c => c.method === "workspace.create").length;
+    f.setSeats([lead]); await f.views.reconcile();
+    expect(f.calls.filter(c => c.method === "workspace.create")).toHaveLength(creates + 1); expect(f.tabs.map(t => t.label)).toEqual(["lead"]);
+  });
+  it("never creates a space for a rig that is down", async () => {
+    const f = fixture(); f.setSeats([{ nodeId: "lead", target: "lead@rig", label: "lead", writable: true, life: "absent", lead: true }]);
+    await f.views.reconcile(); expect(f.calls.some(c => c.method === "workspace.create")).toBe(false);
+  });
+  it("keeps a down rig's space when a human tab still lives in it", async () => {
+    const f = fixture(); await f.views.reconcile();
+    f.tabs.push({ tab_id: "mission-control", label: "mission" });
+    f.setSeats([{ nodeId: "lead", target: "lead@rig", label: "lead", writable: true, life: "absent", lead: true }]); await f.views.reconcile();
+    expect(f.calls.some(c => c.method === "workspace.close")).toBe(false);
   });
   it("rejects writable observer attaches without ignore-size", () => {
     expect(observerAttach(["tmux", "attach", "-E", "-t", "lead@rig"])).toBeNull();
@@ -76,7 +108,7 @@ describe("automatic rig seats views", () => {
   it("leaves matching views untouched across controller restart and unknown status", async () => {
     const f = fixture(); await f.views.reconcile(); const original = structuredClone(f.panes);
     await f.views.dispose(); const restarted = new ManagedHerdrViews(f.deps);
-    f.setSeats([{ nodeId: "lead", target: "lead@rig", label: "lead", writable: true, life: "unknown" }]);
+    f.setSeats([{ nodeId: "lead", target: "lead@rig", label: "lead", writable: true, life: "unknown", lead: true }]);
     await restarted.reconcile(); expect(f.panes).toEqual(original);
     expect(f.calls.filter(c => c.method === "layout.apply")).toHaveLength(1);
   });

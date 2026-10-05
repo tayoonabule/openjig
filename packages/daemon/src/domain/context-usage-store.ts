@@ -257,7 +257,7 @@ export class ContextUsageStore {
         base = { mtimeMs: st.mtimeMs, size: st.size, ...totalsOf(Array.isArray(raw.messages) ? raw.messages : []) };
         this.jcodeSnapshotCache.delete(sessionPath);
         this.jcodeSnapshotCache.set(sessionPath, base);
-        while (this.jcodeSnapshotCache.size > 64) this.jcodeSnapshotCache.delete(this.jcodeSnapshotCache.keys().next().value as string);
+        while (this.jcodeSnapshotCache.size > 1024) this.jcodeSnapshotCache.delete(this.jcodeSnapshotCache.keys().next().value as string);
       }
     } catch (error) {
       return this.unknownUsage((error as NodeJS.ErrnoException)?.code === "ENOENT" ? "no_data" : "parse_error");

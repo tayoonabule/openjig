@@ -570,12 +570,14 @@ export class TmuxAdapter {
       OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS: "",
       ...env,
     };
-    const argv = ["tmux", "new-session", "-d", "-s", name];
+    const argv = ["tmux", "new-session", "-d", "-x", "240", "-y", "70", "-s", name];
     if (cwd != null) argv.push("-c", cwd);
     for (const [k, v] of Object.entries(seatEnv)) argv.push("-e", `${k}=${v}`);
-    const legacyParts = ["tmux", "new-session", "-d", "-s", shellQuote(name)];
+    const legacyParts = ["tmux", "new-session", "-d", "-x", "240", "-y", "70", "-s", shellQuote(name)];
     if (cwd != null) legacyParts.push("-c", shellQuote(cwd));
     for (const [k, v] of Object.entries(seatEnv)) legacyParts.push("-e", shellQuote(`${k}=${v}`));
+    // Observer tiles attach with ignore-size, so nothing else sizes the window: without an explicit size it stays
+    // at tmux's 80x24 default and every herdr tile shows a cut-off pane filled with dots.
     try {
       await this.run(argv, legacyParts.join(" "));
       return { ok: true };

@@ -139,7 +139,7 @@ describe("compaction routes — POST /api/compaction/trigger", () => {
     });
     const enforcer = new ClaudeCompactionEnforcer(makeSettings(), transport, {
       terminalPolicies: new TerminalPolicyStore(db),
-      openrigHome: stateDir, manualPrepWaitMs: 1000, resolveOccupantGeneration: () => "fixture-generation",
+      openrigHome: stateDir, manualPrepWaitMs: 5000, resolveOccupantGeneration: () => "fixture-generation",
       now: () => clock, sleep,
     });
     const app = new Hono();

@@ -224,3 +224,23 @@ export class JcodeSessionReader {
     return undefined;
   }
 }
+
+/**
+ * The model jcode will restore on `--resume`: the session file's top-level `model`, which jcode writes
+ * right after `provider_key` and after the (possibly huge) messages array. Read only the tail so a
+ * 150MB transcript is never loaded. Returns null when unknown, so callers keep their safe hold.
+ */
+export function readSavedJcodeModel(home: string, resumeToken: string): string | null {
+  if (!/^session_[A-Za-z0-9_]+$/.test(resumeToken)) return null;
+  const file = nodePath.join(home, ".jcode", "sessions", `${resumeToken}.json`);
+  let fd: number | undefined;
+  try {
+    const size = fs.statSync(file).size;
+    const length = Math.min(size, 256 * 1024);
+    const buffer = Buffer.alloc(length);
+    fd = fs.openSync(file, "r");
+    fs.readSync(fd, buffer, 0, length, size - length);
+    const match = /"provider_key":(?:"[^"]*"|null),"model":"([^"]+)"/.exec(buffer.toString("utf-8"));
+    return match?.[1] ?? null;
+  } catch { return null; } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch { /* ignore */ } }
+}

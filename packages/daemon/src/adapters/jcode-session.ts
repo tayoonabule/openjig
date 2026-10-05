@@ -150,10 +150,31 @@ function timestamp(value: unknown): number {
   return NaN;
 }
 
-export function scanJcodeSessions(fsOps: JcodeSessionFs, home: string): JcodeSession[] {
+/** jcode names a session file `<id>.json` and embeds the creation time (ms) in the id: session_<name>_<ms>_<hex>. */
+const SESSION_FILE = /^(session_.+_(\d{13})_[0-9a-f]+)\.json$/;
+
+export interface ScanJcodeSessionsOptions {
+  /** Skip sessions created before this time (ms) without opening them. */
+  since?: number;
+  /** Return only ids (taken from file names where possible) and never open session files. */
+  idsOnly?: boolean;
+}
+
+/**
+ * Session files can be hundreds of MB (they hold the whole transcript). Reading and parsing all of them on
+ * the daemon's single thread starved the event loop for seconds to minutes, so every health/CLI/TUI request
+ * timed out. Use the id/timestamp in the file name and only open files that could still match.
+ */
+export function scanJcodeSessions(fsOps: JcodeSessionFs, home: string, options: ScanJcodeSessionsOptions = {}): JcodeSession[] {
   const dir = nodePath.join(home, ".jcode", "sessions");
   try {
     return fsOps.listFiles(dir).filter((name) => name.endsWith(".json")).flatMap((name) => {
+      const named = SESSION_FILE.exec(name);
+      if (named) {
+        const createdAt = Number(named[2]);
+        if (options.idsOnly) return [{ id: named[1]!, workingDir: "", createdAt }];
+        if (options.since !== undefined && createdAt < options.since) return [];
+      }
       try {
         const row: unknown = JSON.parse(fsOps.readFile(nodePath.join(dir, name)));
         if (!row || typeof row !== "object") return [];
@@ -195,7 +216,7 @@ export class JcodeSessionReader {
     const live = debug.filter((row) => !cwd || nodePath.resolve(row.workingDir) === nodePath.resolve(cwd));
     // The seat-scoped socket is authoritative even before the session JSON is flushed.
     if (debug.length) return live.length === 1 && !priorIds.has(live[0]!.id) ? live[0]!.id : undefined;
-    const files = scanJcodeSessions(this.fs, this.home)
+    const files = scanJcodeSessions(this.fs, this.home, { since })
       .filter((row) => !priorIds.has(row.id) && (!cwd || nodePath.resolve(row.workingDir) === nodePath.resolve(cwd)) && row.createdAt >= since)
       .sort((a, b) => b.createdAt - a.createdAt);
     // Shared session files do not identify an owning seat when two seats start in one cwd.

@@ -129,7 +129,8 @@ describe("config routes (User Settings v0)", () => {
     // + 1 daemon.db_conflict (warn by default; optional pre-open conflict stop).
     // + 1 provider.selected (the providers chosen at rig setup --providers; default empty).
     // + 2 retention.stream_days / stream_max_items (slice 22 outcome 9 stream retention; default 30, 20000).
-    expect(Object.keys(body.settings).length).toBe(92);
+    // + 1 upstream OMP resume-runtime setting.
+    expect(Object.keys(body.settings).length).toBe(93);
     expect(body.settings["retention.stream_days"]).toMatchObject({ value: 30, source: "default", defaultValue: 30 });
     expect(body.settings["retention.stream_max_items"]).toMatchObject({ value: 20000, source: "default", defaultValue: 20000 });
     expect(body.settings["decisions.enabled"]).toMatchObject({ value: false, source: "default", defaultValue: false });

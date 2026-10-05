@@ -130,7 +130,7 @@ describe("OPR.99.0.1 oracle: jcode self-report outranks repaint motion", () => {
           : null;
       },
     });
-    const db = { prepare: () => ({ all: () => [{ session_name: NAME, node_id: SEAT, runtime }] }) } as unknown as Database.Database;
+    const db = { prepare: () => ({ all: () => [{ session_name: NAME, node_id: SEAT, runtime, attachment_type: "tmux" }] }) } as unknown as Database.Database;
     return { svc, db, clock };
   }
 

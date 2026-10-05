@@ -42,6 +42,19 @@ def daemon_up():
         return False
 
 
+def ensure_daemon():
+    """Start a stopped daemon or use the documented stop/start recovery for a wedged one."""
+    if daemon_up():
+        return True
+    status = subprocess.run(["rig", "daemon", "status"], capture_output=True, text=True)
+    detail = f"{status.stdout}\n{status.stderr}".lower()
+    if "unresponsive" in detail or "unhealthy" in detail:
+        print("openjig: daemon is unhealthy; restarting the control plane (preserving any live tmux sessions).", flush=True)
+        if not run(["rig", "daemon", "stop"]):
+            return False
+    return run(["rig", "daemon", "start"])
+
+
 def rigs():
     return [r for r in capture_json(["rig", "ps", "--json"]) or [] if not r.get("isArchived")]
 
@@ -115,9 +128,116 @@ def focus_talk_pane(workspace):
         subprocess.run(["herdr", "agent", "focus", pick["pane_id"]], capture_output=True)
 
 
+KERNEL_SEATS = ("advisor.lead", "operator.agent", "queue.worker")
+JCODE_STATE = os.path.expanduser("~/.openrig/state/jcode")
+SHELLS = {"zsh", "-zsh", "bash", "-bash", "sh", "fish", "login"}
+
+
+def latest_jcode_session(seat):
+    """The seat's most recent saved jcode session id from the OpenRig db, or None."""
+    db = os.path.expanduser("~/.openrig/openrig.sqlite")
+    q = ("select s.resume_token from sessions s join nodes n on n.id=s.node_id join rigs r on r.id=n.rig_id "
+         f"where r.name='kernel' and n.logical_id='{seat}' and s.resume_type='jcode_id' "
+         "and s.resume_token is not null order by s.created_at desc limit 1")
+    out = subprocess.run(["sqlite3", db, q], capture_output=True, text=True).stdout.strip()
+    if out and os.path.exists(os.path.expanduser(f"~/.jcode/sessions/{out}.json")):
+        return out
+    return None
+
+
+def relay_path():
+    rig_bin = os.path.realpath(shutil.which("rig") or "")
+    root = os.path.dirname(os.path.dirname(rig_bin))  # .../@openrig/cli
+    p = os.path.join(root, "daemon/assets/plugins/openrig-core/hooks/scripts/activity-relay.cjs")
+    return p if os.path.exists(p) else None
+
+
+def launch_bare_seat(node):
+    """A jcode seat whose tmux pane is just a shell (restore was held): start jcode there
+    exactly as the daemon would, resuming its saved session under its policy model."""
+    session = node["canonicalSessionName"]
+    cmd = subprocess.run(["tmux", "display", "-p", "-t", session, "#{pane_current_command}"],
+                         capture_output=True, text=True).stdout.strip()
+    if cmd not in SHELLS:
+        return
+    runtime = os.path.join(JCODE_STATE, session, "runtime")
+    os.makedirs(runtime, exist_ok=True)
+    sock = os.path.join(runtime, "jcode.sock")
+    env = f"JCODE_RUNTIME_DIR={shlex.quote(runtime)}"
+    relay = relay_path()
+    hooks = "".join(f" JCODE_HOOK_{e}={shlex.quote('node ' + shlex.quote(relay))}"
+                    for e in ("TURN_START", "TURN_END", "SESSION_START", "SESSION_END")) if relay else ""
+    model = node.get("model")
+    resume = latest_jcode_session(node["logicalId"])
+    line = (f"if [ -S {shlex.quote(sock)} ]; then {env} jcode server stop --force >/dev/null 2>&1; fi && "
+            f"{env} JCODE_TEMP_SERVER=1 JCODE_DEBUG_SOCKET=1{hooks} jcode --no-update --no-selfdev "
+            f"-C {shlex.quote(node.get('cwd') or os.path.expanduser('~/.openrig/workspace'))}"
+            + (f" -m {shlex.quote(model)}" if model else "")
+            + (f" --resume {shlex.quote(resume)}" if resume else ""))
+    print(f"openjig: starting {node['logicalId']} in {session}" + (f" (resuming {resume})" if resume else " (fresh)"), flush=True)
+    subprocess.run(["tmux", "send-keys", "-t", session, "-l", line], capture_output=True)
+    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], capture_output=True)
+    if resume and model:
+        pin_model(runtime, resume, model)
+
+
+def pin_model(runtime, session_id, model):
+    """jcode --resume keeps the model saved in the session and ignores -m, so switch it to
+    the OpenRig policy model over the seat's debug socket once the server is up."""
+    import socket, time
+    sock_path = os.path.join(runtime, "jcode-debug.sock")
+    msg = json.dumps({"type": "debug_command", "id": 1, "command": f"set_model:{model}",
+                      "session_id": session_id}) + "\n"
+    time.sleep(2)  # let any previous seat server finish stopping first
+    for _ in range(40):
+        time.sleep(0.5)
+        try:
+            s = socket.socket(socket.AF_UNIX)
+            s.settimeout(10)
+            s.connect(sock_path)
+            s.sendall(msg.encode())
+            reply = json.loads(s.recv(65536).decode().splitlines()[0])
+            s.close()
+            if reply.get("ok"):
+                print(f"openjig: {session_id} pinned to {model}", flush=True)
+                return
+        except Exception:
+            pass
+    print(f"openjig: could not pin {session_id} to {model}; use /model in that seat", flush=True)
+
+
+def ensure_kernel():
+    """The kernel (at least advisor.lead) must always be up when openjig runs."""
+    k = rig_by_name("kernel")
+    if k and k.get("status") != "running":
+        run(["rig", "up", "kernel", "--existing", "--yes"])
+    for n in capture_json(["rig", "ps", "--nodes", "--rig", "kernel", "--json"]) or []:
+        if n.get("runtime") == "jcode" and n.get("logicalId") in KERNEL_SEATS:
+            if n.get("sessionStatus") != "running":
+                continue
+            launch_bare_seat(n)
+
+
+def reattach_dead_tiles(rig, workspace):
+    """Herdr restores tiles after a restart, but the `tmux attach` inside them is gone, leaving
+    an empty shell. Re-run the attach in any seat tile that is sitting at a bare shell."""
+    sessions = {n["canonicalSessionName"] for n in capture_json(["rig", "ps", "--nodes", "--rig", rig, "--json"]) or []
+                if n.get("sessionStatus") == "running" and n.get("canonicalSessionName")}
+    for p in herdr_json(["pane", "list", "--workspace", workspace]).get("panes") or []:
+        target = (p.get("label") or "").replace(".", "-") + "@" + rig
+        if target not in sessions:
+            continue
+        info = herdr_json(["pane", "process-info", "--pane", p["pane_id"]]).get("process_info") or {}
+        procs = info.get("foreground_processes") or []
+        if procs and all(x.get("name") in SHELLS or x.get("cmdline") in SHELLS for x in procs):
+            subprocess.run(["herdr", "pane", "run", p["pane_id"],
+                            f"tmux attach -f ignore-size -t {shlex.quote(target)}"], capture_output=True)
+
+
 def show_in_herdr(rig=None):
     """Give each running rig a Herdr workspace with mission control, jump to `rig`, attach Herdr."""
     reset_scroll_mode()
+    ensure_kernel()
     for r in rigs():
         if r.get("status") != "running":
             continue
@@ -128,6 +248,7 @@ def show_in_herdr(rig=None):
             run(["rig", "terminal", "open", r["name"], "--provider", "herdr"])
             w = herdr_workspace(r["name"])
         if w:
+            reattach_dead_tiles(r["name"], w["workspace_id"])
             add_mission_control(w["workspace_id"])
     # With no rig named, land on the kernel: its operator.human tile is mission control.
     target = herdr_workspace(rig or "kernel")
@@ -275,7 +396,7 @@ def main(argv):
     for tool in ("rig", "herdr"):
         if not shutil.which(tool):
             sys.exit(f"openjig: `{tool}` is not on PATH. See OPENJIG.md.")
-    if not daemon_up() and not run(["rig", "daemon", "start"]):
+    if not ensure_daemon():
         sys.exit(1)
     if not argv:
         return show_in_herdr()

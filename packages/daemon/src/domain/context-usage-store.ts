@@ -104,7 +104,24 @@ interface JcodeSessionRaw {
   messages?: JcodeSessionMessageRaw[];
 }
 
+interface JcodeSnapshotTotals { mtimeMs: number; size: number; totalInputTokens: number; totalOutputTokens: number; sampledAt: string | null; sawUsage: boolean }
+
+function totalsOf(messages: JcodeSessionMessageRaw[]) {
+  let totalInputTokens = 0, totalOutputTokens = 0, sampledAt: string | null = null, sawUsage = false;
+  for (const message of messages) {
+    const usage = message?.token_usage;
+    if (usage && typeof usage === "object") {
+      sawUsage = true;
+      if (typeof usage.input_tokens === "number") totalInputTokens += usage.input_tokens;
+      if (typeof usage.output_tokens === "number") totalOutputTokens += usage.output_tokens;
+    }
+    if (typeof message?.timestamp === "string") sampledAt = message.timestamp;
+  }
+  return { totalInputTokens, totalOutputTokens, sampledAt, sawUsage };
+}
+
 export class ContextUsageStore {
+  private readonly jcodeSnapshotCache = new Map<string, JcodeSnapshotTotals>();
   readonly db: Database.Database;
   private stateDir: string;
   private codexHomeDir: string | null;
@@ -226,15 +243,27 @@ export class ContextUsageStore {
     if (!this.jcodeHomeDir) return this.unknownUsage("no_data");
 
     const sessionPath = join(this.jcodeHomeDir, ".jcode", "sessions", `${resumeToken}.json`);
-    let raw: JcodeSessionRaw;
+    // Snapshots hold the whole transcript (tens to hundreds of MB). Parsing one on the daemon's single
+    // thread on every poll starved every other request, so cache the per-snapshot totals by mtime+size;
+    // only the small journal beside it changes between checkpoints.
+    let base: JcodeSnapshotTotals;
     try {
-      if (!existsSync(sessionPath)) return this.unknownUsage("no_data");
-      raw = JSON.parse(readFileSync(sessionPath, "utf-8")) as JcodeSessionRaw;
-    } catch {
-      return this.unknownUsage("parse_error");
+      const st = statSync(sessionPath);
+      const cached = this.jcodeSnapshotCache.get(sessionPath);
+      if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+        base = cached;
+      } else {
+        const raw = JSON.parse(readFileSync(sessionPath, "utf-8")) as JcodeSessionRaw;
+        base = { mtimeMs: st.mtimeMs, size: st.size, ...totalsOf(Array.isArray(raw.messages) ? raw.messages : []) };
+        this.jcodeSnapshotCache.delete(sessionPath);
+        this.jcodeSnapshotCache.set(sessionPath, base);
+        while (this.jcodeSnapshotCache.size > 64) this.jcodeSnapshotCache.delete(this.jcodeSnapshotCache.keys().next().value as string);
+      }
+    } catch (error) {
+      return this.unknownUsage((error as NodeJS.ErrnoException)?.code === "ENOENT" ? "no_data" : "parse_error");
     }
 
-    const messages = Array.isArray(raw.messages) ? [...raw.messages] : [];
+    const messages: JcodeSessionMessageRaw[] = [];
     // jcode appends new turns to `<id>.journal.jsonl` beside the snapshot and folds them into the
     // JSON only on its next checkpoint, so recent usage lives in the journal.
     try {
@@ -249,19 +278,11 @@ export class ContextUsageStore {
     } catch {
       // A torn final journal line is expected mid-write; the snapshot alone is still honest.
     }
-    let totalInputTokens = 0;
-    let totalOutputTokens = 0;
-    let sampledAt: string | null = null;
-    let sawUsage = false;
-    for (const message of messages) {
-      const usage = message?.token_usage;
-      if (usage && typeof usage === "object") {
-        sawUsage = true;
-        if (typeof usage.input_tokens === "number") totalInputTokens += usage.input_tokens;
-        if (typeof usage.output_tokens === "number") totalOutputTokens += usage.output_tokens;
-      }
-      if (typeof message?.timestamp === "string") sampledAt = message.timestamp;
-    }
+    const journal = totalsOf(messages);
+    const totalInputTokens = base.totalInputTokens + journal.totalInputTokens;
+    const totalOutputTokens = base.totalOutputTokens + journal.totalOutputTokens;
+    const sampledAt = journal.sampledAt ?? base.sampledAt;
+    const sawUsage = base.sawUsage || journal.sawUsage;
     if (!sawUsage) return this.unknownUsage("no_data");
 
     return {

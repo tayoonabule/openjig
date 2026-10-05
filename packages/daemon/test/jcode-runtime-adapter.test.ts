@@ -217,6 +217,17 @@ describe("JcodeRuntimeAdapter", () => {
     expect(await adapter.checkReady(binding())).toMatchObject({ ready: true });
   });
 
+  it("treats a shell-wrapped jcode as live, but a bare shell as returned", async () => {
+    const wrapped = fixture({}, { pane: "Jcode\n1> " });
+    vi.mocked(wrapped.tmux.getPaneCommand).mockResolvedValue("bash");
+    (wrapped.tmux as any).paneHasNonShellDescendant = vi.fn(async () => true);
+    expect(await wrapped.adapter.checkReady(binding())).toMatchObject({ ready: true });
+    const bare = fixture({}, { pane: "light@host % " });
+    vi.mocked(bare.tmux.getPaneCommand).mockResolvedValue("bash");
+    (bare.tmux as any).paneHasNonShellDescendant = vi.fn(async () => false);
+    expect(await bare.adapter.checkReady(binding())).toMatchObject({ ready: false, code: "returned_to_shell" });
+  });
+
   it("does not trust a different cwd on the seat debug socket", async () => {
     const socket = `${STATE}/seat/runtime/jcode.sock`;
     const { adapter } = fixture({ [socket]: "" }, { pane: "Jcode\n1> ",

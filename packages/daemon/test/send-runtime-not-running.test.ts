@@ -288,7 +288,8 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
     }
   });
   it("fork: a runtime launched through a /bin/sh wrapper reads as sh but still receives the wake", async () => {
-    seat("jcode", "dev-impl@my-rig");
+    const { node } = seat("jcode", "dev-impl@my-rig");
+    sessionRegistry.updateBinding(node.id, { tmuxSession: "dev-impl@my-rig", tmuxPane: "%1" });
     const { tmux, sendText } = tmuxWithPane(async () => "sh");
     (tmux as unknown as { paneHasNonShellDescendant: () => Promise<boolean> }).paneHasNonShellDescendant = async () => true;
     const result = await watchdogSend(new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: tmux }), "dev-impl@my-rig");
@@ -304,7 +305,7 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
       (tmux as unknown as { paneHasNonShellDescendant: () => Promise<boolean | null> }).paneHasNonShellDescendant = async () => descendant;
       const result = await watchdogSend(new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: tmux }), "dev-impl@my-rig");
 
-      expect(result).toMatchObject({ ok: false, reason: "target_runtime_not_running" });
+      expect(result).toMatchObject({ ok: false, reason: "target_runtime_unverified" });
       expect(sendText).not.toHaveBeenCalled();
     });
 

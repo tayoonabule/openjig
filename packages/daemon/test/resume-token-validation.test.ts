@@ -51,7 +51,7 @@ describe("validateResumeToken", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.error).toMatch(/not supported/i);
-      expect(r.error).toContain("claude-code, codex, jcode, and pi");
+      expect(r.error).toContain("claude-code, codex, jcode, pi, and omp");
     }
   });
 

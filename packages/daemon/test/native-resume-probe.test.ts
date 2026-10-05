@@ -127,6 +127,8 @@ describe("native resume probe", () => {
         paneContent: `› Earlier conversation prompt\n${gate}\n${reportedFooter}`,
       })).toMatchObject({ status: "inconclusive", code });
     });
+  });
+
   it("requires a numbered Jcode prompt instead of process presence", () => {
     expect(assessNativeResumeProbe({ runtime: "jcode", paneCommand: "jcode", paneContent: "Jcode starting" }))
       .toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });

@@ -484,7 +484,7 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
     // OPR.0.6.0.8: after the page is applied, its tab is focused (no blank-tab close here:
     // this create reply carries no default tab id).
     // #707: the applied page is followed by one pane.list read (this fake's reply has no panes, so nothing changes).
-    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "layout.apply"]);
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "layout.apply", "pane.list", "tab.focus"]);
     expect(requests[2]!.params).toEqual({ focus: false, label: "v" });
     expect(requests[3]!.params).toEqual({
       workspace_id: "wG",
@@ -524,7 +524,7 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
       expect(r.method).not.toContain("--help");
       expect(r.method).not.toContain(" ");
     }
-    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "layout.apply"]);
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "layout.apply", "pane.list", "tab.focus"]);
   });
 
   it("a labeled workspace.create failure falls back ONCE to a bare create (uncaptured-param defense)", async () => {
@@ -542,8 +542,9 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
     expect(res.ok).toBe(true);
     expect(res.opened).toEqual(["a@r"]);
     // Existing workspace/tab checks run before creation; the label retry then falls back once.
-    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "workspace.create", "layout.apply"]);
-    expect((requests[4]!.params as Record<string, unknown>)["workspace_id"]).toBe("wH");
+    // This create reply has no tab id, so the adapter cannot verify panes or focus a tab.
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "workspace.list", "workspace.create", "layout.apply"]);
+    expect((requests[5]!.params as Record<string, unknown>)["workspace_id"]).toBe("wH");
     expect(res.notes?.join(" ")).toContain('refused the workspace name "v"');
   });
 

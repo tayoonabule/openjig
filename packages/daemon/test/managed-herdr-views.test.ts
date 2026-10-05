@@ -96,4 +96,17 @@ describe("automatic rig seats views", () => {
     f.setCurrent(false); f.setSeats([{ nodeId: "helper", target: "helper@rig", label: "helper", writable: true, life: "running" }]);
     await f.views.reconcile(); expect(f.calls.filter(c => c.method === "layout.apply")).toHaveLength(1);
   });
+  it("treats a dead observer's bare idle login shell as disposable and rebuilds the view", async () => {
+    const f = fixture(); await f.views.reconcile(); const request = f.deps.transport.request;
+    f.deps.transport.request = async (method: string, params: any) => {
+      const result = await request(method, params);
+      if (method === "pane.process_info") return { process_info: { shell_pid: 7, foreground_processes: [{ pid: 7, argv: ["-zsh"] }] } };
+      return result;
+    };
+    const before = f.calls.filter(c => c.method === "layout.apply").length;
+    f.setSeats([{ nodeId: "other", target: "other@rig", label: "other", writable: true, life: "running" }]);
+    await f.views.reconcile();
+    expect(f.views.status()[Object.keys(f.views.status())[0]!]).not.toMatch(/unverified or human/);
+    expect(f.calls.filter(c => c.method === "layout.apply").length).toBeGreaterThan(before);
+  });
 });

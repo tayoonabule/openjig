@@ -158,7 +158,7 @@ export class ManagedHerdrViews {
     // Close stale view tabs, but only tabs whose every pane is positively one of our observer attaches.
     for (const tab of tabs.filter(t => !kept.has(t.label))) {
       const panes = array<Pane>((await this.rpc("pane.list", { workspace_id: workspace.workspace_id })).panes).filter(p => p.tab_id === tab.tab_id);
-      if (!panes.length || !(await this.allObservers(panes, clients))) continue;
+      if (!panes.length || !(await this.allObservers(panes, clients, /^\d+$/.test(tab.label)))) continue;
       for (const pane of panes) this.deps.unbind?.(pane.pane_id);
       await this.rpc("tab.close", { tab_id: tab.tab_id });
     }
@@ -177,11 +177,14 @@ export class ManagedHerdrViews {
     }
     this.note(rig.id, `${running} tabs, ${rig.seats.filter(s => s.life === "running").length} seats${rig.seats.some(s => s.life === "unknown") ? ", some runtime status unknown" : ""}`);
   }
-  private async allObservers(panes: Pane[], clients: ObserverClient[]): Promise<boolean> {
+  /** `idleShell` also accepts a bare idle login shell, which is what herdr leaves in a fresh workspace's default tab. */
+  private async allObservers(panes: Pane[], clients: ObserverClient[], idleShell = false): Promise<boolean> {
     try {
       const results = await Promise.all(panes.map(async pane => {
         const info = object((await this.rpc("pane.process_info", { pane_id: pane.pane_id })).process_info);
-        return array<Record<string, any>>(info.foreground_processes).some(p => {
+        const fg = array<Record<string, any>>(info.foreground_processes);
+        if (idleShell && fg.length === 1 && fg[0]!.pid === info.shell_pid && /^(?:-)?(?:zsh|bash|sh|fish)$/.test(path.basename(String(fg[0]!.argv?.[0] ?? "")))) return true;
+        return fg.some(p => {
           const attach = observerAttach(p.argv);
           if (attach) return clients.some(c => c.pid === p.pid && c.target === attach.target);
           return p.pid === info.shell_pid && Array.isArray(p.argv) && path.basename(p.argv[0] ?? "") === "sleep" && p.argv[1] === "2147483647";

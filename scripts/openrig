@@ -1,0 +1,3 @@
+#!/bin/sh
+# OpenRig's one-command startup/recovery flow. Use `rig` for other CLI commands.
+exec rig start "$@"

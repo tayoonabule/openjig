@@ -567,9 +567,10 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
     const res = await adapter.openView(view);
     expect(res.ok).toBe(true);
     expect(res.opened).toEqual(["a@r"]);
-    // Existing-workspace checks and fallback naming are read-only; the bare create succeeds.
-    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.list", "workspace.create", "workspace.list", "workspace.create", "layout.apply", "pane.list", "tab.focus"]);
-    expect((requests.find((r) => r.method === "layout.apply")!.params as Record<string, unknown>)["workspace_id"]).toBe("wH");
+    // Existing workspace/tab checks run before creation; the label retry then falls back once.
+    // This create reply has no tab id, so the adapter cannot verify panes or focus a tab.
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.list", "workspace.create", "workspace.list", "workspace.create", "layout.apply"]);
+    expect((requests[6]!.params as Record<string, unknown>)["workspace_id"]).toBe("wH");
     expect(res.notes?.join(" ")).toContain('refused the workspace name "v"');
   });
 

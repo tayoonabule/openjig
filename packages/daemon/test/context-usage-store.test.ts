@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import BetterSqlite3, { type Database } from "better-sqlite3";
 import { createDb } from "../src/db/connection.js";
 import { migrate } from "../src/db/migrate.js";
@@ -138,6 +138,29 @@ describe("ContextUsageStore", () => {
     expect(usage.currentUsage).toContain("\"model_context_window\":258400");
 
     rmSync(codexHome, { recursive: true, force: true });
+  });
+
+  it("jcode usage parses an unchanged snapshot once and still picks up journal growth and snapshot rewrites", () => {
+    const jcodeHome = join(tmpdir(), `jcode-cache-${Date.now()}`);
+    const dir = join(jcodeHome, ".jcode", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const snap = join(dir, "sess-c.json");
+    const msg = (i: number, o: number) => ({ role: "assistant", timestamp: new Date().toISOString(), token_usage: { input_tokens: i, output_tokens: o } });
+    writeFileSync(snap, JSON.stringify({ messages: [msg(10, 1)] }));
+    const store = new ContextUsageStore(db, { stateDir: "/tmp/openrig-test", jcodeHomeDir: jcodeHome });
+    const read = () => store.readJcodeAndNormalize({ resumeToken: "sess-c", sessionName: "s@r" });
+    const parse = vi.spyOn(JSON, "parse");
+    expect(read().totalInputTokens).toBe(10);
+    const afterFirst = parse.mock.calls.length;
+    expect(read().totalInputTokens).toBe(10);
+    expect(parse.mock.calls.length).toBe(afterFirst); // snapshot not re-parsed
+    writeFileSync(join(dir, "sess-c.journal.jsonl"), JSON.stringify({ append_messages: [msg(5, 2)] }));
+    expect(read().totalInputTokens).toBe(15); // journal growth seen immediately
+    writeFileSync(snap, JSON.stringify({ messages: [msg(10, 1), msg(5, 2), msg(7, 7)] }));
+    rmSync(join(dir, "sess-c.journal.jsonl"));
+    expect(read().totalInputTokens).toBe(22); // rewritten snapshot invalidates the cache
+    parse.mockRestore();
+    rmSync(jcodeHome, { recursive: true, force: true });
   });
 
   it("jcode usage includes turns still in the journal and survives a torn last line", () => {

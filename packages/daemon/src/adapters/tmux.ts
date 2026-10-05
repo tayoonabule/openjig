@@ -424,7 +424,9 @@ export class TmuxAdapter {
     const envFlags = env
       ? Object.entries(env).map(([k, v]) => ` -e ${shellQuote(`${k}=${v}`)}`).join("")
       : "";
-    const cmd = `tmux new-session -d -s ${shellQuote(name)}${cwdFlag}${envFlags}`;
+    // Observer tiles attach with ignore-size, so nothing else sizes the window: without an explicit size it stays
+    // at tmux's 80x24 default and every herdr tile shows a cut-off pane filled with dots.
+    const cmd = `tmux new-session -d -x 240 -y 70 -s ${shellQuote(name)}${cwdFlag}${envFlags}`;
     try {
       await this.exec(cmd);
       return { ok: true };

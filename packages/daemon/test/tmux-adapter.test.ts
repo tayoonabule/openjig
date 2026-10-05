@@ -289,7 +289,7 @@ describe("TmuxAdapter", () => {
 
       expect(exec).toHaveBeenCalledOnce();
       expect(exec.mock.calls[0]![0]).toBe(
-        "tmux new-session -d -s 'r01-dev1-impl' -c '/home/user/code'"
+        "tmux new-session -d -x 240 -y 70 -s 'r01-dev1-impl' -c '/home/user/code'"
       );
     });
 
@@ -301,7 +301,7 @@ describe("TmuxAdapter", () => {
 
       expect(exec).toHaveBeenCalledOnce();
       expect(exec.mock.calls[0]![0]).toBe(
-        "tmux new-session -d -s 'r01-dev1-impl' -c '/home/user/my project/code'"
+        "tmux new-session -d -x 240 -y 70 -s 'r01-dev1-impl' -c '/home/user/my project/code'"
       );
     });
 
@@ -313,7 +313,7 @@ describe("TmuxAdapter", () => {
 
       expect(exec).toHaveBeenCalledOnce();
       expect(exec.mock.calls[0]![0]).toBe(
-        "tmux new-session -d -s 'r01-dev'\"'\"'s session' -c '/tmp'"
+        "tmux new-session -d -x 240 -y 70 -s 'r01-dev'\"'\"'s session' -c '/tmp'"
       );
     });
 
@@ -325,7 +325,7 @@ describe("TmuxAdapter", () => {
 
       expect(exec).toHaveBeenCalledOnce();
       expect(exec.mock.calls[0]![0]).toBe(
-        "tmux new-session -d -s 'r01-dev1-impl'"
+        "tmux new-session -d -x 240 -y 70 -s 'r01-dev1-impl'"
       );
     });
 
@@ -359,7 +359,7 @@ describe("TmuxAdapter", () => {
 
       const cmd = exec.mock.calls[0]![0] as string;
       expect(cmd).not.toContain("-e ");
-      expect(cmd).toBe("tmux new-session -d -s 'r01-test' -c '/tmp'");
+      expect(cmd).toBe("tmux new-session -d -x 240 -y 70 -s 'r01-test' -c '/tmp'");
     });
 
     it("returns { ok: false, code: 'duplicate_session' } on duplicate", async () => {
@@ -625,7 +625,7 @@ describe("TmuxAdapter", () => {
       // createSession with canonical name
       await adapter.createSession("dev-impl@auth-feats", "/home/user/code");
       expect(exec.mock.calls[0]![0]).toBe(
-        "tmux new-session -d -s 'dev-impl@auth-feats' -c '/home/user/code'"
+        "tmux new-session -d -x 240 -y 70 -s 'dev-impl@auth-feats' -c '/home/user/code'"
       );
 
       // sendKeys targeting canonical name

@@ -17,6 +17,7 @@ import type { ProjectionPlan, ProjectionEntry } from "../domain/projection-plann
 // history: about 15s live, so allow 30s. Fresh launches only wait for an id.
 const RESUME_POLL_ATTEMPTS = 120;
 const POLL_DELAY_MS = 250;
+const JCODE_SHELLS = new Set(["bash", "fish", "nu", "sh", "tmux", "zsh"]);
 const FRESH_POLL_ATTEMPTS = 20;
 
 export interface JcodeAdapterFsOps extends JcodeSessionFs {
@@ -257,7 +258,13 @@ export class JcodeRuntimeAdapter implements RuntimeAdapter {
     if (current?.status === "ready") return { ready: true };
     if (current?.status === "running") return { ready: false, reason: "Jcode is processing a turn", code: "runtime_busy" };
     if (debug.length) return { ready: false, reason: "The seat debug socket does not identify this workspace", code: "awaiting_runtime" };
-    const command = await this.options.tmux.getPaneCommand(binding.tmuxSession);
+    let command = await this.options.tmux.getPaneCommand(binding.tmuxSession);
+    // Seats start jcode through a `/bin/sh <script>` wrapper, so the pane's foreground command is a
+    // shell while jcode runs as its child. A live non-shell descendant is the runtime, not a bare shell.
+    if (command && JCODE_SHELLS.has(command.replace(/^-/, ""))
+      && await this.options.tmux.paneHasNonShellDescendant?.(binding.tmuxSession, (c) => JCODE_SHELLS.has(c)) === true) {
+      command = "jcode";
+    }
     const content = (await this.options.tmux.capturePaneScreen?.(binding.tmuxSession))
       ?? await this.options.tmux.capturePaneContent(binding.tmuxSession, 40);
     const probe = assessNativeResumeProbe({ runtime: "jcode", paneCommand: command, paneContent: content });

@@ -180,7 +180,10 @@ export class JcodeRuntimeAdapter implements RuntimeAdapter {
           ` JCODE_HOOK_${event}=${shellQuote(`node ${shellQuote(relay)}`)}`).join("") : "";
     // A retained seat server keeps the former occupant's hooks and environment.
     // Never stop the user's shared server: scope both stop and launch to this seat.
-    const command = `if [ -S ${shellQuote(nodePath.join(runtimeDir, "jcode.sock"))} ]; then JCODE_RUNTIME_DIR=${shellQuote(runtimeDir)} jcode server stop --force >/dev/null 2>&1; fi && JCODE_RUNTIME_DIR=${shellQuote(runtimeDir)} JCODE_TEMP_SERVER=1 JCODE_DEBUG_SOCKET=1${hooks} jcode --no-update --no-selfdev -C ${shellQuote(binding.cwd)}${model ? ` -m ${shellQuote(model)}` : ""}${opts.resumeToken ? ` --resume ${shellQuote(opts.resumeToken)}` : ""}`;
+    // A JCODE_SOCKET inherited from the tmux server (set when it was started from a
+    // jcode session) overrides the seat runtime dir, so every seat would join one shared
+    // server and run its tools with that server's OPENRIG_* identity and model.
+    const command = `unset JCODE_SOCKET; if [ -S ${shellQuote(nodePath.join(runtimeDir, "jcode.sock"))} ]; then JCODE_RUNTIME_DIR=${shellQuote(runtimeDir)} jcode server stop --force >/dev/null 2>&1; fi && JCODE_RUNTIME_DIR=${shellQuote(runtimeDir)} JCODE_TEMP_SERVER=1 JCODE_DEBUG_SOCKET=1${hooks} jcode --no-update --no-selfdev -C ${shellQuote(binding.cwd)}${model ? ` -m ${shellQuote(model)}` : ""}${opts.resumeToken ? ` --resume ${shellQuote(opts.resumeToken)}` : ""}`;
     const launch = await this.options.tmux.sendShellCommand(binding.tmuxSession,
       this.options.launchPath ? `PATH=${shellQuote(this.options.launchPath)}; ${command}` : command);
     if (!launch.ok) return { ok: false, error: `Failed to send launch command: ${launch.message}` };

@@ -216,6 +216,10 @@ export class JcodeSessionReader {
     const live = debug.filter((row) => !cwd || nodePath.resolve(row.workingDir) === nodePath.resolve(cwd));
     // The seat-scoped socket is authoritative even before the session JSON is flushed.
     if (debug.length) return live.length === 1 && !priorIds.has(live[0]!.id) ? live[0]!.id : undefined;
+    // The file scan can only identify a session inside a launch window (a cwd and a start time). Without one,
+    // the result below is always undefined, and the scan would open every transcript (hundreds of MB) on the
+    // daemon's single thread, which is what wedged it at ~90% CPU during periodic resume-token refresh.
+    if (!cwd || since <= 0) return undefined;
     const files = scanJcodeSessions(this.fs, this.home, { since })
       .filter((row) => !priorIds.has(row.id) && (!cwd || nodePath.resolve(row.workingDir) === nodePath.resolve(cwd)) && row.createdAt >= since)
       .sort((a, b) => b.createdAt - a.createdAt);

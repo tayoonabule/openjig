@@ -140,6 +140,8 @@ describe("JcodeRuntimeAdapter", () => {
     const command = vi.mocked(tmux.sendText).mock.calls[0]![1];
     expect(command).toContain(`if [ -S '${socket}' ]; then JCODE_RUNTIME_DIR='${STATE}/seat/runtime' jcode server stop --force`);
     expect(command).not.toMatch(/(^|;)\s*jcode server stop/);
+    // An inherited JCODE_SOCKET would put every seat on one shared server and identity.
+    expect(command.startsWith("unset JCODE_SOCKET; ")).toBe(true);
     expect(command.indexOf("server stop --force")).toBeLessThan(command.indexOf("jcode --no-update"));
     // A failed stop must skip the launch without exiting the seat's interactive shell.
     expect(command).toContain("2>&1; fi && JCODE_RUNTIME_DIR=");

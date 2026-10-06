@@ -400,6 +400,7 @@ export class TerminalSessionBroker {
     this.onEmpty?.(this.sessionName);
   }
 
+  private pinnedWindowSize = false;
   private async openPipe(): Promise<{ ok: true } | { ok: false; code: number; reason: string }> {
     // Close codes mirror the pre-broker route so the UI keeps its semantics:
     // 1008 (policy) = the session genuinely does not exist; 1011 (server error)
@@ -416,7 +417,7 @@ export class TerminalSessionBroker {
     // after a client switches windows, and the read, record and pin run in its
     // queue (window-pin.ts), so a readable capture in this daemon takes its turn.
     // Without a window id or a readable value, the session's window is pinned as
-    // before with nothing to give back.
+    // before; the fallback restores tmux's `latest` sizing when this broker detaches.
     const window = (await this.tmux.readWindow?.(this.sessionName, WINDOW_SIZE_PRIOR_OPTION).catch(() => null))?.id ?? null;
     const pinned = await (window ? withWindowPin(window, () => this.pinWindow(window)) : this.pinWindow(null));
     if (!pinned || this.torndown) return { ok: false, code: 1011, reason: "terminal broker unavailable" }; // dispose gives it back
@@ -451,6 +452,10 @@ export class TerminalSessionBroker {
     if (sizing) {
       this.pinnedWindow = sizing.window;
       await recordPin(this.tmux, sizing, this.holder);
+    } else {
+      // With no readable window identity, retain the legacy session-level pin and
+      // restore tmux's default sizing mode when the last subscriber detaches.
+      this.pinnedWindowSize = true;
     }
     const target = sizing?.window ?? this.sessionName;
     await this.tmux.setWindowOption(target, "window-size", "manual").catch(() => {});
@@ -612,7 +617,14 @@ export class TerminalSessionBroker {
   private async restoreWindowSize(): Promise<void> {
     const window = this.pinnedWindow;
     this.pinnedWindow = null;
-    if (window) await releasePin(this.tmux, window, this.holder);
+    if (window) {
+      await releasePin(this.tmux, window, this.holder);
+      return;
+    }
+    if (this.pinnedWindowSize) {
+      this.pinnedWindowSize = false;
+      await this.tmux.setWindowOption(this.sessionName, "window-size", "latest").catch(() => {});
+    }
   }
 
   private teardownResources(): void {

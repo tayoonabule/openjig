@@ -1,4 +1,5 @@
 import nodePath from "node:path";
+import os from "node:os";
 import { describe, expect, it, vi } from "vitest";
 import { JcodeRuntimeAdapter, type JcodeAdapterFsOps } from "../src/adapters/jcode-runtime-adapter.js";
 import { scanJcodeSessions } from "../src/adapters/jcode-session.js";
@@ -226,6 +227,18 @@ describe("JcodeRuntimeAdapter", () => {
     vi.mocked(bare.tmux.getPaneCommand).mockResolvedValue("bash");
     (bare.tmux as any).paneHasNonShellDescendant = vi.fn(async () => false);
     expect(await bare.adapter.checkReady(binding())).toMatchObject({ ready: false, code: "returned_to_shell" });
+  });
+
+  it("never opens session transcripts when asked for a seat with no launch window", async () => {
+    const dir = `${nodePath.join(os.homedir(), ".jcode", "sessions")}`;
+    const reads: string[] = [];
+    const big = `${dir}/session_big_1790000000000_abc.json`;
+    const { adapter } = fixture({ [big]: "{}" });
+    const fsOps = (adapter as any).reader.fs;
+    const original = fsOps.readFile;
+    fsOps.readFile = (p: string) => { reads.push(p); return original(p); };
+    expect(await adapter.captureSessionId("never-launched-seat")).toBeUndefined();
+    expect(reads).toEqual([]);
   });
 
   it("does not trust a different cwd on the seat debug socket", async () => {

@@ -374,6 +374,7 @@ export class TerminalSessionBroker {
     this.onEmpty?.(this.sessionName);
   }
 
+  private pinnedWindowSize = false;
   private async openPipe(): Promise<{ ok: true } | { ok: false; code: number; reason: string }> {
     // Close codes mirror the pre-broker route so the UI keeps its semantics:
     // 1008 (policy) = the session genuinely does not exist; 1011 (server error)
@@ -385,6 +386,7 @@ export class TerminalSessionBroker {
     // window to the smallest attached client; then the canonical width/height
     // ONCE. Deliberately NOT aggressive-resize, which does the opposite.
     await this.tmux.setWindowOption(this.sessionName, "window-size", "manual").catch(() => {});
+    this.pinnedWindowSize = true;
     await this.tmux.resizeWindow(this.sessionName, this.cols, this.rows).catch(() => {});
 
     const outputPath = path.join(
@@ -555,6 +557,12 @@ export class TerminalSessionBroker {
   }
 
   private teardownResources(): void {
+    // Undo the fixed geometry from openPipe so the window follows the user's tmux config again
+    // (a leftover `manual` size leaves herdr panes small with dot filler after the last detach).
+    if (this.pinnedWindowSize) {
+      this.pinnedWindowSize = false;
+      void this.tmux.setWindowOption(this.sessionName, "window-size", "latest").catch(() => {});
+    }
     if (this.tailInterval) {
       clearInterval(this.tailInterval);
       this.tailInterval = null;

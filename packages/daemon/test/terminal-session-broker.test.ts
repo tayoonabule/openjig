@@ -225,6 +225,16 @@ describe("TerminalSessionBroker", () => {
     expect(setWindowOption).not.toHaveBeenCalledWith("dev@rig", "aggressive-resize", expect.anything());
   });
 
+  it("test 7c: the last detach restores window-size latest so the seat window follows tmux config again", async () => {
+    const setWindowOption = vi.fn(async () => ({ ok: true as const }));
+    const broker = track(new TerminalSessionBroker("dev@rig", makeTmux({ setWindowOption }), { pollMs: 10, cols: 120, rows: 40 }));
+    const a = makeSub();
+    await broker.attach(a);
+    expect(setWindowOption).not.toHaveBeenCalledWith("dev@rig", "window-size", "latest");
+    broker.detach(a);
+    await vi.waitFor(() => expect(setWindowOption).toHaveBeenLastCalledWith("dev@rig", "window-size", "latest"));
+  });
+
   it("test 8: seeds on FIRST attach with NO resize message, as the first bytes the subscriber sees", async () => {
     const tmux = makeTmux({
       capturePaneScreen: async () => "line one\nline two",

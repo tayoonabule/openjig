@@ -1,9 +1,17 @@
 import { Hono } from "hono";
+import { seatForRuntimeSession, RUNTIME_SESSION_HEADER } from "./require-sender-identity.js";
 import { WhoamiService, WhoamiAmbiguousError } from "../domain/whoami-service.js";
 import type { PermissionDriftReader } from "../domain/permission-drift-observer.js";
 
 export function whoamiRoutes(): Hono {
   const router = new Hono();
+
+  // Seat that owns the caller's runtime session id (header), so the CLI can adopt it as its identity.
+  router.get("/seat", (c) => {
+    const id = c.req.header(RUNTIME_SESSION_HEADER)?.trim();
+    const seat = id ? seatForRuntimeSession(c, id) : undefined;
+    return c.json({ seat: seat ?? null });
+  });
 
   router.get("/", (c) => {
     const svc = c.get("whoamiService" as never) as WhoamiService;

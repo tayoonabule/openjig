@@ -95,6 +95,7 @@ export async function run(argv = process.argv): Promise<void> {
   // opens the TUI here, not only under a direct `node dist/index.js` run
   // (guard finding 1: importing the entry makes its isDirectRun false).
   // Feature-detected so the wrapper still runs an older sibling entry.
+  await (mod as { adoptRuntimeSessionSeat?: () => Promise<void> }).adoptRuntimeSessionSeat?.();
   const owned = mod.runFrontDoor ? await mod.runFrontDoor(normalizedArgv) : false;
   if (owned) return;
   // Slice 15: run through the shared error path so `--json` failures emit a JSON

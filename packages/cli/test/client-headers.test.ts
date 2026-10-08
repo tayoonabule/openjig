@@ -1,8 +1,15 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { DaemonClient, remoteDaemonClient, senderIdentityHeaders, SENDER_IDENTITY_HEADER, OCCUPANT_GENERATION_HEADER } from "../src/client.js";
+import {
+  DaemonClient,
+  remoteDaemonClient,
+  senderIdentityHeaders,
+  SENDER_IDENTITY_HEADER,
+  OCCUPANT_GENERATION_HEADER,
+  RUNTIME_SESSION_HEADER,
+} from "../src/client.js";
 import { resolveOriginSelfHostId } from "../src/daemon-lifecycle.js";
 
 /** Walk every non-test, non-dist .ts under a package's src/, returning [absPath, contents]. */
@@ -24,6 +31,10 @@ function srcFiles(pkg: string): Array<[string, string]> {
   if (fs.existsSync(root)) walk(root);
   return out;
 }
+
+// The runtime session header is derived from the ambient seat shell; pin it so these tests do not
+// depend on whichever seat happens to run them.
+beforeEach(() => { vi.stubEnv("JCODE_SESSION_ID", ""); });
 
 function mockFetch(handler: (url: string, init: RequestInit) => Promise<Response>): typeof fetch {
   return handler as unknown as typeof fetch;
@@ -274,6 +285,30 @@ describe("A4 — origin-triple carry (senderIdentityHeaders + remoteDaemonClient
       }
       expect(hits.length, `originSelfHostId must be assigned in exactly ONE place; found: ${hits.join(", ")}`).toBe(1);
       expect(hits[0]).toMatch(/^client\.ts:/);
+    });
+  });
+});
+
+describe("runtime-session header (shared runtime server inherited another seat's OPENRIG_* env)", () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  it("stamps X-OpenRig-Runtime-Session from JCODE_SESSION_ID alongside the env identity", () => {
+    vi.stubEnv("OPENRIG_SESSION_NAME", "rust-core-core@blip");
+    vi.stubEnv("JCODE_SESSION_ID", "session_adv_1");
+    expect(senderIdentityHeaders()).toEqual({
+      "X-OpenRig-Session": "rust-core-core@blip",
+      "X-OpenRig-Runtime-Session": "session_adv_1",
+    });
+  });
+  it("still carries the runtime session when the seat env is absent", () => {
+    vi.stubEnv("OPENRIG_SESSION_NAME", "");
+    vi.stubEnv("JCODE_SESSION_ID", "session_adv_1");
+    expect(senderIdentityHeaders()).toEqual({ [RUNTIME_SESSION_HEADER]: "session_adv_1" });
+  });
+  it("does not let an explicit authenticated caller inherit the ambient runtime session", () => {
+    vi.stubEnv("OPENRIG_SESSION_NAME", "ambient@rig");
+    vi.stubEnv("JCODE_SESSION_ID", "session_ambient");
+    expect(senderIdentityHeaders(undefined, "delegated@rig")).toEqual({
+      [SENDER_IDENTITY_HEADER]: "delegated@rig",
     });
   });
 });

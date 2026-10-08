@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +24,10 @@ function srcFiles(pkg: string): Array<[string, string]> {
   if (fs.existsSync(root)) walk(root);
   return out;
 }
+
+// The runtime session header is derived from the ambient seat shell; pin it so these tests do not
+// depend on whichever seat happens to run them.
+beforeEach(() => { vi.stubEnv("JCODE_SESSION_ID", ""); });
 
 function mockFetch(handler: (url: string, init: RequestInit) => Promise<Response>): typeof fetch {
   return handler as unknown as typeof fetch;
@@ -241,5 +245,22 @@ describe("A4 — origin-triple carry (senderIdentityHeaders + remoteDaemonClient
       expect(hits.length, `originSelfHostId must be assigned in exactly ONE place; found: ${hits.join(", ")}`).toBe(1);
       expect(hits[0]).toMatch(/^client\.ts:/);
     });
+  });
+});
+
+describe("runtime-session header (shared runtime server inherited another seat's OPENRIG_* env)", () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  it("stamps X-OpenRig-Runtime-Session from JCODE_SESSION_ID alongside the env identity", () => {
+    vi.stubEnv("OPENRIG_SESSION_NAME", "rust-core-core@blip");
+    vi.stubEnv("JCODE_SESSION_ID", "session_adv_1");
+    expect(senderIdentityHeaders()).toEqual({
+      "X-OpenRig-Session": "rust-core-core@blip",
+      "X-OpenRig-Runtime-Session": "session_adv_1",
+    });
+  });
+  it("still carries the runtime session when the seat env is absent", () => {
+    vi.stubEnv("OPENRIG_SESSION_NAME", "");
+    vi.stubEnv("JCODE_SESSION_ID", "session_adv_1");
+    expect(senderIdentityHeaders()).toEqual({ "X-OpenRig-Runtime-Session": "session_adv_1" });
   });
 });

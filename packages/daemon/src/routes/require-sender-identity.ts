@@ -56,9 +56,39 @@ export function canonicalSenderSession(session: string, selfId: string | null = 
   return `${parts[0]}@${parts[1]}`;
 }
 
-/** The trimmed, canonicalized transport identity (X-OpenRig-Session), or undefined when absent/blank. */
+export const RUNTIME_SESSION_HEADER = "x-openrig-runtime-session";
+
+/**
+ * Seat that owns a runtime session id (e.g. JCODE_SESSION_ID), or undefined unless the id maps to
+ * EXACTLY ONE seat. A shared runtime server launched with another seat's OPENRIG_* env makes the env
+ * identity wrong for every seat on it, while the runtime session id stays per-seat. Ambiguous or
+ * unknown ids return undefined so the caller falls back to the env identity (never a guess).
+ */
+export function seatForRuntimeSession(c: Context, runtimeSessionId: string): string | undefined {
+  try {
+    const db = c.get("db" as never) as { prepare(sql: string): { all(...a: unknown[]): unknown[] } } | undefined;
+    if (!db) return undefined;
+    const rows = db
+      .prepare("SELECT DISTINCT session_name FROM sessions WHERE resume_token = ? AND session_name IS NOT NULL")
+      .all(runtimeSessionId) as Array<{ session_name: string }>;
+    return rows.length === 1 ? rows[0]!.session_name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The trimmed, canonicalized transport identity, or undefined when absent/blank. Normally the
+ * X-OpenRig-Session env identity; when the caller's runtime session id (X-OpenRig-Runtime-Session)
+ * maps to exactly one different seat, that seat wins (the env was inherited from a shared server).
+ */
 export function transportSenderSession(c: Context): string | undefined {
   const raw = c.req.header(SENDER_IDENTITY_HEADER)?.trim();
+  const runtimeId = c.req.header(RUNTIME_SESSION_HEADER)?.trim();
+  if (runtimeId) {
+    const seat = seatForRuntimeSession(c, runtimeId);
+    if (seat && (!raw || canonicalSenderSession(raw) !== seat)) return canonicalSenderSession(seat);
+  }
   return raw ? canonicalSenderSession(raw) : undefined;
 }
 

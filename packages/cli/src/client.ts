@@ -14,6 +14,14 @@ export function terminalAuthHeaders(): Record<string, string> {
 export const SENDER_IDENTITY_HEADER = "X-OpenRig-Session";
 
 /**
+ * Per-seat runtime session id (jcode: JCODE_SESSION_ID). Unlike OPENRIG_SESSION_NAME it is set per
+ * tool shell by the seat's own runtime, so it survives a shared runtime server that was launched with
+ * ANOTHER seat's OPENRIG_* env (every seat on it then inherited the wrong sender). The daemon resolves
+ * it to a seat; it is only a hint and never overrides an unambiguous mapping.
+ */
+export const RUNTIME_SESSION_HEADER = "X-OpenRig-Runtime-Session";
+
+/**
  * P18 sender-provenance — derive the caller's identity from the seat ENV (never a request-body
  * claim). Routes that record authorship into the channel of record read ONLY this header, so a
  * buggy/stale caller cannot write false history by fat-fingering or stale-copying a body field.
@@ -23,13 +31,15 @@ export const SENDER_IDENTITY_HEADER = "X-OpenRig-Session";
  */
 export function senderIdentityHeaders(originSelfHostId?: string): Record<string, string> {
   const session = readOpenRigEnv("OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME")?.trim();
-  if (!session) return {};
+  const runtimeSession = process.env["JCODE_SESSION_ID"]?.trim();
+  const runtimeHeader: Record<string, string> = runtimeSession ? { [RUNTIME_SESSION_HEADER]: runtimeSession } : {};
+  if (!session) return runtimeHeader;
   // Preserve qualified senders; append only a locally derived instance id.
   const value =
     originSelfHostId && originSelfHostId.length > 0 && session.split("@").length < 3
       ? `${session}@${originSelfHostId}`
       : session;
-  return { [SENDER_IDENTITY_HEADER]: value };
+  return { [SENDER_IDENTITY_HEADER]: value, ...runtimeHeader };
 }
 
 /** Construct registered remote clients with the origin derived from this instance's durable store. */

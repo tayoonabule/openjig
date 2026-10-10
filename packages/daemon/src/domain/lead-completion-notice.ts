@@ -17,8 +17,9 @@ import type { QueueRepository } from "./queue-repository.js";
 export const LEAD_NOTICE_TAG = "auto-completion-notice";
 const MIN_WORK_MS = 120_000;
 export const RECHECK_MS = 600_000;
-// Policy, not a guarantee: how far back startup recovery reads persisted events (covers a long daemon outage).
-const RECOVERY_LOOKBACK_MS = 24 * 3_600_000;
+// Startup recovery reads each lead's last N persisted activity events (enough for the final two stretches);
+// deliberately NOT time-bounded, so an outage of any length cannot drop the obligation.
+const RECOVERY_TAIL_EVENTS = 12;
 
 interface SeatStateReader { getSeatStateBySession(name: string): { activity: string; seq: number } | null }
 
@@ -94,10 +95,15 @@ export function startLeadCompletionNotice(deps: {
   const recover = (): void => {
     try {
       const nowMs = now().getTime();
-      const since = new Date(nowMs - RECOVERY_LOOKBACK_MS).toISOString().replace("T", " ").slice(0, 19);
-      const rows = deps.db.prepare(
-        "SELECT created_at AS at, json_extract(payload,'$.sessionName') AS seat, json_extract(payload,'$.activity.state') AS st FROM events WHERE type = 'agent.activity' AND created_at >= ? AND json_extract(payload,'$.sessionName') LIKE 'main-lead@%' ORDER BY seq",
-      ).all(since) as Array<{ at: string; seat: string; st: string }>;
+      // No time cutoff: take each lead's LAST few persisted activity events, however long the daemon was down.
+      const seats = deps.db.prepare(
+        "SELECT DISTINCT json_extract(payload,'$.sessionName') AS seat FROM events WHERE type = 'agent.activity' AND json_extract(payload,'$.sessionName') LIKE 'main-lead@%'",
+      ).all() as Array<{ seat: string }>;
+      const tail = deps.db.prepare(
+        "SELECT created_at AS at, json_extract(payload,'$.sessionName') AS seat, json_extract(payload,'$.activity.state') AS st FROM events WHERE type = 'agent.activity' AND json_extract(payload,'$.sessionName') = ? ORDER BY seq DESC LIMIT ?",
+      );
+      const rows: Array<{ at: string; seat: string; st: string }> = [];
+      for (const { seat } of seats) rows.push(...(tail.all(seat, RECOVERY_TAIL_EVENTS) as typeof rows).reverse());
       const bySeat = new Map<string, Array<{ start: Date; end: Date | null }>>();
       for (const r of rows) {
         if (r.seat === advisor) continue;

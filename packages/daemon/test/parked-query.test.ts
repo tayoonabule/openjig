@@ -260,4 +260,29 @@ describe("owner-input HELD rows do not re-wake the holder (Blip repeated-wake re
     expect(isOwnerInputHold({ state: "blocked", blockedOn: "external:tayo" })).toBe(true);
   });
 });
+
+describe("owner-input hold: reviewer findings on 28e712e0", () => {
+  const mk = (blockedOn: string | null, id = "q"): ObligationRow => ({ qitemId: id, state: "blocked", blockedOn });
+  it("owner-prefixed retryable/service names are NOT owner holds", () => {
+    for (const b of ["external:owner-api-rate-limit", "external:user-service-outage", "external:owner-provider-quota", "external:human-host-unavailable", "external:tayo-retry-timeout"]) {
+      expect(isOwnerInputHold({ state: "blocked", blockedOn: b }), b).toBe(false);
+      expect(diagnoseSeatParked(deps(oracleState({}), [mk(b)]), SEAT).parked, b).toBe(true);
+    }
+  });
+  it("documented slash form external:user/blank-required-cells IS an owner hold; bare and :-delimited too", () => {
+    for (const b of ["external:user/blank-required-cells", "external:tayo", "external:owner:verdict", "external:Tayo-owner-first-press-verdict"]) expect(isOwnerInputHold({ state: "blocked", blockedOn: b }), b).toBe(true);
+  });
+  it("a truncated read never trusts the exemption: 500 owner holds cannot hide a 501st pending row", () => {
+    const rows: ObligationRow[] = Array.from({ length: PARKED_OBLIGATION_LIMIT }, (_, i) => mk("external:Tayo-verdict", `owner-${i}`));
+    const d = diagnoseSeatParked(deps(oracleState({}), rows), SEAT);
+    expect(d.obligations.complete).toBe(false);
+    expect(d.parked).toBe(true);
+  });
+  it("reason text for owner-held rows no longer claims a live wake", () => {
+    const d = diagnoseSeatParked(deps(oracleState({}), [mk("external:Tayo-x")]), SEAT);
+    expect(d.parked).toBe(false);
+    expect(d.reason).toMatch(/owner\/human input/);
+    expect(d.reason).not.toMatch(/all healthy with a live wake/);
+  });
+});
 });

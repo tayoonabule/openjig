@@ -39,7 +39,11 @@ export interface ObligationRow {
 export function isOwnerInputHold(row: { state: string; blockedOn?: string | null }): boolean {
   if (row.state !== "blocked" || !row.blockedOn) return false;
   if (isHumanSeatSessionRef(row.blockedOn)) return true;
-  return /^external:(?:tayo|owner|human|user)(?:[-_.:]|$)/i.test(row.blockedOn);
+  const m = row.blockedOn.match(/^external:(?:tayo|owner|human|user)(?:[-_.:/](.*))?$/i);
+  if (!m) return false;
+  // Names that describe a retryable service/timed condition are NOT owner input, even with an owner-ish prefix
+  // (e.g. external:owner-api-rate-limit). Those keep the live-wake rule.
+  return !/(api|rate|limit|quota|retry|service|host|provider|timeout|timed|deadline|unavailable|outage|down)/i.test(m[1] ?? "");
 }
 
 export interface ParkWakeDiagnosis {
@@ -136,9 +140,12 @@ export function diagnoseSeatParked(
   const state = deps.getSeatState(seat.seatNodeId);
   const scope = `destination=${seat.sessionName} state=pending,in-progress,blocked limit=${PARKED_OBLIGATION_LIMIT}`;
   const read = deps.listOpenObligations(seat.sessionName, PARKED_OBLIGATION_LIMIT);
+  // A truncated read may hide an actionable row behind a page of owner holds, so the owner-input exemption
+  // is only trusted when the obligation read is complete; otherwise the strict live-wake rule applies.
+  const readComplete = read.rows.length < read.limit;
   const held: HeldObligation[] = read.rows.filter((r) => r.state === "blocked").map((row) => {
     const wake = parseWake(deps.getParkWake?.(row.qitemId));
-    return { ...row, state: "blocked", wake, healthy: isOwnerInputHold(row) || (wake?.live === true && (!wake.unconsumed || wake.recoveryOwner === "queue-stuck-sweep")) };
+    return { ...row, state: "blocked", wake, healthy: (readComplete && isOwnerInputHold(row)) || (wake?.live === true && (!wake.unconsumed || wake.recoveryOwner === "queue-stuck-sweep")) };
   });
   const unhealthyHeld = held.filter((row) => !row.healthy);
   const open = read.rows.filter((r) => r.state !== "blocked");
@@ -192,7 +199,7 @@ export function diagnoseSeatParked(
       : `idle-at-prompt with ${open.length} open obligation(s) and ${unhealthyHeld.length} unhealthy HELD row(s) — ${unconsumed.length > 0 ? `${unconsumed.length} wake(s) fired but remain unconsumed. ` : ""}${HELD_REMEDY}`
     : stopped
       ? held.length > 0
-        ? `stopped with ${held.length} HELD row(s), all healthy with a live wake — not parked`
+        ? `stopped with ${held.length} HELD row(s), all healthy (live wake, or waiting on owner/human input) — not parked`
         : "stopped but the board is clean"
       : `working — not parked`;
 

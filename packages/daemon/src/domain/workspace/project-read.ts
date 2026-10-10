@@ -3,9 +3,11 @@ import * as path from "node:path";
 import { parse, YAMLParseError } from "yaml";
 import type { SettingsStore } from "../user-settings/settings-store.js";
 import { NODE_FILE_PRECEDENCE } from "../scope/node-file.js";
-import { readProjectCatalog, selectCatalogProject, yamlObject, ProjectReadError } from "./project-catalog.js";
+import { catalogProjectRigs, readProjectCatalog, selectCatalogProject, yamlObject, ProjectReadError } from "./project-catalog.js";
 
-export interface ProjectRead { id: string; root: string; name: string; sourcePath: string | null; missionsRoot: string; error?: string }
+export interface ProjectRead { id: string; root: string; name: string; sourcePath: string | null; missionsRoot: string; error?: string;
+  /** Rigs the catalog entry claims (`projects[].rigs`); mission-only queue rows from these rigs belong to the project. */
+  rigs?: string[] }
 type ReadContext = { get: (key: never) => unknown; req: { query: (key: string) => string | undefined } };
 export function projectCatalogPaths(c: Pick<ReadContext, "get">) {
   const store = c.get("settingsStore" as never) as SettingsStore | undefined;
@@ -73,7 +75,9 @@ function lookupProject(c: Pick<ReadContext, "get">, id: string): ProjectRead {
   const selected = selectCatalogProject(catalog, id);
   const p = selected ? projectEntry(selected.id, selected.root) : listProjects(c).projects.find(p => p.id === id);
   if (!p) throw new ProjectReadError("project_not_found", `Project ${id} is unavailable`);
-  return p;
+  // Keep declaredProject permissive for callers that need to report authored/unavailable state.
+  // selectedProject applies root identity and usability checks, while catalog rig claims flow into the execution view.
+  return selected ? { ...p, rigs: catalogProjectRigs(catalog, selected.id) } : p;
 }
 function usableProject(p: ProjectRead): ProjectRead {
   if (p.error) throw new ProjectReadError("project_unavailable", `${p.id}: ${p.error}`);

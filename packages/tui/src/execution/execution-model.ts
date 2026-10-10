@@ -17,7 +17,7 @@ import { workflowOverview, workflowDetail } from "./workflow-model.js";
 import type { Action, SliceDetailSnap } from "../types.js";
 import type { Token } from "../theme.js";
 import { wrapDetailLines, detailPage, listItem, sectionRule, type ContentLine, type Section } from "../detail.js";
-import { authoredCompletion, scopeContractLines, scopeIdentityLines, proofProvenanceLines, type ReadinessSnap, type MissionScopesSnap, type SliceScopeSnap } from "../scopes/scopes-model.js";
+import { authoredCompletion, scopeContractLines, scopeIdentityLines, proofProvenanceLines, type ReadinessSnap, type MissionScopesSnap, type MissionStatusItemSnap, type SliceScopeSnap } from "../scopes/scopes-model.js";
 
 export interface ExecutionViewSnap {
   readiness?: { historicalStatus?: string | null; revision: string; state: string; slices: Array<{ scope: string; readiness: import("../scopes/scopes-model.js").ReadinessSnap }> };
@@ -90,8 +90,9 @@ function semanticAction(parts: SemanticSeg[], action: Action, width: number): Co
 }
 
 function stateToken(word: string): Token {
-  if (word === "working" || word === "done" || word === "outcome complete" || word === "active") return "ok";
+  if (word === "working" || word === "done" || word === "outcome complete" || word === "active" || word === "accepted") return "ok";
   if (word === "needs input" || word === "blocked" || word === "parked") return "warn";
+  if (word === "in progress" || word === "assigned" || word === "merged, incomplete" || word === "built, awaiting gates" || word === "ongoing gates") return "accent";
   if (word === "failed") return "error";
   if (word === "retired" || word === "deferred") return "dim";
   return "dim";
@@ -154,7 +155,50 @@ interface SliceFacts {
   lane: Record<string, unknown> | null;
   work: Array<Record<string, unknown>>;
   plannedOwners: Array<{ component: string; owner: string; source: string }>;
+  /** Seats that actually carried bound queue rows (open or closed), newest first. */
+  workedBy: Array<{ seat: string; rows: number; done: number; last_at: string }>;
+  /** The lead's status.yaml items for this slice (exact `slice:` match on the two-digit id). */
+  records: MissionStatusItemSnap[];
   park: Record<string, unknown> | null;
+}
+
+/** status.yaml items whose `slice:` names this slice by its leading number ("01") or full dir. */
+function statusRecordsFor(items: readonly MissionStatusItemSnap[], dir: string): MissionStatusItemSnap[] {
+  const num = /^(\d+)/.exec(dir)?.[1];
+  return items.filter(item => {
+    const tag = item.slice?.trim();
+    return !!tag && (tag === dir || (!!num && tag.padStart(num.length, "0") === num));
+  });
+}
+
+/** Roll the lead's per-item states up to one honest slice word. Accepted only when every item is. */
+const RECORD_ORDER = ["in-progress", "built-awaiting-gates", "merged-incomplete", "ongoing", "design-only", "not-started"] as const;
+const RECORD_WORD: Record<string, string> = {
+  "in-progress": "in progress", "built-awaiting-gates": "built, awaiting gates", "merged-incomplete": "merged, incomplete",
+  ongoing: "ongoing gates", "design-only": "design only", "not-started": "not started", accepted: "accepted",
+};
+function recordWord(records: readonly MissionStatusItemSnap[]): string | null {
+  const live = records.filter(r => r.state !== "excluded");
+  if (!live.length) return null;
+  if (live.every(r => r.state === "accepted")) return "accepted";
+  const lead = RECORD_ORDER.find(state => live.some(r => r.state === state));
+  return lead ? RECORD_WORD[lead]! : null;
+}
+function recordSummary(records: readonly MissionStatusItemSnap[]): string | null {
+  const live = records.filter(r => r.state !== "excluded");
+  if (!live.length) return null;
+  const accepted = live.filter(r => r.state === "accepted").length;
+  const built = live.filter(r => r.state === "merged-incomplete" || r.state === "built-awaiting-gates").length;
+  return `${accepted}/${live.length} accepted${built ? ` · ${built} built` : ""}`;
+}
+function qaSummary(records: readonly MissionStatusItemSnap[]): string | null {
+  const live = records.filter(r => r.state !== "excluded");
+  if (!live.length) return null;
+  const word = (v: string | null) => (v ?? "none").split(/[\s(]/)[0]!.toLowerCase();
+  const passed = live.filter(r => word(r.qa) === "pass").length;
+  const partial = live.filter(r => /^pass-/.test(word(r.qa))).length;
+  const approved = live.filter(r => word(r.review) === "approve").length;
+  return `review ${approved}/${live.length} · QA ${passed}/${live.length} pass${partial ? `, ${partial} partial` : ""}`;
 }
 
 function sliceName(scope: SliceScopeSnap | null, dir: string): string {
@@ -191,6 +235,8 @@ function sliceFacts(execution: ExecutionViewSnap, scopes: readonly MissionScopes
       lane,
       work: Array.isArray(seq[seqIndex]?.["work_rows"]) ? seq[seqIndex]!["work_rows"] as Array<Record<string, unknown>> : lane ? [lane] : [],
       plannedOwners: (seq[seqIndex]?.["planned_owners"] ?? []) as Array<{ component: string; owner: string; source: string }>,
+      workedBy: (Array.isArray(seq[seqIndex]?.["worked_by"]) ? seq[seqIndex]!["worked_by"] : []) as SliceFacts["workedBy"],
+      records: statusRecordsFor(missionScopes?.status?.items ?? [], dir),
       park: lane ? parks.find((item) => item["qitem_id"] === lane["qitem_id"]) ?? null : null,
     };
   }).sort((a, b) => a.order - b.order);
@@ -255,7 +301,9 @@ function stateWord(slice: SliceFacts): string {
   if (slice.readiness?.configured) return "outcomes pending";
   if (stageText(slice) === "retired" || declaredText(slice) === "retired") return "retired";
   if (declaredText(slice) === "deferred" || declaredText(slice) === "closed-deferred") return "deferred";
-  return declaredText(slice) === "done" ? "declared done" : "planned";
+  if (declaredText(slice) === "done") return "declared done";
+  // The lead's status.yaml record is the authored progress for this slice; use it before "planned".
+  return recordWord(slice.records) ?? "planned";
 }
 
 function proofText(scope: SliceScopeSnap | null): string | null {
@@ -272,6 +320,25 @@ function assigneeText(slice: SliceFacts): string | null {
 function plannedOwnerText(slice: SliceFacts): string {
   const build = slice.plannedOwners.filter(p => p.component === "build.minimal-gap");
   return [...new Set((build.length ? build : slice.plannedOwners).map(p => seatShort(p.owner)))].join(", ") || "unknown";
+}
+/** The owner line: open work first, then authored planned owners, then who actually worked it. */
+function ownerLine(slice: SliceFacts): string {
+  const owners = assigneeText(slice);
+  if (owners) return `Owner: ${owners}`;
+  const planned = plannedOwnerText(slice);
+  if (planned !== "unknown") return `Planned: ${planned}`;
+  if (slice.workedBy.length) {
+    const seats = slice.workedBy.slice(0, 3).map(w => seatShort(w.seat));
+    return `Worked by: ${seats.join(", ")}${slice.workedBy.length > 3 ? ` +${slice.workedBy.length - 3}` : ""}`;
+  }
+  return "Owner: none assigned yet";
+}
+/** The evidence line: lead record (review/QA) when present, else the authored PROOF.md report. */
+function evidenceLine(slice: SliceFacts): string | null {
+  const qa = qaSummary(slice.records);
+  const report = slice.scope?.proofReport?.verdict;
+  if (qa) return report ? `${qa} · report ${report}` : qa;
+  return proofText(slice.scope);
 }
 
 /** What unlocks next, only when the projection actually says so. */
@@ -313,7 +380,8 @@ function stateMark(word: string): string {
   if (word === "working") return "●";
   if (word === "needs input") return "◐";
   if (word === "blocked") return "⚑";
-  if (word === "done" || word === "outcome complete") return "✓";
+  if (word === "done" || word === "outcome complete" || word === "accepted") return "✓";
+  if (word === "merged, incomplete" || word === "built, awaiting gates" || word === "in progress" || word === "ongoing gates") return "◑";
   if (word === "failed") return "✕";
   return "○";
 }
@@ -326,7 +394,6 @@ function padCell(text: string, width: number): string {
 function graphNode(slice: SliceFacts, width: number, showReport: boolean): ContentLine[] {
   const inside = width - 2;
   const state = stateWord(slice);
-  const owners = assigneeText(slice);
   const deps = slice.sequencing?.["depends_on"];
   const after = Array.isArray(deps) ? deps.map(String).join(", ") || "none declared" : "unknown";
   const cell = (text: string, token: Token): ContentLine => semantic([
@@ -334,10 +401,10 @@ function graphNode(slice: SliceFacts, width: number, showReport: boolean): Conte
   ], width);
   return [
     semantic([{ text: "┌" + padCell(`─ ${slice.id} `, inside).replace(/ +$/, m => "─".repeat(m.length)) + "┐", token: "accentBright" }], width),
-    cell(slice.name, "bright"), cell(`${stateMark(state)} ${state}`, stateToken(state)),
-    cell(owners ? `Owner: ${owners}` : `Planned: ${plannedOwnerText(slice)}`, "dim"),
+    cell(slice.name, "bright"), cell(`${stateMark(state)} ${state}${recordSummary(slice.records) ? ` · ${recordSummary(slice.records)}` : ""}`, stateToken(state)),
+    cell(ownerLine(slice), "dim"),
     cell(`After: ${after}`, "dim"),
-    ...(showReport ? [cell(proofText(slice.scope) ?? "Report: not recorded", "dim")] : []),
+    ...(showReport ? [cell(evidenceLine(slice) ?? "Report: not recorded", "dim")] : []),
     semantic([{ text: `└${"─".repeat(inside)}┘`, token: "chrome" }], width),
   ];
 }
@@ -349,7 +416,7 @@ function graphChunk(execution: ExecutionViewSnap, members: SliceFacts[], width: 
   const out: ContentLine[] = [];
   for (let start = 0; start < members.length; start += perRow) {
     const chunk = members.slice(start, start + perRow);
-    const showReport = chunk.some(slice => !!slice.scope?.proofReport);
+    const showReport = chunk.some(slice => !!slice.scope?.proofReport || slice.records.length > 0);
     const boxes = chunk.map(slice => graphNode(slice, nodeWidth, showReport));
     const zones = chunk.map((slice, index) => ({ start: index * (nodeWidth + gap), end: index * (nodeWidth + gap) + nodeWidth, action: sliceAction(execution, slice) }));
     for (let line = 0; line < boxes[0]!.length; line++) {
@@ -465,13 +532,21 @@ function overviewLines(execution: ExecutionViewSnap, scopes: readonly MissionSco
   const unknown = slices.filter(slice => !slice.scope && !slice.readiness?.configured).length;
   const missionState = allComplete ? "OUTCOMES COMPLETE" : declaredCompletion ?? (!attributed && legacy === slices.length && slices.length > 0 ? declaredDone === slices.length ? "DECLARED DONE" : "DECLARED WORK" : "OUTCOMES OPEN");
   const missionToken: Token = problems ? "warn" : allComplete || declaredCompletion ? "ok" : "dim";
-  const nowText = active.length ? active.map(slice => `${slice.id} · ${assigneeText(slice) ?? "owner unknown"} · ${stateWord(slice)}`).join("; ") : declaredCompletion ? "nothing left to do" : "no open slice work in this read";
+  const nowText = active.length ? active.map(slice => `${slice.id} · ${assigneeText(slice) ?? (slice.workedBy[0] ? seatShort(slice.workedBy[0].seat) : "owner unknown")} · ${stateWord(slice)}`).join("; ") : declaredCompletion ? "nothing left to do" : "no open slice work in this read";
   const nextValue = declaredCompletion ? "nothing left to do" : next ? `${next.id} · ${nextText(next) ?? "dependency eligibility unknown"}`
     : allComplete ? "outcomes complete; release decision separate"
     : !attributed && declaredDone > 0 && declaredDone === slices.length ? "declared work done; acceptance and release separate"
     : active.length ? "await current work; outcomes remain open"
     : "next eligibility unknown";
   const progress = declaredCompletion ?? `${!attributed && legacy > 0 ? `${declaredDone}/${slices.length} declared done` : `${done}/${slices.length} outcomes complete`} · ${live} working${problems ? ` · ${problems} waiting` : ""}${unknown ? ` · ${unknown} proof unknown` : ""}`;
+  // Slice-level roll-up of the lead's status.yaml record (what is actually built vs not started).
+  const recorded = slices.filter(slice => slice.records.length);
+  const byWord = new Map<string, number>();
+  for (const slice of recorded) { const w = recordWord(slice.records); if (w) byWord.set(w, (byWord.get(w) ?? 0) + 1); }
+  const recordLine = recorded.length
+    ? ["accepted", "in progress", "built, awaiting gates", "merged, incomplete", "ongoing gates", "design only", "not started"]
+      .filter(w => byWord.get(w)).map(w => `${byWord.get(w)} ${w}`).join(" · ") + (recorded.length < slices.length ? ` · ${slices.length - recorded.length} no record` : "")
+    : null;
   const fact = (label: string, value: string, token: Token): ContentLine => semantic([
     { text: `  ${label.padEnd(10)}`, token: "dim", bold: true },
     { text: value, token },
@@ -492,6 +567,7 @@ function overviewLines(execution: ExecutionViewSnap, scopes: readonly MissionSco
   }
   lines.push(fact("NEXT", nextValue, next ? "accentBright" : "dim"));
   lines.push(fact("PROGRESS", progress, "bright"));
+  if (recordLine) lines.push(fact("RECORD", `${recordLine} (lead status.yaml)`, "bright"));
   if (declaredCompletion) lines.push(semantic([{ text: "  formal item proof not recorded", token: "dim" }], width));
   const declaration = scopes?.find(scope => scope.mission === execution.mission)?.declaration;
   const lifecycle = execution.readiness?.historicalStatus ?? declaration?.status ?? declaration?.stage ?? "not declared";

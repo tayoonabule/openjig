@@ -206,6 +206,28 @@ describe("mission execution story — readable rows over the shipped projections
       expect(detail).toContain(title);
   });
 
+  it("shows the lead's status.yaml record and who worked a slice instead of planned/unknown/no verdict", () => {
+    const execution = executionFixture(3);
+    for (const s of execution.q2_sequencing) { (s as Record<string, unknown>)["planned_owners"] = []; (s as Record<string, unknown>)["work_rows"] = []; }
+    execution.q1_lanes = [];
+    (execution.q2_sequencing[1] as Record<string, unknown>)["worked_by"] = [{ seat: "backend-impl@rig", rows: 3, done: 3, last_at: "2026-10-10T00:00:00Z" }];
+    const scopes = executionScopes(3, () => "draft").map(m => ({ ...m, slices: m.slices.map(s => ({ ...s, proofReport: null })) }));
+    const item = (id: string, slice: string, state: string, review: string | null, qa: string | null) =>
+      ({ id, title: id, state, review, qa, hash: null, branch: null, blockedBy: null, note: null, slice });
+    scopes[0]!.status = {
+      updatedAt: null, fileModifiedAt: "2026-10-10T00:00:00Z", ageMs: 0, stale: false, integration: [],
+      total: 3, counts: {}, accepted: 0, reviewOrQaPending: 0, blocked: 0, issues: [],
+      items: [item("A1", "01", "merged-incomplete", "APPROVE", "PASS-PARTIAL (x)"), item("A2", "01", "accepted", "APPROVE", "PASS"), item("B1", "02", "not-started", null, null)],
+    };
+    const body = text(executionContentLines(execution, scopes, [], null, 150));
+    expect(body).toContain("merged, incomplete · 1/2 accepted · 1 built");
+    expect(body).toContain("review 2/2 · QA 1/2 pass, 1 partial");
+    expect(body).toContain("not started · 0/1 accepted");
+    expect(body).toContain("Worked by: backend-impl");
+    expect(body).toMatch(/RECORD\s+1 merged, incomplete · 1 not started · 1 no record/);
+    expect(body).not.toContain("Planned: unknown");
+  });
+
   it("stacks every mission node at narrow width and leaves overflow to the content scroller", () => {
     const lines = executionContentLines(executionFixture(12), executionScopes(12), [], null, 58);
     const body = text(lines);

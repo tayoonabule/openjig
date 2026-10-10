@@ -39,7 +39,7 @@ export interface SliceScopeSnap {
   specShaShort: string | null;
   prdExists: boolean;
 }
-export interface MissionStatusItemSnap { id: string; title: string; state: string; review: string | null; qa: string | null; hash: string | null; branch: string | null; blockedBy: string | null; note: string | null }
+export interface MissionStatusItemSnap { id: string; title: string; state: string; review: string | null; qa: string | null; hash: string | null; branch: string | null; blockedBy: string | null; note: string | null; slice?: string | null }
 /** Counts computed by the daemon from the lead-maintained status.yaml items. No percentage exists anywhere. */
 export interface MissionStatusSnap {
   updatedAt: string | null; fileModifiedAt: string; ageMs: number | null; stale: boolean;

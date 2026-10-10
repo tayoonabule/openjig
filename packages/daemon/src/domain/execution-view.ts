@@ -1024,6 +1024,21 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
         .sort((a, b) => b.ts_updated.localeCompare(a.ts_updated))
         .map(r => ({ qitem_id: r.qitem_id, seat: r.destination_session, state: r.state,
           summary: r.summary ?? null, blocked_on: r.blocked_on, claimed_at: r.claimed_at })),
+      // Who actually carried this slice, from every bound queue row (open or closed), newest
+      // first. Derived at read time; distinct from planned_owners (authored) and work_rows (open).
+      worked_by: (() => {
+        const seen = new Map<string, { seat: string; rows: number; done: number; last_at: string }>();
+        for (const r of rows) {
+          if (sliceOfRow(r) !== s.id && sliceOfRow(r) !== s.dir) continue;
+          const seat = r.destination_session;
+          const entry = seen.get(seat) ?? { seat, rows: 0, done: 0, last_at: r.ts_updated };
+          entry.rows++;
+          if (r.state === "done") entry.done++;
+          if (r.ts_updated > entry.last_at) entry.last_at = r.ts_updated;
+          seen.set(seat, entry);
+        }
+        return [...seen.values()].sort((a, b) => b.last_at.localeCompare(a.last_at));
+      })(),
       depends_on: dependsOn,
       soft_after: softAfter,
       blocked_on_rows: blockedRows,

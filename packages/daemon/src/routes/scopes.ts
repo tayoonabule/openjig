@@ -109,7 +109,7 @@ export function scopesRoutes(): Hono {
       const slices = realFs.listDir(path.join(dir, "slices"))
         .filter(s => realFs.isDirectory(path.join(dir, "slices", s)))
         .map(s => detailFor(name, s)).filter((s): s is NonNullable<typeof s> => s !== null);
-      return { mission: name, declaration, slices: wantDetail ? slices : slices.map(({ intent, miniRequirements, proofContract, progressPath, specShaShort, prdExists, narrative, ...summary }) => summary), readiness: readMissionReadiness(dir, readPolicy), status: readMissionStatus(dir) };
+      return { mission: name, declaration, slices: wantDetail ? slices : slices.map(({ intent, miniRequirements, proofContract, progressPath, specShaShort, prdExists, narrative, ...summary }) => summary), readiness: readMissionReadiness(dir, readPolicy), status: readMissionStatus(dir, Date.now(), r.root) };
     };
     if (mission) {
       if (!realFs.isDirectory(path.join(r.root, mission))) return c.json({ error: "mission_not_found", mission }, 404);

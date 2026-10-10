@@ -116,4 +116,19 @@ describe("scopes routes", () => {
     expect(narrative.content).toBe("narrative only");
     fs.rmSync(root, { recursive: true, force: true });
   });
+  it("exposes mission.status from status.yaml and refuses a symlink that escapes the missions root", async () => {
+    const root = scaffold();
+    const app = appWith(root);
+    const fresh = new Date().toISOString();
+    fs.writeFileSync(path.join(root, "release-x", "status.yaml"), `updated_at: ${fresh}\nitems:\n  - {id: a, title: A, state: accepted, review: approve, qa: pass}\n  - {id: b, title: B, state: not-started}\n`);
+    const ok = await (await app.request("/api/scopes?mission=release-x")).json() as { status: { total: number; accepted: number } | null };
+    expect(ok.status!.total).toBe(2); expect(ok.status!.accepted).toBe(1);
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "scopes-out-"));
+    fs.writeFileSync(path.join(outside, "status.yaml"), `updated_at: ${fresh}\nitems:\n  - {id: z, title: Z, state: accepted, review: approve, qa: pass}\n`);
+    fs.rmSync(path.join(root, "release-x", "status.yaml"));
+    fs.symlinkSync(path.join(outside, "status.yaml"), path.join(root, "release-x", "status.yaml"));
+    const esc = await (await app.request("/api/scopes?mission=release-x")).json() as { status: unknown };
+    expect(esc.status).toBeNull();
+    fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(outside, { recursive: true, force: true });
+  });
 });

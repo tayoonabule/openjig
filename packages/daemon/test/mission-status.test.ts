@@ -44,6 +44,28 @@ items:
     fs.utimesSync(path.join(dir, "status.yaml"), (NOW - MISSION_STATUS_STALE_MS - 60_000) / 1000, (NOW - MISSION_STATUS_STALE_MS - 60_000) / 1000);
     expect(readMissionStatus(dir, NOW)!.stale).toBe(true);
   });
+  it("freshness: mixed age, fresh mtime but stale authored updated_at is STALE (older of the two)", () => {
+    write(`updated_at: 2026-10-09T01:00:00Z\nitems:\n  - {id: a, title: A, state: not-started}\n`);
+    fs.utimesSync(path.join(dir, "status.yaml"), NOW / 1000, NOW / 1000);
+    expect(readMissionStatus(dir, NOW)!.stale).toBe(true);
+  });
+  it("freshness: mixed age, fresh updated_at but stale mtime is STALE (older of the two)", () => {
+    write(`updated_at: 2026-10-10T07:59:00Z\nitems:\n  - {id: a, title: A, state: not-started}\n`);
+    const old = (NOW - MISSION_STATUS_STALE_MS - 60_000) / 1000;
+    fs.utimesSync(path.join(dir, "status.yaml"), old, old);
+    expect(readMissionStatus(dir, NOW)!.stale).toBe(true);
+  });
+  it("containment: a status.yaml symlink escaping the root is refused; an in-root one is read", () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "mstatus-out-"));
+    fs.writeFileSync(path.join(outside, "status.yaml"), `updated_at: 2026-10-10T07:59:00Z\nitems:\n  - {id: x, title: X, state: accepted, review: approve, qa: pass}\n`);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "mstatus-root-"));
+    const mission = path.join(root, "m"); fs.mkdirSync(mission);
+    fs.symlinkSync(path.join(outside, "status.yaml"), path.join(mission, "status.yaml"));
+    expect(readMissionStatus(mission, NOW, root)).toBeNull();
+    fs.rmSync(path.join(mission, "status.yaml"));
+    fs.writeFileSync(path.join(mission, "status.yaml"), `updated_at: 2026-10-10T07:59:00Z\nitems:\n  - {id: a, title: A, state: not-started}\n`);
+    expect(readMissionStatus(mission, NOW, root)!.total).toBe(1);
+  });
   it("missing/invalid updated_at is flagged and freshness falls back to the file mtime", () => {
     write(`items:\n  - {id: a, title: A, state: not-started}\n`);
     fs.utimesSync(path.join(dir, "status.yaml"), NOW / 1000, NOW / 1000);

@@ -124,7 +124,7 @@ export class SeatActivityService {
     // Negative ageSeconds (clock skew) defensively reads as active too —
     // it means tmux reports activity in the (very near) future, which
     // happens when the daemon's monotonic clock lags briefly.
-    let isActiveWithinWindow = ageSeconds < silenceWindowSeconds;
+    const isActiveWithinWindow = ageSeconds < silenceWindowSeconds;
     if (isActiveWithinWindow) {
       let text: string | null = null;
       try {
@@ -143,14 +143,10 @@ export class SeatActivityService {
         const prev = this.contentByPane.get(paneId);
         if (!prev || prev.hash !== hash) {
           this.contentByPane.set(paneId, { hash, changedAtMs: nowMs });
-        } else if ((nowMs - prev.changedAtMs) / 1000 >= Math.max(silenceWindowSeconds, CONTENT_FROZEN_IDLE_SECONDS)) {
-          isActiveWithinWindow = false; // window ticks, content frozen >= CONTENT_FROZEN_IDLE_SECONDS: repaint chrome
         }
       }
-    } else {
-      // genuinely silent: the next activity must be judged from a fresh baseline
-      this.contentByPane.delete(paneId);
     }
+    // (a genuinely silent window keeps the baseline: the notice compares the last CHANGE time against a stretch start)
 
     const record: SeatActivity = {
       paneId,
@@ -199,6 +195,12 @@ export class SeatActivityService {
    * observation has been recorded yet (e.g. service hasn't polled this
    * seat). Distinct from `isActiveWithinWindow: false`.
    */
+  /** Epoch-ms when this pane's (digit-normalised) content last CHANGED while the window read active, or null when
+   *  there is no content evidence (never observed active, capture unavailable/failed, timestamp lost). */
+  getContentChangedAtMs(paneId: string): number | null {
+    return this.contentByPane.get(paneId)?.changedAtMs ?? null;
+  }
+
   getSeatActivity(paneId: string): SeatActivity | null {
     return this.latestByPaneId.get(paneId) ?? null;
   }

@@ -360,7 +360,7 @@ export async function startServer(port?: number) {
         stuckSweepTimer = startStuckSweepScheduler(deps);
         // A lead that goes idle after real work without reporting gets an automatic notice queued to the advisor.
         if (deps.queueRepo && deps.seatActivityService && deps.eventBus) {
-          stopLeadNotice = startLeadCompletionNotice({ db: deps.rigRepo.db, eventBus: deps.eventBus, queueRepo: deps.queueRepo, seatActivity: deps.seatActivityService });
+          stopLeadNotice = startLeadCompletionNotice({ db: deps.rigRepo.db, eventBus: deps.eventBus, queueRepo: deps.queueRepo, seatActivity: deps.seatActivityService, contentChangedAtMs: (n: string) => deps.seatActivityService?.getContentChangedAtMs(n) ?? null });
         }
         // S01 — wake-or-escalate on batons: a failed baton wake retries on schedule,
         // then escalates through recorded rungs; never a silent park.

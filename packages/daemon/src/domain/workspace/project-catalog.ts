@@ -129,6 +129,39 @@ export function inferCatalogProject(
   throw required;
 }
 
+/** The rigs a catalog entry claims (workspace.yaml `projects[].rigs`); malformed or absent reads as none. */
+export function catalogProjectRigs(catalogPath: string, id: string): string[] {
+  for (const entry of catalogEntries(catalogPath)) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const { id: entryId, rigs } = entry as { id?: unknown; rigs?: unknown };
+    if (entryId === id && Array.isArray(rigs) && rigs.every((name) => typeof name === "string")) return rigs as string[];
+  }
+  return [];
+}
+
+/** Membership for a row already bound to a mission inside the selected project.
+ *  An explicit `project:` tag decides. A row with no `project:` tag belongs when its
+ *  destination or source seat's rig is one the catalog says this project claims, the
+ *  same rig association project inference uses (#712). Seat handoffs are normally
+ *  mission-only, so without this every project-scoped read showed no work. */
+export function belongsToProjectMission(
+  row: { tags: string | null | undefined; destination_session?: string | null; source_session?: string | null },
+  id: string,
+  claimedRigs: readonly string[],
+): boolean {
+  let tags: string[] = [];
+  try {
+    const parsed: unknown = JSON.parse(row.tags ?? "null");
+    if (Array.isArray(parsed)) tags = parsed.flatMap(t => typeof t === "string" ? t.split(",").map(s => s.trim()) : []);
+  } catch { return false; }
+  const projects = tags.filter(t => t.startsWith("project:"));
+  if (projects.length) return projects.includes(`project:${id}`);
+  return [row.destination_session, row.source_session].some(session => {
+    const rig = rigFromSession(session);
+    return rig !== null && claimedRigs.includes(rig);
+  });
+}
+
 /** Exact project membership; unscoped historical rows are not assigned to a selected project. */
 export function belongsToProject(raw: string | null | undefined, id: string): boolean {
   try {

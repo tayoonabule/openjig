@@ -150,7 +150,7 @@ export class ViewProjector {
       }
       const build = () => {
         const deps = this.executionDeps!;
-        return buildExecutionView(opts?.project ? { ...deps, slicesRoot: () => opts.project!.missionsRoot } : deps, { mission: opts?.mission, rig: opts?.rig, project: opts?.project?.id })
+        return buildExecutionView(opts?.project ? { ...deps, slicesRoot: () => opts.project!.missionsRoot } : deps, { mission: opts?.mission, rig: opts?.rig, project: opts?.project?.id, projectRigs: opts?.project?.rigs })
           .then(doc => ({ viewName: "execution" as const, generatedAt: this.now().toISOString(), rows: [doc], rowCount: 1 }));
       };
       // A caller inside a transaction keeps its uncommitted visibility: its build starts now, outside the queue.

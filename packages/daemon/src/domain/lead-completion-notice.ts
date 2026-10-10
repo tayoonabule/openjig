@@ -17,9 +17,9 @@ import type { QueueRepository } from "./queue-repository.js";
 export const LEAD_NOTICE_TAG = "auto-completion-notice";
 const MIN_WORK_MS = 120_000;
 export const RECHECK_MS = 600_000;
-// Startup recovery reads each lead's last N persisted activity events (enough for the final two stretches);
-// deliberately NOT time-bounded, so an outage of any length cannot drop the obligation.
-const RECOVERY_TAIL_EVENTS = 12;
+// Startup recovery pages back through each lead's persisted activity events in pages of this size; it is
+// bounded by logical state runs (final two stretches), never by wall-clock or a fixed event count.
+const RECOVERY_PAGE = 200;
 
 interface SeatStateReader { getSeatStateBySession(name: string): { activity: string; seq: number } | null }
 
@@ -99,11 +99,32 @@ export function startLeadCompletionNotice(deps: {
       const seats = deps.db.prepare(
         "SELECT DISTINCT json_extract(payload,'$.sessionName') AS seat FROM events WHERE type = 'agent.activity' AND json_extract(payload,'$.sessionName') LIKE 'main-lead@%'",
       ).all() as Array<{ seat: string }>;
-      const tail = deps.db.prepare(
-        "SELECT created_at AS at, json_extract(payload,'$.sessionName') AS seat, json_extract(payload,'$.activity.state') AS st FROM events WHERE type = 'agent.activity' AND json_extract(payload,'$.sessionName') = ? ORDER BY seq DESC LIMIT ?",
+      // Per lead, page backwards through persisted events, COLLAPSING consecutive duplicate observations
+      // (and ignoring 'unknown'), until the final two logical stretches (4 state runs) are in hand or history
+      // is exhausted. No time cutoff and no fixed event count: duplicates cannot hide a boundary.
+      const page = deps.db.prepare(
+        "SELECT seq, created_at AS at, json_extract(payload,'$.activity.state') AS st FROM events WHERE type = 'agent.activity' AND json_extract(payload,'$.sessionName') = ? AND seq < ? ORDER BY seq DESC LIMIT ?",
       );
       const rows: Array<{ at: string; seat: string; st: string }> = [];
-      for (const { seat } of seats) rows.push(...(tail.all(seat, RECOVERY_TAIL_EVENTS) as typeof rows).reverse());
+      for (const { seat } of seats) {
+        const runs: Array<{ at: string; st: string }> = []; // newest first; at = EARLIEST event of the run
+        let before = Number.MAX_SAFE_INTEGER;
+        for (;;) {
+          const batch = page.all(seat, before, RECOVERY_PAGE) as Array<{ seq: number; at: string; st: string }>;
+          if (batch.length === 0) break;
+          for (const r of batch) {
+            if (r.st !== "running" && r.st !== "idle") continue;
+            const top = runs[runs.length - 1];
+            if (top && top.st === r.st) top.at = r.at;
+            else runs.push({ at: r.at, st: r.st });
+          }
+          const oldest = batch[batch.length - 1];
+          if (!oldest) break;
+          before = oldest.seq;
+          if (runs.length > 4 || batch.length < RECOVERY_PAGE) break; // >4: the 4th run is then certainly complete
+        }
+        for (const r of runs.slice(0, 4).reverse()) rows.push({ at: r.at, seat, st: r.st });
+      }
       const bySeat = new Map<string, Array<{ start: Date; end: Date | null }>>();
       for (const r of rows) {
         if (r.seat === advisor) continue;

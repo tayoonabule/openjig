@@ -241,3 +241,50 @@ describe("lead completion notice: outage of any length", () => {
     expect(r.dueInMs()).toBe(RECHECK_MS - 3 * MIN);
   });
 });
+
+describe("lead completion notice: duplicate observations cannot hide the final two stretches", () => {
+  const dup = (state: "running" | "idle", startIso: string, n: number, stepMs = 1000): Array<[string, "running" | "idle"]> => {
+    const t0 = new Date(startIso).getTime();
+    return Array.from({ length: n }, (_, i) => [new Date(t0 + i * stepMs).toISOString(), state] as [string, "running" | "idle"]);
+  };
+  it(">12 duplicate running/idle observations inside the final two stretches: boundaries still found, original deadline kept", async () => {
+    // reported stretch 04:00-04:03 (30 dup running + 30 dup idle), silent continuation 04:04-04:07 (40 dup running, 40 dup idle)
+    const events = [
+      ...dup("running", "2026-10-10T04:00:00Z", 30), ...dup("idle", "2026-10-10T04:03:00Z", 30),
+      ...dup("running", "2026-10-10T04:04:00Z", 40, 4000), ...dup("idle", "2026-10-10T04:07:00Z", 40),
+    ];
+    events.sort((a, b) => (a[0] < b[0] ? -1 : 1));
+    const r = restart({ nowAt: "2026-10-10T04:10:00Z", events: events as any, reports: ["2026-10-10T04:02:00Z"] });
+    // the run of idle is anchored at its EARLIEST observation (04:07:00), so the deadline is 04:17:00, not later
+    expect(r.dueInMs()).toBe(RECHECK_MS - 3 * MIN);
+    r.advance(RECHECK_MS); await Promise.resolve();
+    expect(r.created).toHaveLength(1);
+  });
+  it("interleaved 'unknown' observations (real data has them) are ignored, not treated as a boundary", async () => {
+    const events: any[] = [...EV];
+    const db0 = events.length;
+    expect(db0).toBe(4);
+    // inject unknowns by running through the same harness with raw rows
+    const SEAT = "main-lead@provineer";
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE queue_items (source_session TEXT, destination_session TEXT, ts_created TEXT, state TEXT, summary TEXT, tags TEXT); CREATE TABLE outbox_entries (sender_session TEXT, destination_session TEXT, ts_dispatched TEXT); CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, created_at TEXT, payload TEXT);");
+    const put = (at: string, st: string) => db.prepare("INSERT INTO events (type, created_at, payload) VALUES ('agent.activity', ?, ?)").run(at.replace("T", " ").slice(0, 19), JSON.stringify({ sessionName: SEAT, activity: { state: st } }));
+    put("2026-10-10T04:00:00Z", "running"); put("2026-10-10T04:01:00Z", "unknown"); put("2026-10-10T04:03:00Z", "idle");
+    put("2026-10-10T04:04:00Z", "running"); for (let i = 0; i < 30; i++) put(`2026-10-10T04:05:${String(i).padStart(2, "0")}Z`, "unknown"); put("2026-10-10T04:07:00Z", "idle");
+    db.prepare("INSERT INTO queue_items VALUES (?,?,?,?,?,?)").run(SEAT, "advisor-lead@kernel", "2026-10-10T04:02:00Z", "done", "report", "[]");
+    const timers: number[] = [];
+    startLeadCompletionNotice({ db, now: () => new Date("2026-10-10T04:10:00Z"),
+      eventBus: { subscribe: () => () => {} } as any, queueRepo: { create: async () => ({}) } as any,
+      seatActivity: { getSeatStateBySession: () => ({ activity: "idle-at-prompt", seq: 1 }) },
+      schedule: (_fn, ms) => { timers.push(ms); return 1; }, cancel: () => {} });
+    expect(timers).toEqual([RECHECK_MS - 3 * MIN]);
+  });
+  it("history larger than one page (>200 events, all duplicates) is paged through to the real boundary", async () => {
+    const events = [
+      ...dup("running", "2026-10-10T04:00:00Z", 10), ...dup("idle", "2026-10-10T04:03:00Z", 10),
+      ...dup("running", "2026-10-10T04:04:00Z", 250, 500), ...dup("idle", "2026-10-10T04:07:00Z", 250, 100),
+    ];
+    const r = restart({ nowAt: "2026-10-10T04:10:00Z", events: events as any, reports: ["2026-10-10T04:02:00Z"] });
+    expect(r.dueInMs()).toBe(RECHECK_MS - 3 * MIN);
+  });
+});

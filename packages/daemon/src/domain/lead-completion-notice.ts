@@ -70,7 +70,7 @@ export function startLeadCompletionNotice(deps: {
       const at = deps.contentChangedAtMs?.(seat);
       if (at === null || at === undefined) return false;
       const st = deps.seatActivity.getSeatStateBySession(seat) as { decidedBy?: string | null } | null;
-      if (st?.decidedBy && st.decidedBy !== "window-sampling") return false;
+      if (st?.decidedBy !== "window-sampling") return false; // only an EXPLICIT window-sampling decision may suppress; null/unknown/hook fail open
       return at < Date.parse(sinceIso) - CHROME_MARGIN_MS;
     } catch { return false; }
   };

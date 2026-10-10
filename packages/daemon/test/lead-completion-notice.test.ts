@@ -158,7 +158,7 @@ function restart(opts: { nowAt: string; seatState?: string | null; events: Array
   const timers: Array<{ at: number; fn: () => void; dead: boolean }> = [];
   let cb: (e: unknown) => void = () => {};
   let state: string | null = opts.seatState === undefined ? "idle-at-prompt" : opts.seatState;
-  startLeadCompletionNotice({
+  const dispose = startLeadCompletionNotice({
     db, now: () => t,
     eventBus: { subscribe: (f: any) => { cb = f; return () => {}; } } as any,
     queueRepo: { create: async (i: any) => { created.push(i); return i; } } as any,
@@ -167,7 +167,7 @@ function restart(opts: { nowAt: string; seatState?: string | null; events: Array
     cancel: (h: any) => { h.dead = true; },
   });
   return {
-    created, timers,
+    created, timers, dispose,
     advance: (ms: number) => { const tgt = t.getTime() + ms; for (;;) { const h = timers.filter((x) => !x.dead && x.at <= tgt).sort((a, b) => a.at - b.at)[0]; if (!h) break; t = new Date(h.at); h.dead = true; h.fn(); } t = new Date(tgt); },
     working: () => { state = "working"; cb({ type: "seat.activity_changed", sessionName: SEAT }); },
     dueInMs: () => (timers.filter((x) => !x.dead)[0]?.at ?? NaN) - t.getTime(),
@@ -319,5 +319,11 @@ describe("lead completion notice: reviewer findings (startup vs live parity)", (
     await Promise.resolve();
     expect(created).toHaveLength(1);                                // 5 min stretch from the persisted start, no report
     expect(created[0].body).toContain("2026-10-10T04:00:00.000Z");
+  });
+  it("dispose with a pending recovery/retry timer: timer is cancelled, nothing queries or creates after shutdown", async () => {
+    const r = restart({ nowAt: "2026-10-10T04:10:00Z", events: EV, reports: ["2026-10-10T04:02:00Z"], seatState: null });
+    r.dispose();
+    r.advance(30 * 60_000); await Promise.resolve();
+    expect(r.created).toHaveLength(0);
   });
 });

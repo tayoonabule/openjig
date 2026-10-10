@@ -136,7 +136,7 @@ export function scopesRoutes(): Hono {
             ? slices
             : slices.map(({ intent, miniRequirements, proofContract, progressPath, specShaShort, prdExists, narrative, ...summary }) => summary),
         readiness: readMissionReadiness(dir, readPolicy, bound),
-        status: readMissionStatus(dir) };
+        status: readMissionStatus(dir, Date.now(), r.root) };
     };
     if (mission) {
       if (!realFs.isDirectory(path.join(r.root, mission))) return c.json({ error: "mission_not_found", mission }, 404);

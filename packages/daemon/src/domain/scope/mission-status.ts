@@ -28,10 +28,19 @@ export interface MissionStatusSummary {
 
 const str = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v.trim() : v === undefined || v === null ? null : String(v));
 
-export function readMissionStatus(missionDir: string, now = Date.now()): MissionStatusSummary | null {
+// containRoot: when given, the real path of status.yaml must stay inside the real path of this root
+// (a symlinked status.yaml or mission dir pointing elsewhere is refused, not followed).
+export function readMissionStatus(missionDir: string, now = Date.now(), containRoot?: string): MissionStatusSummary | null {
   const file = path.join(missionDir, "status.yaml");
   let text: string; let mtime: Date;
-  try { text = fs.readFileSync(file, "utf-8"); mtime = fs.statSync(file).mtime; } catch { return null; }
+  try {
+    if (containRoot) {
+      const root = fs.realpathSync(containRoot);
+      const real = fs.realpathSync(file);
+      if (real !== root && !real.startsWith(root + path.sep)) return null;
+    }
+    text = fs.readFileSync(file, "utf-8"); mtime = fs.statSync(file).mtime;
+  } catch { return null; }
   const issues: string[] = [];
   let doc: any; // parsed with the failsafe schema: all scalars stay strings, so a hash like 34e7702 never becomes a number
   try { doc = parse(text, { schema: "failsafe" }); } catch (e) { return emptySummary(file, mtime, now, [`status.yaml is not valid YAML: ${(e as Error).message.split("\n")[0]}`]); }
@@ -61,8 +70,9 @@ export function readMissionStatus(missionDir: string, now = Date.now()): Mission
   const updatedAt = str(doc.updated_at);
   const authored = updatedAt ? Date.parse(updatedAt) : NaN;
   if (!updatedAt || Number.isNaN(authored)) issues.push("updated_at is missing or not a timestamp; freshness uses the file modification time only");
-  const newest = Math.max(Number.isNaN(authored) ? 0 : authored, mtime.getTime());
-  const ageMs = Math.max(0, now - newest);
+  // freshness uses the OLDER of the authored timestamp and the file mtime: touching the file must not make stale content look fresh
+  const older = Number.isNaN(authored) ? mtime.getTime() : Math.min(authored, mtime.getTime());
+  const ageMs = Math.max(0, now - older);
   const integration = Object.entries((doc.integration ?? {}) as Record<string, any>).map(([repo, v]) => ({ repo, branch: str(v?.branch), hash: str(v?.hash) }));
   return { sourcePath: file, updatedAt, fileModifiedAt: mtime.toISOString(), ageMs, stale: ageMs > MISSION_STATUS_STALE_MS, integration,
     total: items.length - counts.excluded, counts, accepted, reviewOrQaPending: pending, blocked, issues, items };

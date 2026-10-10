@@ -11,6 +11,7 @@ import { createProofPolicyRead, readMissionReadiness } from "../domain/proof/jud
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parse } from "yaml";
+import { readMissionStatus } from "../domain/scope/mission-status.js";
 import type { SliceIndexer } from "../domain/slices/slice-indexer.js";
 import { projectSliceHeader, projectSliceScope, type ScopeFsDeps, type SliceScopeDetail } from "../domain/scope/scope-view-projection.js";
 import { readAllowedFile } from "../domain/files/file-read.js";
@@ -134,7 +135,8 @@ export function scopesRoutes(): Hono {
           : wantDetail
             ? slices
             : slices.map(({ intent, miniRequirements, proofContract, progressPath, specShaShort, prdExists, narrative, ...summary }) => summary),
-        readiness: readMissionReadiness(dir, readPolicy, bound) };
+        readiness: readMissionReadiness(dir, readPolicy, bound),
+        status: readMissionStatus(dir) };
     };
     if (mission) {
       if (!realFs.isDirectory(path.join(r.root, mission))) return c.json({ error: "mission_not_found", mission }, 404);

@@ -225,3 +225,19 @@ describe("lead completion notice: restart recovery", () => {
     expect(r.timers).toHaveLength(0);
   });
 });
+
+describe("lead completion notice: outage of any length", () => {
+  it("daemon down >24h (even 30 days) with no further work: the obligation is still recovered and fires at once", async () => {
+    const r = restart({ nowAt: "2026-11-09T04:10:00Z", events: EV, reports: ["2026-10-10T04:02:00Z"] });
+    expect(r.dueInMs()).toBe(0);
+    r.advance(1); await Promise.resolve();
+    expect(r.created).toHaveLength(1);
+    expect(r.created[0].summary).not.toMatch(/\bDONE\b/);
+  });
+  it("many unrelated old events do not push the last stretches out of view", async () => {
+    const noise: Array<[string, "running" | "idle"]> = [];
+    for (let i = 0; i < 40; i++) noise.push([`2026-09-${String(10 + (i % 15)).padStart(2, "0")}T01:${String(i).padStart(2, "0")}:00Z`, i % 2 ? "idle" : "running"]);
+    const r = restart({ nowAt: "2026-10-10T04:10:00Z", events: [...noise, ...EV], reports: ["2026-10-10T04:02:00Z"] });
+    expect(r.dueInMs()).toBe(RECHECK_MS - 3 * MIN);
+  });
+});

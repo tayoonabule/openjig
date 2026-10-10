@@ -16,6 +16,7 @@
 // S19 A7 RED: unwired.
 
 import type { ArbitratedSeatState, NeedsInput } from "./activity-taxonomy.js";
+import { isHumanSeatSessionRef } from "./session-name.js";
 
 /** One open obligation row from the queue's obligation face. HELD rows (state=blocked —
  *  the deliberate queue-level hold with an owner and a resolution path) are the
@@ -25,6 +26,20 @@ export interface ObligationRow {
   qitemId: string;
   state: "pending" | "in-progress" | "blocked";
   summary?: string | null;
+  /** What a blocked row waits on. Optional (pre-existing readers omit it): absent = no owner-hold rule applies. */
+  blockedOn?: string | null;
+}
+
+/** A HELD row that genuinely waits on a human OWNER's input (a human seat, or an `external:` gate whose
+ *  name starts with the owner/human/user/Tayo prefix). Nothing the seat can do or retry moves it, so
+ *  re-waking the holder each time it idles only burns tokens. Deliberately NARROW: external service /
+ *  host blockers (`external:registered-host-unavailable`), timed/retry waits, internal blocker qitems and
+ *  anything unrecognised do NOT qualify and keep the live-wake rule. It stops counting the moment the
+ *  owner answers (the row leaves `blocked`) or the blocker changes (blockedOn no longer matches). */
+export function isOwnerInputHold(row: { state: string; blockedOn?: string | null }): boolean {
+  if (row.state !== "blocked" || !row.blockedOn) return false;
+  if (isHumanSeatSessionRef(row.blockedOn)) return true;
+  return /^external:(?:tayo|owner|human|user)(?:[-_.:]|$)/i.test(row.blockedOn);
 }
 
 export interface ParkWakeDiagnosis {
@@ -123,7 +138,7 @@ export function diagnoseSeatParked(
   const read = deps.listOpenObligations(seat.sessionName, PARKED_OBLIGATION_LIMIT);
   const held: HeldObligation[] = read.rows.filter((r) => r.state === "blocked").map((row) => {
     const wake = parseWake(deps.getParkWake?.(row.qitemId));
-    return { ...row, state: "blocked", wake, healthy: wake?.live === true && (!wake.unconsumed || wake.recoveryOwner === "queue-stuck-sweep") };
+    return { ...row, state: "blocked", wake, healthy: isOwnerInputHold(row) || (wake?.live === true && (!wake.unconsumed || wake.recoveryOwner === "queue-stuck-sweep")) };
   });
   const unhealthyHeld = held.filter((row) => !row.healthy);
   const open = read.rows.filter((r) => r.state !== "blocked");

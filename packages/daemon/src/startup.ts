@@ -2089,6 +2089,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
                     qitemId: r.qitemId,
                     state: r.state as "pending" | "in-progress" | "blocked",
                     summary: r.summary ?? null,
+                    blockedOn: r.blockedOn ?? null,
                   })),
                 limit,
               }),

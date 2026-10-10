@@ -3,6 +3,7 @@ import {
   diagnoseSeatParked,
   diagnoseRigParked,
   PARKED_OBLIGATION_LIMIT,
+  isOwnerInputHold,
   type ParkedQueryDeps,
   type ObligationRow,
 } from "../src/domain/parked-query.js";
@@ -206,4 +207,57 @@ describe("S19 A7 — rig-level: 'are we parked?'", () => {
     expect(d.parked).toBe("indeterminate");
     expect(d.reason).toMatch(/node-2|indeterminate/i);
   });
+
+describe("owner-input HELD rows do not re-wake the holder (Blip repeated-wake regression)", () => {
+  const ownerHeld: ObligationRow = { qitemId: "qitem-owner", state: "blocked", summary: "Tayo acceptance", blockedOn: "external:Tayo-owner-first-press-verdict" };
+  const expiredOneShot = { "qitem-owner": { kind: "timer", ref: "job-fired", live: false, phase: "fired", unconsumed: true, deliveryStatus: "ok" } };
+
+  it("expired one-shot timer + unchanged external owner blocker: NOT parked, row stays visible as held", () => {
+    const d = diagnoseSeatParked(deps(oracleState({}), [ownerHeld], PARKED_OBLIGATION_LIMIT, expiredOneShot), SEAT);
+    expect(d.parked).toBe(false);
+    expect(d.obligations.heldCount).toBe(1);
+    expect(d.obligations.unhealthyHeldCount).toBe(0);
+    expect(d.obligations.held[0]!.qitemId).toBe("qitem-owner");
+  });
+  it("human-seat blocker with no wake at all: NOT parked", () => {
+    const row: ObligationRow = { ...ownerHeld, blockedOn: "human-tayo@kernel" };
+    expect(diagnoseSeatParked(deps(oracleState({}), [row]), SEAT).parked).toBe(false);
+  });
+  it("owner responds: row leaves blocked (in-progress) and is a real open obligation again -> PARKED", () => {
+    const answered: ObligationRow = { ...ownerHeld, state: "in-progress" };
+    const d = diagnoseSeatParked(deps(oracleState({}), [answered]), SEAT);
+    expect(d.parked).toBe(true);
+    expect(d.obligations.openCount).toBe(1);
+  });
+  it("blocker changes away from the owner gate: the exemption ends and the wakeless hold alerts again", () => {
+    const changed: ObligationRow = { ...ownerHeld, blockedOn: "qitem-some-internal-blocker" };
+    const d = diagnoseSeatParked(deps(oracleState({}), [changed], PARKED_OBLIGATION_LIMIT, expiredOneShot), SEAT);
+    expect(d.parked).toBe(true);
+    expect(d.obligations.unhealthyHeldCount).toBe(1);
+  });
+  it("mixed: owner-held row + an actionable mission-brief row still PARKS on the actionable one, both rows kept", () => {
+    const brief: ObligationRow = { qitemId: "qitem-brief", state: "in-progress", summary: "mission brief" };
+    const d = diagnoseSeatParked(deps(oracleState({}), [ownerHeld, brief], PARKED_OBLIGATION_LIMIT, expiredOneShot), SEAT);
+    expect(d.parked).toBe(true);
+    expect(d.obligations.items.map((r) => r.qitemId)).toEqual(["qitem-brief"]);
+    expect(d.obligations.held.map((r) => r.qitemId)).toEqual(["qitem-owner"]);
+  });
+  it("external SERVICE/host blockers keep the live-wake rule (wakeless -> still alerts)", () => {
+    const host: ObligationRow = { qitemId: "qitem-host", state: "blocked", blockedOn: "external:registered-host-unavailable" };
+    expect(diagnoseSeatParked(deps(oracleState({}), [host]), SEAT).parked).toBe(true);
+    const svc: ObligationRow = { qitemId: "qitem-svc", state: "blocked", blockedOn: "external:provider-rate-limit-retry" };
+    expect(diagnoseSeatParked(deps(oracleState({}), [svc]), SEAT).parked).toBe(true);
+  });
+  it("internal blocker qitem, timed park and unrecognised blockers keep the live-wake rule", () => {
+    for (const blockedOn of ["qitem-20261002060614-a7506c9e", "parked:missions/blip-v2-craft", "external:ownership-transfer-bot", null]) {
+      const row: ObligationRow = { qitemId: "qitem-x", state: "blocked", blockedOn };
+      expect(diagnoseSeatParked(deps(oracleState({}), [row]), SEAT).parked, String(blockedOn)).toBe(true);
+    }
+  });
+  it("owner hold with a live wake is unchanged (still healthy); isOwnerInputHold ignores non-blocked rows", () => {
+    expect(isOwnerInputHold({ state: "in-progress", blockedOn: "external:Tayo-x" })).toBe(false);
+    expect(isOwnerInputHold({ state: "blocked", blockedOn: "external:Tayo-x" })).toBe(true);
+    expect(isOwnerInputHold({ state: "blocked", blockedOn: "external:tayo" })).toBe(true);
+  });
+});
 });

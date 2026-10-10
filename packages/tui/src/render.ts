@@ -13,7 +13,7 @@ import { connectionsLines } from "./connections/connections-model.js";
 // SAME semantic actions commands produce (PIN 1). Isolated seam: a substrate
 // swap touches only this module (spike verdict revisit trigger).
 import { computeExplorerRows, findAgent, findSpec, findAgentBySession, agentsRunningSpec, agentsRunningSpecTargets, specDetailArrowsScroll } from "./state.js";
-import { authoredCompletion, scopesContentLines } from "./scopes/scopes-model.js";
+import { missionStatusLines, missionStatusHeadline, authoredCompletion, scopesContentLines } from "./scopes/scopes-model.js";
 import { executionContentLines, executionSliceStripLines } from "./execution/execution-model.js";
 import { navigatorDisplay } from "./navigator.js";
 import { renderGraphStyle } from "./topology/render-graph.js";
@@ -1108,7 +1108,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
     if (state.project && (!entry || entry.error)) return [...projectHeader, { text: "Choose a project again or go Back." }];
     if (state.project && !state.scopesMission) return [...projectHeader, { text: "Choose a mission" }, ...(snap.scopes ?? []).flatMap(m => {
       const completion = !m.error ? authoredCompletion(m.slices) : null;
-      return [listItem(m.mission + (m.error ? " · source unavailable" : completion ? ` · ${completion}` : ""), { type: "scopes-mission-open", mission: m.mission }),
+      return [listItem(m.mission + (m.error ? " · source unavailable" : completion ? ` · ${completion}` : m.status ? ` · ${missionStatusHeadline(m.status)}` : ""), { type: "scopes-mission-open", mission: m.mission }),
         ...(completion ? [{ text: "  Authored reports · formal item proof not recorded", segs: [{ text: "  Authored reports · formal item proof not recorded", token: "dim" as const }] }] : [])];
     }), ...(!snap.scopes?.length && !errors.length ? [{ text: "No missions found in this project." }] : [])];
     // SCOPES owns both levels. Both mission-graph and Explorer slice routes land
@@ -1138,7 +1138,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
     }
     if (!detail && missionName) {
       const lines = executionContentLines(execution, snap.scopes, snap.readErrors, state.executionOpen, contentWidth, !snap.hydratedAt || snap.executionMission !== missionName, undefined, undefined, state.timeZone);
-      return [...projectHeader, ...(execution ? lines : [{ text: `  ${missionName} EXECUTION` }, ...lines])];
+      return [...projectHeader, ...missionStatusLines(mission?.status, contentWidth), ...(execution ? lines : [{ text: `  ${missionName} EXECUTION` }, ...lines])];
     }
     return [...projectHeader, ...scopesContentLines(detail, missionName, {
       collapseReqs: state.scopesCollapseReqs,

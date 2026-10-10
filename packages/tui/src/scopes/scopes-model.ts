@@ -39,7 +39,15 @@ export interface SliceScopeSnap {
   specShaShort: string | null;
   prdExists: boolean;
 }
-export interface MissionScopesSnap { mission: string; slices: SliceScopeSnap[]; error?: string; declaration?: { stage: string | null; status: string | null; sourcePath: string } | null }
+export interface MissionStatusItemSnap { id: string; title: string; state: string; review: string | null; qa: string | null; hash: string | null; branch: string | null; blockedBy: string | null; note: string | null }
+/** Counts computed by the daemon from the lead-maintained status.yaml items. No percentage exists anywhere. */
+export interface MissionStatusSnap {
+  updatedAt: string | null; fileModifiedAt: string; ageMs: number | null; stale: boolean;
+  integration: Array<{ repo: string; branch: string | null; hash: string | null }>;
+  total: number; counts: Record<string, number>; accepted: number; reviewOrQaPending: number; blocked: number;
+  issues: string[]; items: MissionStatusItemSnap[];
+}
+export interface MissionScopesSnap { mission: string; slices: SliceScopeSnap[]; status?: MissionStatusSnap | null; error?: string; declaration?: { stage: string | null; status: string | null; sourcePath: string } | null }
 
 /** Human completion from authored declarations/reports, never formal acceptance.
  * Configured item proof keeps its own authority, including pending/reopened items. */
@@ -49,6 +57,55 @@ export function authoredCompletion(slices: readonly SliceScopeSnap[]): string | 
   if (verdicts.some(verdict => verdict !== "pass" && verdict !== "pass-with-residue")) return null;
   const residue = verdicts.includes("pass-with-residue") || slices.some(s => /\bwith[ -]residue\b/i.test(s.proofReport?.detail ?? ""));
   return `${slices.length} of ${slices.length} done, ${residue ? "closed with residue" : "pass"}`;
+}
+
+export function statusAge(ms: number | null): string {
+  if (ms === null) return "age unknown";
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  return h < 48 ? `${h}h ${m % 60}m ago` : `${Math.floor(h / 24)}d ago`;
+}
+
+/** One-line glance. Counts only: never a percentage, never registered/scoped as implemented. */
+export function missionStatusHeadline(st: MissionStatusSnap): string {
+  return `${st.accepted} of ${st.total} accepted${st.stale ? " · STALE" : ""}`;
+}
+
+const STATUS_ROWS: Array<[key: string, label: string, token: Token]> = [
+  ["accepted", "accepted", "ok"], ["in-progress", "in progress", "accent"], ["built-awaiting-gates", "built, awaiting review/QA", "warn"],
+  ["merged-incomplete", "merged, outcome incomplete", "warn"], ["design-only", "design only (nothing built)", "dim"], ["not-started", "not started", "dim"], ["ongoing", "ongoing gates", "info"],
+];
+
+/** The operator at-a-glance block for a mission with a status.yaml record. */
+export function missionStatusLines(st: MissionStatusSnap | null | undefined, width: number): ContentLine[] {
+  if (!st) return [];
+  const lines: ContentLine[] = [rule("STATUS", width)];
+  lines.push(semantic([{ text: "  " }, { text: `${st.accepted} of ${st.total} accepted`, token: st.accepted === st.total && st.total > 0 ? "ok" : "bright", bold: true },
+    { text: "  · accepted = reviewer approve + exact-hash QA in a real browser · no percentage", token: "dim" }], width));
+  for (const [key, label, token] of STATUS_ROWS) {
+    const n = st.counts[key] ?? 0;
+    if (n === 0 && key !== "accepted") continue;
+    lines.push(semantic([{ text: `  ${String(n).padStart(3)}  ` , token }, { text: label, token: "bright" }], width));
+  }
+  lines.push(semantic([{ text: `  ${String(st.reviewOrQaPending).padStart(3)}  `, token: "warn" }, { text: "awaiting review or QA", token: "bright" },
+    { text: `   ${st.blocked} blocked by a named dependency`, token: st.blocked ? "warn" : "dim" }], width));
+  lines.push(semantic([{ text: `  record updated ${statusAge(st.ageMs)}`, token: st.stale ? "warn" : "dim" },
+    ...(st.stale ? [{ text: "  STALE, ask the lead to refresh status.yaml", token: "warn" as Token, bold: true }] : []),
+    ...(st.updatedAt ? [{ text: `  (${st.updatedAt})`, token: "dim" as Token }] : [])], width));
+  if (st.integration.length) lines.push(semantic([{ text: "  integrated: ", token: "dim" }, { text: st.integration.map(i => `${i.repo} ${i.branch ?? "?"}@${i.hash ?? "?"}`).join(" · "), token: "dim" }], width));
+  for (const issue of st.issues) lines.push(...wrapped(`record issue: ${issue}`, width, "  ", "warn"));
+  const open = st.items.filter(i => i.state !== "accepted");
+  if (open.length) {
+    lines.push(rule("ITEMS", width));
+    for (const it of open) {
+      const gate = `review ${it.review ?? "none"} · qa ${it.qa ?? "none"}`;
+      const tail = [it.blockedBy ? `BLOCKED: ${it.blockedBy}` : null, it.hash ? it.hash : null].filter(Boolean).join(" · ");
+      lines.push(semantic([{ text: `  ${it.id.padEnd(4)}`, token: "dim" }, { text: it.state.padEnd(21), token: STATUS_ROWS.find(r => r[0] === it.state)?.[2] ?? "dim" }, { text: it.title, token: "bright" }, { text: `  ${gate}${tail ? " · " + tail : ""}`, token: "dim" }], width));
+    }
+  }
+  return lines;
 }
 
 /** Slice state glyph (mock: ● building/spec · ✓ delivery-locked · ⊙ other/idle). */
@@ -80,8 +137,9 @@ export function scopesExplorerRows(
     const key = `scopes-mission:${m.mission}`;
     const open = expanded.has(key);
     const completion = !m.error ? authoredCompletion(m.slices) : null;
+    const glance = !m.error && m.status ? ` · ${missionStatusHeadline(m.status)}` : "";
     rows.push({
-      label: `${indent}${open ? "▾" : "▸"} ${m.mission}${m.error ? " · unavailable" : completion ? ` · ${completion}` : ""}`,
+      label: `${indent}${open ? "▾" : "▸"} ${m.mission}${m.error ? " · unavailable" : completion ? ` · ${completion}` : glance}`,
       action: { type: "scopes-mission-open", mission: m.mission },
       disclosureAction: { type: "toggle-expand", key },
       key,

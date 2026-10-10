@@ -39,7 +39,11 @@ export interface ObligationRow {
 export function isOwnerInputHold(row: { state: string; blockedOn?: string | null }): boolean {
   if (row.state !== "blocked" || !row.blockedOn) return false;
   if (isHumanSeatSessionRef(row.blockedOn)) return true;
-  return /^external:(?:tayo|owner|human|user)(?:[-_.:]|$)/i.test(row.blockedOn);
+  const m = row.blockedOn.match(/^external:(?:tayo|owner|human|user)(?:[-_.:/](.*))?$/i);
+  if (!m) return false;
+  // Names that describe a retryable service/timed condition are NOT owner input, even with an owner-ish prefix
+  // (e.g. external:owner-api-rate-limit). Those keep the live-wake rule.
+  return !/(api|rate|limit|quota|retry|service|host|provider|timeout|timed|deadline|unavailable|outage|down)/i.test(m[1] ?? "");
 }
 
 export interface ParkWakeDiagnosis {
@@ -144,9 +148,12 @@ export function diagnoseSeatParked(
   const state = deps.getSeatState(seat.seatNodeId);
   const scope = `destination=${seat.sessionName} state=pending,in-progress,blocked limit=${PARKED_OBLIGATION_LIMIT}`;
   const read = deps.listOpenObligations(seat.sessionName, PARKED_OBLIGATION_LIMIT);
+  // A truncated read may hide an actionable row behind a page of owner holds, so the owner-input exemption
+  // is only trusted when the obligation read is complete; otherwise the strict live-wake rule applies.
+  const readComplete = read.rows.length < read.limit;
   const held: HeldObligation[] = read.rows.filter((r) => r.state === "blocked").map((row) => {
     const wake = parseWake(deps.getParkWake?.(row.qitemId));
-    const healthy = isOwnerInputHold(row) || (wake?.live === true && (!wake.unconsumed || wake.recoveryOwner === "queue-stuck-sweep"));
+    const healthy = (readComplete && isOwnerInputHold(row)) || (wake?.live === true && (!wake.unconsumed || wake.recoveryOwner === "queue-stuck-sweep"));
     // A fired reminder reads spent to the wake status, but one that is still active, aimed at this owner and
     // delivering keeps waking them: the row is waiting, not stranded.
     const served = !healthy && deps.servedByOwnReminder?.(row.qitemId) === true;
@@ -207,8 +214,8 @@ export function diagnoseSeatParked(
     : stopped
       ? held.length > 0
         ? served > 0
-          ? `stopped with ${held.length} HELD row(s), all healthy: ${held.length - served} with a live wake, ${served} served by its own repeating reminder — not parked`
-          : `stopped with ${held.length} HELD row(s), all healthy with a live wake — not parked`
+          ? `stopped with ${held.length} HELD row(s), all healthy: ${held.length - served} with a live wake or owner/human hold, ${served} served by its own repeating reminder — not parked`
+          : `stopped with ${held.length} HELD row(s), all healthy (live wake or owner/human hold) — not parked`
         : "stopped but the board is clean"
       : `working — not parked`;
 

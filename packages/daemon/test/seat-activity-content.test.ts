@@ -95,4 +95,25 @@ describe("content-aware sampling", () => {
     expect(r.svc.getSeatState(SEAT)!.decidedBy).toBe("lifecycle-hooks");
     void at;
   });
+  it("partial batch omission: a target missing from the batch falls back to a per-target capture", async () => {
+    const nowMs = Date.parse("2026-10-10T10:00:00.000Z");
+    const tmux = {
+      readPaneLastActivity: vi.fn(async () => null),
+      readAllSessionWindowActivity: vi.fn(async () => new Map([["a@r", nowMs / 1000 - 1]])),
+      capturePanesContent: vi.fn(async () => new Map()),
+      capturePaneContent: vi.fn(async () => "x"),
+    } as unknown as TmuxAdapter;
+    const svc = new SeatActivityService({ tmux, defaultWindowSeconds: 3, now: () => new Date(nowMs) });
+    const db: any = { prepare: () => ({ all: () => [{ session_name: "a@r", node_id: "n1", runtime: "jcode", attachment_type: "tmux" }] }) };
+    await svc.pollAllRunningTmuxSeats(db);
+    expect((tmux.capturePaneContent as any).mock.calls.length).toBe(1);
+  });
+  it("timestamp outage clears the baseline: recovery with unchanged text is NOT instantly idle", async () => {
+    const r = rig({ text: () => "same" });
+    await tick(r, 5);
+    r.setLast(() => null as any);
+    expect(await tick(r, 60)).toBeNull();
+    r.setLast(() => r.nowSec() - 1);
+    expect((await tick(r, 1))!.isActiveWithinWindow).toBe(true);
+  });
 });

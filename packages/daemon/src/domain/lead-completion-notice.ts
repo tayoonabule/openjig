@@ -17,6 +17,8 @@ import type { QueueRepository } from "./queue-repository.js";
 export const LEAD_NOTICE_TAG = "auto-completion-notice";
 const MIN_WORK_MS = 120_000;
 export const RECHECK_MS = 600_000;
+// Policy, not a guarantee: how far back startup recovery reads persisted events (covers a long daemon outage).
+const RECOVERY_LOOKBACK_MS = 24 * 3_600_000;
 
 interface SeatStateReader { getSeatStateBySession(name: string): { activity: string; seq: number } | null }
 
@@ -80,6 +82,55 @@ export function startLeadCompletionNotice(deps: {
       tags: [LEAD_NOTICE_TAG, `${LEAD_NOTICE_TAG}:${seat}`],
     }).catch(() => { /* a notice failure never affects the seat */ });
   };
+
+  /**
+   * Restart recovery (no second timer store). The pending recheck is derivable from persisted facts:
+   * `agent.activity` running/idle events, and reports in queue_items/outbox_entries. On startup, for each
+   * lead whose LAST persisted activity is idle, rebuild its final two stretches; if the final one was a
+   * >=2 min unreported continuation of a reported stretch (gap < RECHECK_MS), re-arm the recheck for the
+   * ORIGINAL deadline (idle_at + RECHECK_MS), or fire immediately if that deadline already passed.
+   * Dedup (one open notice per seat) and the "still idle / nothing sent since" check are the same code path.
+   */
+  const recover = (): void => {
+    try {
+      const nowMs = now().getTime();
+      const since = new Date(nowMs - RECOVERY_LOOKBACK_MS).toISOString().replace("T", " ").slice(0, 19);
+      const rows = deps.db.prepare(
+        "SELECT created_at AS at, json_extract(payload,'$.sessionName') AS seat, json_extract(payload,'$.activity.state') AS st FROM events WHERE type = 'agent.activity' AND created_at >= ? AND json_extract(payload,'$.sessionName') LIKE 'main-lead@%' ORDER BY seq",
+      ).all(since) as Array<{ at: string; seat: string; st: string }>;
+      const bySeat = new Map<string, Array<{ start: Date; end: Date | null }>>();
+      for (const r of rows) {
+        if (r.seat === advisor) continue;
+        const t = new Date(r.at.replace(" ", "T") + "Z");
+        const list = bySeat.get(r.seat) ?? [];
+        const last = list[list.length - 1];
+        if (r.st === "running") { if (!last || last.end) list.push({ start: t, end: null }); }
+        else if (r.st === "idle" && last && !last.end) last.end = t;
+        bySeat.set(r.seat, list);
+      }
+      for (const [seat, list] of bySeat) {
+        const cur = list[list.length - 1];
+        if (!cur || !cur.end) continue;                                   // working now / unknown: live events decide
+        const prev = list[list.length - 2];
+        prevStretch.set(seat, prev && prev.end ? { start: prev.start, end: prev.end } : { start: cur.start, end: cur.end });
+        if (cur.end.getTime() - cur.start.getTime() < MIN_WORK_MS) continue;
+        const sinceIso = cur.start.toISOString();
+        if (reportedSince(seat, sinceIso)) continue;
+        if (!(prev && prev.end && cur.start.getTime() - prev.end.getTime() < RECHECK_MS && reportedSince(seat, prev.start.toISOString()))) continue; // non-continuations already notified live
+        const dueIn = Math.max(0, cur.end.getTime() + RECHECK_MS - nowMs);   // original deadline, never extended
+        deferred.set(seat, schedule(() => {
+          deferred.delete(seat);
+          try {
+            const st = deps.seatActivity.getSeatStateBySession(seat);
+            if (st && st.activity !== "idle-at-prompt") return;           // working again
+            if (reportedSince(seat, sinceIso)) return;
+            emit(seat, sinceIso);
+          } catch { /* never crash the daemon */ }
+        }, dueIn));
+      }
+    } catch { /* never crash the daemon */ }
+  };
+  recover();
 
   return deps.eventBus.subscribe((event) => {
     const e = event as unknown as { type?: string; sessionName?: string };

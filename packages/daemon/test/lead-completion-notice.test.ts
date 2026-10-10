@@ -144,3 +144,84 @@ describe("lead completion notice: continuation after a report", () => {
     expect(s.created).toHaveLength(1);                                            // immediate, no deferral
   });
 });
+
+// ---- restart recovery: the pending recheck is rebuilt from persisted events + reports ----
+function restart(opts: { nowAt: string; seatState?: string | null; events: Array<[string, "running" | "idle"]>; reports?: string[]; openNotice?: boolean }) {
+  const SEAT = "main-lead@provineer";
+  const db = new Database(":memory:");
+  db.exec("CREATE TABLE queue_items (source_session TEXT, destination_session TEXT, ts_created TEXT, state TEXT, summary TEXT, tags TEXT); CREATE TABLE outbox_entries (sender_session TEXT, destination_session TEXT, ts_dispatched TEXT); CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, created_at TEXT, payload TEXT);");
+  for (const [at, st] of opts.events) db.prepare("INSERT INTO events (type, created_at, payload) VALUES ('agent.activity', ?, ?)").run(at.replace("T", " ").slice(0, 19), JSON.stringify({ sessionName: SEAT, activity: { state: st } }));
+  for (const r of opts.reports ?? []) db.prepare("INSERT INTO queue_items VALUES (?,?,?,?,?,?)").run(SEAT, "advisor-lead@kernel", r, "done", "report", "[]");
+  if (opts.openNotice) db.prepare("INSERT INTO queue_items VALUES (?,?,?,?,?,?)").run("advisor-lead@kernel", "advisor-lead@kernel", "2026-10-10T04:00:00Z", "pending", "AUTO", '["auto-completion-notice","auto-completion-notice:main-lead@provineer"]');
+  let t = new Date(opts.nowAt);
+  const created: any[] = [];
+  const timers: Array<{ at: number; fn: () => void; dead: boolean }> = [];
+  let cb: (e: unknown) => void = () => {};
+  let state: string | null = opts.seatState === undefined ? "idle-at-prompt" : opts.seatState;
+  startLeadCompletionNotice({
+    db, now: () => t,
+    eventBus: { subscribe: (f: any) => { cb = f; return () => {}; } } as any,
+    queueRepo: { create: async (i: any) => { created.push(i); return i; } } as any,
+    seatActivity: { getSeatStateBySession: () => (state ? { activity: state, seq: 1 } : null) },
+    schedule: (fn, ms) => { const h = { at: t.getTime() + ms, fn, dead: false }; timers.push(h); return h; },
+    cancel: (h: any) => { h.dead = true; },
+  });
+  return {
+    created, timers,
+    advance: (ms: number) => { const tgt = t.getTime() + ms; for (const h of timers.filter((x) => !x.dead).sort((a, b) => a.at - b.at)) if (h.at <= tgt) { t = new Date(h.at); h.dead = true; h.fn(); } t = new Date(tgt); },
+    working: () => { state = "working"; cb({ type: "seat.activity_changed", sessionName: SEAT }); },
+    dueInMs: () => (timers.filter((x) => !x.dead)[0]?.at ?? NaN) - t.getTime(),
+  };
+}
+// reported stretch 04:00-04:03 (report 04:02), silent continuation 04:04-04:07, idle since 04:07
+const EV: Array<[string, "running" | "idle"]> = [["2026-10-10T04:00:00Z", "running"], ["2026-10-10T04:03:00Z", "idle"], ["2026-10-10T04:04:00Z", "running"], ["2026-10-10T04:07:00Z", "idle"]];
+
+describe("lead completion notice: restart recovery", () => {
+  it("restart BEFORE due: re-arms for the ORIGINAL deadline (idle_at + RECHECK_MS), then fires once", async () => {
+    const r = restart({ nowAt: "2026-10-10T04:10:00Z", events: EV, reports: ["2026-10-10T04:02:00Z"] });
+    expect(r.created).toHaveLength(0);
+    expect(r.dueInMs()).toBe(RECHECK_MS - 3 * MIN);                 // 04:07 + 10m = 04:17, now 04:10
+    r.advance(RECHECK_MS); await Promise.resolve();
+    expect(r.created).toHaveLength(1);
+    expect(r.created[0].summary).toContain("not a completion");
+    expect(r.created[0].summary).not.toMatch(/\bDONE\b/);
+  });
+  it("restart AFTER due: the lead is surfaced immediately, not lost", async () => {
+    const r = restart({ nowAt: "2026-10-10T05:30:00Z", events: EV, reports: ["2026-10-10T04:02:00Z"] });
+    expect(r.dueInMs()).toBe(0);
+    r.advance(1); await Promise.resolve();
+    expect(r.created).toHaveLength(1);
+  });
+  it("report sent BEFORE the restart, after the silent stretch began: no notice", async () => {
+    const r = restart({ nowAt: "2026-10-10T04:10:00Z", events: EV, reports: ["2026-10-10T04:02:00Z", "2026-10-10T04:08:00Z"] });
+    expect(r.timers.filter((x) => !x.dead)).toHaveLength(0);
+    r.advance(RECHECK_MS * 3); await Promise.resolve();
+    expect(r.created).toHaveLength(0);
+  });
+  it("seat working again after the restart: the re-armed recheck is cancelled", async () => {
+    const r = restart({ nowAt: "2026-10-10T04:10:00Z", events: EV, reports: ["2026-10-10T04:02:00Z"] });
+    r.working();
+    r.advance(RECHECK_MS * 2); await Promise.resolve();
+    expect(r.created).toHaveLength(0);
+  });
+  it("seat is working at the due time (state read at fire time): no notice", async () => {
+    const r = restart({ nowAt: "2026-10-10T04:10:00Z", events: EV, reports: ["2026-10-10T04:02:00Z"], seatState: "working" });
+    r.advance(RECHECK_MS); await Promise.resolve();
+    expect(r.created).toHaveLength(0);
+  });
+  it("dedup after restart: an already-open notice for the seat is not stacked", async () => {
+    const r = restart({ nowAt: "2026-10-10T05:30:00Z", events: EV, reports: ["2026-10-10T04:02:00Z"], openNotice: true });
+    r.advance(1); await Promise.resolve();
+    expect(r.created).toHaveLength(0);
+  });
+  it("no recovery for a lead that never reported (its notice already fired live) or a short stretch", async () => {
+    const a = restart({ nowAt: "2026-10-10T05:30:00Z", events: EV, reports: [] });
+    expect(a.timers).toHaveLength(0);
+    const b = restart({ nowAt: "2026-10-10T05:30:00Z", events: [["2026-10-10T04:00:00Z", "running"], ["2026-10-10T04:03:00Z", "idle"], ["2026-10-10T04:04:00Z", "running"], ["2026-10-10T04:04:30Z", "idle"]], reports: ["2026-10-10T04:02:00Z"] });
+    expect(b.timers).toHaveLength(0);
+  });
+  it("a lead whose last persisted state is working is left to live events", async () => {
+    const r = restart({ nowAt: "2026-10-10T04:10:00Z", events: [...EV.slice(0, 3)], reports: ["2026-10-10T04:02:00Z"] });
+    expect(r.timers).toHaveLength(0);
+  });
+});

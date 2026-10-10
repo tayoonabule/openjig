@@ -31,6 +31,8 @@ export function startLeadCompletionNotice(deps: {
   eventBus: Pick<EventBus, "subscribe">;
   queueRepo: Pick<QueueRepository, "create">;
   seatActivity: SeatStateReader;
+  /** Advisory content evidence (SeatActivityService.getContentChangedAtMs). Absent/null = no evidence = never suppress. */
+  contentChangedAtMs?: (session: string) => number | null;
   advisor?: string;
   now?: () => Date;
   /** Test seams; default to an unref'd setTimeout. */
@@ -59,8 +61,23 @@ export function startLeadCompletionNotice(deps: {
     ).get(seat, advisor, iso)
   );
 
+  // A stretch whose pane CONTENT last changed BEFORE the stretch began was repaint/timer chrome on a sampled seat,
+  // not work (real work changes the pane at/after its start). Only the notice is suppressed; seat state is untouched.
+  // No evidence (null), a first-ever observation, or a hook/self-report-decided seat never suppresses.
+  const CHROME_MARGIN_MS = 2_000;
+  const chromeOnly = (seat: string, sinceIso: string): boolean => {
+    try {
+      const at = deps.contentChangedAtMs?.(seat);
+      if (at === null || at === undefined) return false;
+      const st = deps.seatActivity.getSeatStateBySession(seat) as { decidedBy?: string | null } | null;
+      if (st?.decidedBy && st.decidedBy !== "window-sampling") return false;
+      return at < Date.parse(sinceIso) - CHROME_MARGIN_MS;
+    } catch { return false; }
+  };
+
   const emit = (seat: string, sinceIso: string): void => {
     if (disposed) return;
+    if (chromeOnly(seat, sinceIso)) return;
     // Debounce: one open notice per seat at a time.
     const open = deps.db.prepare(
       "SELECT 1 FROM queue_items WHERE state IN ('pending','in-progress','blocked') AND tags LIKE ? LIMIT 1",

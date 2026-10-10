@@ -1413,7 +1413,7 @@ describe("QueueRepository.listOpenObligations: the parked query's lean read", ()
     const ids = repo.list({ destinationSession: "b@r" }).map((r) => r.qitemId);
     repo.claim({ qitemId: ids[0]!, destinationSession: "b@r" });
     const want = repo.list({ destinationSession: "b@r", state: ["pending", "in-progress", "blocked"], limit: 500 })
-      .map((r) => ({ qitemId: r.qitemId, state: r.state, summary: r.summary ?? null }));
+      .map((r) => ({ qitemId: r.qitemId, state: r.state, summary: r.summary ?? null, blockedOn: r.blockedOn ?? null }));
     const prepare = vi.spyOn(db, "prepare");
     const got = repo.listOpenObligations("b@r", 500);
     expect(got).toEqual(want);

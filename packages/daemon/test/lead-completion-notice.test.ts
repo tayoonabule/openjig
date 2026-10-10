@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import Database from "better-sqlite3";
 import { startLeadCompletionNotice, RECHECK_MS } from "../src/domain/lead-completion-notice.js";
 
-function setup(opts: { reported?: boolean; workMs: number; blocked?: boolean; openNotice?: boolean }) {
+function setup(opts: { reported?: boolean; workMs: number; blocked?: boolean; openNotice?: boolean; contentChangedAtMs?: () => number | null; decidedBy?: string }) {
   const db = new Database(":memory:");
   db.exec("CREATE TABLE queue_items (source_session TEXT, destination_session TEXT, ts_created TEXT, state TEXT, summary TEXT, tags TEXT); CREATE TABLE outbox_entries (sender_session TEXT, destination_session TEXT, ts_dispatched TEXT);");
   let cb: (e: unknown) => void = () => {};
@@ -13,7 +13,8 @@ function setup(opts: { reported?: boolean; workMs: number; blocked?: boolean; op
     db, now: () => t,
     eventBus: { subscribe: (f: any) => { cb = f; return () => {}; } } as any,
     queueRepo: { create: async (i: any) => { created.push(i); return i; } } as any,
-    seatActivity: { getSeatStateBySession: () => ({ activity, seq: 1 }) },
+    seatActivity: { getSeatStateBySession: () => ({ activity, seq: 1, decidedBy: opts.decidedBy ?? "window-sampling" }) } as any,
+    contentChangedAtMs: opts.contentChangedAtMs,
   });
   const fire = (name: string) => cb({ type: "seat.activity_changed", sessionName: name });
   fire("main-lead@drewl-docs");
@@ -50,6 +51,19 @@ describe("lead completion notice", () => {
   });
   it("stays quiet when the lead already reported to the advisor", () => {
     expect(setup({ workMs: 300_000, reported: true })).toHaveLength(0);
+  });
+  const T0 = Date.parse("2026-10-10T00:00:00Z");
+  it("chrome-only stretch on a sampled seat (content last changed before the stretch) queues NO notice", () => {
+    expect(setup({ workMs: 300_000, contentChangedAtMs: () => T0 - 60_000 })).toHaveLength(0);
+  });
+  it("real content change during the stretch still queues the notice", () => {
+    expect(setup({ workMs: 300_000, contentChangedAtMs: () => T0 + 120_000 })).toHaveLength(1);
+  });
+  it("no content evidence (null) never suppresses", () => {
+    expect(setup({ workMs: 300_000, contentChangedAtMs: () => null })).toHaveLength(1);
+  });
+  it("hook/self-report-decided seat is never suppressed by content evidence", () => {
+    expect(setup({ workMs: 300_000, contentChangedAtMs: () => T0 - 60_000, decidedBy: "lifecycle-hooks" })).toHaveLength(1);
   });
   it("stays quiet for short work", () => {
     expect(setup({ workMs: 10_000 })).toHaveLength(0);

@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
-import type { TmuxAdapter } from "../adapters/tmux.js";
+import type { TmuxAdapter, PaneCapture } from "../adapters/tmux.js";
+import { createHash } from "node:crypto";
 import type { EventBus } from "./event-bus.js";
 import type { SeatActivity } from "./types.js";
 import type {
@@ -15,6 +16,13 @@ import type {
 import { COMMUNITY_HARNESS_RUNG_INVENTORY, COMMUNITY_RUNNER_RUNG_INVENTORY, EVIDENCE_RUNG_RANK, runtimeRungInventory } from "./activity-taxonomy.js";
 import { sessionCommunityHarnessSelect, sessionCommunityRunnerSelect } from "./session-registry.js";
 import { hookPrecedes } from "./agent-activity-store.js";
+
+/** Digit runs are normalised before hashing so countdown/clock/elapsed footers (e.g. "next task in 13h 20m") do not read as
+ *  change; any real text change (streamed output, new tool lines, a new prompt) still does.
+ *  Window ticks with byte-identical pane content for at least this long are repaint/timer chrome, not work.
+ *  Deliberately longer than the silence window so a slow-but-animating TUI never flips idle; a spinner or
+ *  streaming text changes the capture and resets it. */
+export const CONTENT_FROZEN_IDLE_SECONDS = 30;
 
 /** Default polling cadence: 1Hz. The default silence window is 3s, so
  *  1Hz polling gives at-most ~1s freshness lag on the cached observation. */
@@ -40,7 +48,7 @@ export const PERMISSION_REQUEST_GRACE_MS = 3_000;
  * ps/queue projection and never imports this service either.
  */
 export interface SeatActivityServiceDeps {
-  tmux: Pick<TmuxAdapter, "readPaneLastActivity"> & Partial<Pick<TmuxAdapter, "readAllSessionWindowActivity">>;
+  tmux: Pick<TmuxAdapter, "readPaneLastActivity"> & Partial<Pick<TmuxAdapter, "readAllSessionWindowActivity" | "capturePanesContent" | "capturePaneContent">>;
   defaultWindowSeconds: number;
   eventBus?: EventBus;
   now?: () => Date;
@@ -59,7 +67,7 @@ export interface PollSeatOptions {
 }
 
 export class SeatActivityService {
-  private readonly tmux: Pick<TmuxAdapter, "readPaneLastActivity"> & Partial<Pick<TmuxAdapter, "readAllSessionWindowActivity">>;
+  private readonly tmux: Pick<TmuxAdapter, "readPaneLastActivity"> & Partial<Pick<TmuxAdapter, "readAllSessionWindowActivity" | "capturePanesContent" | "capturePaneContent">>;
   private readonly defaultWindowSeconds: number;
   private readonly eventBus: EventBus | null;
   private readonly now: () => Date;
@@ -70,6 +78,11 @@ export class SeatActivityService {
   private sweeping = false;
   private readonly permissionPromptReader?: SeatActivityServiceDeps["permissionPromptReader"];
   private readonly permissionPromptChanged?: SeatActivityServiceDeps["permissionPromptChanged"];
+  // Content evidence for sampled seats: tmux's window_activity also advances on a TUI repaint/timer tick
+  // with NO transcript change, which read as endless "working". Per pane: hash of the last captured content
+  // and the epoch-ms it last CHANGED. An active-by-window reading with unchanged content for a full silence
+  // window is repaint chrome, so it reports idle. Capture failure/unavailable = the raw reading stands.
+  private readonly contentByPane = new Map<string, { hash: string; changedAtMs: number }>();
 
   private readonly selfReportReader: SeatActivityServiceDeps["selfReportReader"] | null;
 
@@ -108,7 +121,7 @@ export class SeatActivityService {
    *  one tmux spawn instead of one per seat. A seat missing from a batch that was read is not asked about by target:
    *  its session is gone, or its value is the same malformed one a per-target read returns, and tmux 3.2a (Ubuntu
    *  22.04's) exits its whole server when asked about a vanished target. Only with no batch is each seat read per target. */
-  private async observeSeat(paneId: string, opts: PollSeatOptions | undefined, batch: Map<string, number> | null): Promise<SeatActivity | null> {
+  private async observeSeat(paneId: string, opts: PollSeatOptions | undefined, batch: Map<string, number> | null, captures?: Map<string, PaneCapture> | null): Promise<SeatActivity | null> {
     const silenceWindowSeconds = opts?.silenceWindowSeconds ?? this.defaultWindowSeconds;
     let lastActivityEpochSeconds: number | null = batch?.get(paneId) ?? null;
     if (lastActivityEpochSeconds === null && batch === null) {
@@ -127,7 +140,32 @@ export class SeatActivityService {
     // Negative ageSeconds (clock skew) defensively reads as active too —
     // it means tmux reports activity in the (very near) future, which
     // happens when the daemon's monotonic clock lags briefly.
-    const isActiveWithinWindow = ageSeconds < silenceWindowSeconds;
+    let isActiveWithinWindow = ageSeconds < silenceWindowSeconds;
+    if (isActiveWithinWindow) {
+      let text: string | null = null;
+      try {
+        const cap = captures?.get(paneId);
+        if (cap) text = cap.text;
+        else if (!captures && this.tmux.capturePaneContent) text = await this.tmux.capturePaneContent(paneId, 40);
+      } catch { text = null; }
+      if (text === null) {
+        // no content evidence (unavailable/failed): keep the raw window reading, never invent idle
+        // (and forget the baseline so a later success cannot compare against a stale one)
+        this.contentByPane.delete(paneId);
+      } else {
+        const hash = createHash("sha1").update(text.replace(/\d+/g, "#")).digest("hex");
+        const nowMs = observedAt.getTime();
+        const prev = this.contentByPane.get(paneId);
+        if (!prev || prev.hash !== hash) {
+          this.contentByPane.set(paneId, { hash, changedAtMs: nowMs });
+        } else if ((nowMs - prev.changedAtMs) / 1000 >= Math.max(silenceWindowSeconds, CONTENT_FROZEN_IDLE_SECONDS)) {
+          isActiveWithinWindow = false; // window ticks, content frozen >= CONTENT_FROZEN_IDLE_SECONDS: repaint chrome
+        }
+      }
+    } else {
+      // genuinely silent: the next activity must be judged from a fresh baseline
+      this.contentByPane.delete(paneId);
+    }
 
     const record: SeatActivity = {
       paneId,
@@ -272,6 +310,7 @@ export class SeatActivityService {
    *  Keep the durable seat's state/seq so readers and waiters see it become unknown. */
   forgetSeat(paneId: string): void {
     this.latestByPaneId.delete(paneId);
+    this.contentByPane.delete(paneId);
     this.samplerSeqBySession.delete(paneId);
     const seatNodeId = this.sessionToSeat.get(paneId);
     this.sessionToSeat.delete(paneId);
@@ -352,10 +391,23 @@ export class SeatActivityService {
       if (tmuxRows.length > 0 && this.tmux.readAllSessionWindowActivity) {
         try { batch = await this.tmux.readAllSessionWindowActivity(); } catch { batch = null; }
       }
+      // Content evidence is read ONLY for seats whose window reading is active (one batched tmux call); a
+      // failed or unavailable batch is null and each active seat then reads per target, else raw stands.
+      let captures: Map<string, PaneCapture> | null | undefined = undefined;
+      if (batch && this.tmux.capturePanesContent) {
+        const nowSec = this.now().getTime() / 1000;
+        const activeTargets = tmuxRows.filter((r) => {
+          const t = batch!.get(r.session_name);
+          return t !== undefined && nowSec - t < this.defaultWindowSeconds;
+        }).map((r) => r.session_name);
+        if (activeTargets.length > 0) {
+          try { captures = await this.tmux.capturePanesContent(activeTargets, 40, this.now); } catch { captures = null; }
+        } else captures = new Map();
+      }
       // Best-effort: a single seat's failure does not crash the loop.
       await Promise.all(rows.map(async (r) => {
         try {
-          if (r.attachment_type === "tmux") await this.observeSeat(r.session_name, undefined, batch);
+          if (r.attachment_type === "tmux") await this.observeSeat(r.session_name, undefined, batch, captures ?? undefined);
           else await this.pollPermissionPrompt(r.session_name, false);
         } catch { /* swallow */ }
       }));

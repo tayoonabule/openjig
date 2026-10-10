@@ -1,5 +1,5 @@
 import { resolveNodeFile } from "./scope/node-file.js";
-import { belongsToProject } from "./workspace/project-catalog.js";
+import { belongsToProject, belongsToProjectMission } from "./workspace/project-catalog.js";
 import { inspectGraph } from "./workflow-reconciliation.js";
 import { createProofPolicyRead, readMissionReadiness, readProjectReadiness } from "./proof/judgments.js";
 import { lifecycleObligations, requiredLifecycleSteps } from "./lifecycle-obligations.js";
@@ -644,7 +644,7 @@ async function gitAncestor(exec: ExecutionViewDeps["exec"], repoCtx: string, sha
   }
 }
 
-export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { mission?: string; rig?: string; project?: string }): Promise<Record<string, unknown>> {
+export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { mission?: string; rig?: string; project?: string; projectRigs?: readonly string[] }): Promise<Record<string, unknown>> {
   const now = deps.now ?? (() => new Date());
   const exec = deps.exec ?? defaultExec;
   const buildInfo = deps.buildInfo ?? BUILD_INFO;
@@ -714,7 +714,9 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     )
     .all(...missionLikes.flatMap((like) => [like, like])) as QueueRowLite[];
 
-  const rows = candidateRows.filter(row => !opts?.project || belongsToProject(row.tags, opts.project));
+  // Rows here already bind to this mission. An untagged row belongs to the project
+  // when one of its seats is on a rig the catalog says this project claims.
+  const rows = candidateRows.filter(row => !opts?.project || belongsToProjectMission(row, opts.project, opts.projectRigs ?? []));
 
   const sliceOfRow = (r: QueueRowLite): string | null => {
     for (const t of parseTags(r.tags)) {
@@ -1159,7 +1161,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
   };
 
   return {
-    ...(opts?.project ? { project: opts.project, membership: "exact project:<id> queue tags and lifecycle identity; unscoped rows excluded" } : {}),
+    ...(opts?.project ? { project: opts.project, membership: "queue rows tagged project:<id>, or untagged mission rows whose seat is on a rig the catalog assigns this project; rows tagged for another project excluded; lifecycle identity exact" } : {}),
     view: "execution",
     readiness,
     project_readiness: missionsRoot ? readProjectReadiness(missionsRoot, readPolicy) : null,

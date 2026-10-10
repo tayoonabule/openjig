@@ -140,7 +140,7 @@ export class ViewProjector {
           "execution view deps are not wired on this daemon (setExecutionDeps was never called)",
         );
       }
-      return buildExecutionView(opts?.project ? { ...this.executionDeps, slicesRoot: () => opts.project!.missionsRoot } : this.executionDeps, { mission: opts?.mission, rig: opts?.rig, project: opts?.project?.id })
+      return buildExecutionView(opts?.project ? { ...this.executionDeps, slicesRoot: () => opts.project!.missionsRoot } : this.executionDeps, { mission: opts?.mission, rig: opts?.rig, project: opts?.project?.id, projectRigs: opts?.project?.rigs })
         .then(doc => ({ viewName: "execution", generatedAt: this.now().toISOString(), rows: [doc], rowCount: 1 }));
     }
     if ((BUILT_IN_VIEW_NAMES as readonly string[]).includes(viewName)) {

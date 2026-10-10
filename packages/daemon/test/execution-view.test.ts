@@ -691,6 +691,30 @@ describe("execution view — S27 (OPR.0.5.6.27)", () => {
     expect(result.rows[0].sources.build_info.basis).toContain("OpenRig daemon");
   });
 
+  it("project read keeps mission-only rows from the project's claimed rigs and drops others", async () => {
+    // Production shape: seat handoffs carry mission:/slice: tags and no project: tag.
+    // A project-scoped read used to drop every one of them, so cards showed no work.
+    const deps = { db, slicesRoot: () => missionsRoot, rigsRoot: () => rigsRoot };
+    const baseline = await buildExecutionView(deps, { mission: MISSION });
+    const work = (doc: Record<string, unknown>, id: string) =>
+      ((doc.q2_sequencing as Record<string, unknown>[]).find(s => s.slice_id === id)!.work_rows as unknown[]).length;
+    expect(work(baseline, "OPR.9.9.31")).toBeGreaterThan(0);
+
+    const claimed = await buildExecutionView(deps, { mission: MISSION, project: "demo", projectRigs: ["exec-fixture"] });
+    expect(work(claimed, "OPR.9.9.31")).toBe(work(baseline, "OPR.9.9.31"));
+    expect((claimed.q1_lanes as unknown[]).length).toBe((baseline.q1_lanes as unknown[]).length);
+
+    const unclaimed = await buildExecutionView(deps, { mission: MISSION, project: "demo", projectRigs: ["some-other-rig"] });
+    expect(work(unclaimed, "OPR.9.9.31")).toBe(0);
+
+    const row = db.prepare("SELECT tags FROM queue_items WHERE qitem_id = 'qitem-lane-31'").get() as { tags: string };
+    db.prepare("UPDATE queue_items SET tags = ? WHERE qitem_id = 'qitem-lane-31'")
+      .run(JSON.stringify([...JSON.parse(row.tags), "project:other"]));
+    const other = await buildExecutionView(deps, { mission: MISSION, project: "demo", projectRigs: ["exec-fixture"] });
+    expect(work(other, "OPR.9.9.31")).toBe(0);
+    expect(other.membership).toContain("rows tagged for another project excluded");
+  });
+
   it("uses project-local review drops without joining unbound global artifacts", async () => {
     for (const row of db.prepare("SELECT qitem_id, tags FROM queue_items").all() as {qitem_id: string; tags: string}[]) {
       const tags = JSON.parse(row.tags) as string[];

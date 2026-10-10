@@ -3,9 +3,11 @@ import * as path from "node:path";
 import { parse, YAMLParseError } from "yaml";
 import type { SettingsStore } from "../user-settings/settings-store.js";
 import { NODE_FILE_PRECEDENCE } from "../scope/node-file.js";
-import { readProjectCatalog, selectCatalogProject, yamlObject, ProjectReadError } from "./project-catalog.js";
+import { catalogProjectRigs, readProjectCatalog, selectCatalogProject, yamlObject, ProjectReadError } from "./project-catalog.js";
 
-export interface ProjectRead { id: string; root: string; name: string; sourcePath: string | null; missionsRoot: string; error?: string }
+export interface ProjectRead { id: string; root: string; name: string; sourcePath: string | null; missionsRoot: string; error?: string;
+  /** Rigs the catalog entry claims (`projects[].rigs`); mission-only queue rows from these rigs belong to the project. */
+  rigs?: string[] }
 type ReadContext = { get: (key: never) => unknown; req: { query: (key: string) => string | undefined } };
 export function projectCatalogPaths(c: Pick<ReadContext, "get">) {
   const store = c.get("settingsStore" as never) as SettingsStore | undefined;
@@ -78,7 +80,7 @@ export function selectedProject(c: ReadContext): ProjectRead | null {
   if (c.req.query("projectRoot") && c.req.query("projectRoot") !== p.root) throw new ProjectReadError("project_changed", `Project ${id} root changed; choose it again`);
   if (p.error) throw new ProjectReadError("project_unavailable", `${id}: ${p.error}`);
   if (!fs.existsSync(p.missionsRoot)) throw new ProjectReadError("missions_unavailable", `${id}: missions root is unavailable: ${p.missionsRoot}`);
-  return p;
+  return selected ? { ...p, rigs: catalogProjectRigs(catalog, selected.id) } : p;
 }
 export function projectReadResponse(err: unknown): Response {
   return Response.json({ error: err instanceof ProjectReadError ? err.code : "project_source_unavailable", message: (err as Error).message }, { status: 409 });

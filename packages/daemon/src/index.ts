@@ -8,6 +8,7 @@ import { resolveDaemonDbPath } from "./daemon-db-path.js";
 import { createDaemon } from "./startup.js";
 import { resolveBindPlan } from "./domain/bind-plan.js";
 import { runQueueRetentionSweep, RETENTION_DEFAULTS } from "./domain/queue-retention.js";
+import { startLeadCompletionNotice } from "./domain/lead-completion-notice.js";
 import {
   createStuckSweepStatus,
   resolveSessionNodeId,
@@ -319,6 +320,7 @@ export async function startServer(port?: number) {
   let monitorsStarted = false;
   let retentionTimer: ReturnType<typeof setInterval> | null = null;
   let stuckSweepTimer: ReturnType<typeof setInterval> | null = null;
+  let stopLeadNotice: (() => void) | null = null;
   let wakeLadderScheduler: WakeLadderScheduler | null = null;
   // P7 — lifecycle heartbeat: advance last-seen every tick while running.
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -356,6 +358,10 @@ export async function startServer(port?: number) {
         retentionTimer = startQueueRetentionScheduler(deps);
         // S02 — the standing stuck sweep: nobody has to remember to run the verbs.
         stuckSweepTimer = startStuckSweepScheduler(deps);
+        // A lead that goes idle after real work without reporting gets an automatic notice queued to the advisor.
+        if (deps.queueRepo && deps.seatActivityService && deps.eventBus) {
+          stopLeadNotice = startLeadCompletionNotice({ db: deps.rigRepo.db, eventBus: deps.eventBus, queueRepo: deps.queueRepo, seatActivity: deps.seatActivityService });
+        }
         // S01 — wake-or-escalate on batons: a failed baton wake retries on schedule,
         // then escalates through recorded rungs; never a silent park.
         wakeLadderScheduler = startWakeLadderScheduler(deps);
@@ -387,6 +393,7 @@ export async function startServer(port?: number) {
         if (heartbeatTimer) clearInterval(heartbeatTimer);
         if (retentionTimer) clearInterval(retentionTimer);
         if (stuckSweepTimer) clearInterval(stuckSweepTimer);
+        if (stopLeadNotice) stopLeadNotice();
       }],
       ["proof-source-watch", () => deps.proofSourceWatch?.close()],
       ["health-diagnosis", () => deps.healthDiagnosis?.stop()],

@@ -1308,6 +1308,19 @@ describe("execution view — S27 (OPR.0.5.6.27)", () => {
     }
   });
 
+  it("worked_by: every bound row (open or closed) rolls up per seat, newest first", async () => {
+    db.prepare(
+      `INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, tier, tags, body, blocked_on)
+       VALUES ('qitem-wb-old', '2026-08-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z', 'lead@exec-fixture', 'qa-x@exec-fixture', 'done', 'normal', 'light', ?, 'old qa', NULL)`,
+    ).run(JSON.stringify([`mission:${MISSION}`, "slice:OPR.9.9.33"]));
+    const doc = await show();
+    const s33 = (doc.q2_sequencing as Record<string, unknown>[]).find((s) => s.slice_id === "OPR.9.9.33")!;
+    const wb = s33.worked_by as Array<{ seat: string; rows: number; done: number }>;
+    const qa = wb.find((w) => w.seat === "qa-x@exec-fixture")!;
+    expect(qa).toMatchObject({ rows: 1, done: 1 });
+    expect(wb[wb.length - 1]!.seat).toBe("qa-x@exec-fixture");
+  });
+
   it("trust stamps: derived_at + per-source asof on the response; every lane and sequencing cell carries its source id", async () => {
     const doc = await show();
     expect(typeof doc.derived_at).toBe("string");

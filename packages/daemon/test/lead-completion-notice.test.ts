@@ -168,7 +168,7 @@ function restart(opts: { nowAt: string; seatState?: string | null; events: Array
   });
   return {
     created, timers,
-    advance: (ms: number) => { const tgt = t.getTime() + ms; for (const h of timers.filter((x) => !x.dead).sort((a, b) => a.at - b.at)) if (h.at <= tgt) { t = new Date(h.at); h.dead = true; h.fn(); } t = new Date(tgt); },
+    advance: (ms: number) => { const tgt = t.getTime() + ms; for (;;) { const h = timers.filter((x) => !x.dead && x.at <= tgt).sort((a, b) => a.at - b.at)[0]; if (!h) break; t = new Date(h.at); h.dead = true; h.fn(); } t = new Date(tgt); },
     working: () => { state = "working"; cb({ type: "seat.activity_changed", sessionName: SEAT }); },
     dueInMs: () => (timers.filter((x) => !x.dead)[0]?.at ?? NaN) - t.getTime(),
   };
@@ -286,5 +286,38 @@ describe("lead completion notice: duplicate observations cannot hide the final t
     ];
     const r = restart({ nowAt: "2026-10-10T04:10:00Z", events: events as any, reports: ["2026-10-10T04:02:00Z"] });
     expect(r.dueInMs()).toBe(RECHECK_MS - 3 * MIN);
+  });
+});
+
+describe("lead completion notice: reviewer findings (startup vs live parity)", () => {
+  it("null seat state when a recovered recheck is due (oracle not hydrated): waits, does not fire on unknown, then fires on persisted evidence", async () => {
+    const r = restart({ nowAt: "2026-10-10T04:10:00Z", events: EV, reports: ["2026-10-10T04:02:00Z"], seatState: null });
+    r.advance(RECHECK_MS - 3 * MIN); await Promise.resolve();      // due: state still null
+    expect(r.created).toHaveLength(0);
+    r.advance(60_000); await Promise.resolve();                    // still null, retrying
+    expect(r.created).toHaveLength(0);
+    r.advance(5 * 60_000); await Promise.resolve();                // retries exhausted: persisted idle evidence stands
+    expect(r.created).toHaveLength(1);
+  });
+  it("null state at due time that hydrates to WORKING: no notice", async () => {
+    const r = restart({ nowAt: "2026-10-10T04:10:00Z", events: EV, reports: ["2026-10-10T04:02:00Z"], seatState: null });
+    r.advance(RECHECK_MS - 3 * MIN); await Promise.resolve();
+    r.working();                                                    // hydrates as working: cancels the retry
+    r.advance(10 * 60_000); await Promise.resolve();
+    expect(r.created).toHaveLength(0);
+  });
+  it("last persisted state RUNNING at startup (in-flight stretch): the later live idle is judged with the true start, not ignored", async () => {
+    const SEAT = "main-lead@provineer";
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE queue_items (source_session TEXT, destination_session TEXT, ts_created TEXT, state TEXT, summary TEXT, tags TEXT); CREATE TABLE outbox_entries (sender_session TEXT, destination_session TEXT, ts_dispatched TEXT); CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, created_at TEXT, payload TEXT);");
+    db.prepare("INSERT INTO events (type, created_at, payload) VALUES ('agent.activity', '2026-10-10 04:00:00', ?)").run(JSON.stringify({ sessionName: SEAT, activity: { state: "running" } }));
+    let t = new Date("2026-10-10T04:01:00Z"); let activity = "working"; let cb: (e: unknown) => void = () => {}; const created: any[] = [];
+    startLeadCompletionNotice({ db, now: () => t, eventBus: { subscribe: (f: any) => { cb = f; return () => {}; } } as any,
+      queueRepo: { create: async (i: any) => { created.push(i); return i; } } as any,
+      seatActivity: { getSeatStateBySession: () => ({ activity, seq: 1 }) }, schedule: () => 1, cancel: () => {} });
+    t = new Date("2026-10-10T04:05:00Z"); activity = "idle-at-prompt"; cb({ type: "seat.activity_changed", sessionName: SEAT });
+    await Promise.resolve();
+    expect(created).toHaveLength(1);                                // 5 min stretch from the persisted start, no report
+    expect(created[0].body).toContain("2026-10-10T04:00:00.000Z");
   });
 });

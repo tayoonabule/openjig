@@ -20,6 +20,9 @@ export const RECHECK_MS = 600_000;
 // Startup recovery pages back through each lead's persisted activity events in pages of this size; it is
 // bounded by logical state runs (final two stretches), never by wall-clock or a fixed event count.
 const RECOVERY_PAGE = 200;
+// After a restart the seat-state oracle may not be hydrated when a recovered recheck is due: retry briefly, then fall back to the persisted idle evidence.
+const RECOVERY_HYDRATION_RETRIES = 4;
+const RECOVERY_HYDRATION_RETRY_MS = 30_000;
 
 interface SeatStateReader { getSeatStateBySession(name: string): { activity: string; seq: number } | null }
 
@@ -137,7 +140,8 @@ export function startLeadCompletionNotice(deps: {
       }
       for (const [seat, list] of bySeat) {
         const cur = list[list.length - 1];
-        if (!cur || !cur.end) continue;                                   // working now / unknown: live events decide
+        if (!cur) continue;
+        if (!cur.end) { if (!workingSince.has(seat)) workingSince.set(seat, cur.start); const p0 = list[list.length - 2]; if (p0 && p0.end) prevStretch.set(seat, { start: p0.start, end: p0.end }); continue; } // in flight: the live idle event decides, with the true start
         const prev = list[list.length - 2];
         prevStretch.set(seat, prev && prev.end ? { start: prev.start, end: prev.end } : { start: cur.start, end: cur.end });
         if (cur.end.getTime() - cur.start.getTime() < MIN_WORK_MS) continue;
@@ -145,15 +149,19 @@ export function startLeadCompletionNotice(deps: {
         if (reportedSince(seat, sinceIso)) continue;
         if (!(prev && prev.end && cur.start.getTime() - prev.end.getTime() < RECHECK_MS && reportedSince(seat, prev.start.toISOString()))) continue; // non-continuations already notified live
         const dueIn = Math.max(0, cur.end.getTime() + RECHECK_MS - nowMs);   // original deadline, never extended
+        const arm = (attempt: number, ms: number): void => {
         deferred.set(seat, schedule(() => {
           deferred.delete(seat);
           try {
             const st = deps.seatActivity.getSeatStateBySession(seat);
+            if (!st && attempt < RECOVERY_HYDRATION_RETRIES) { arm(attempt + 1, RECOVERY_HYDRATION_RETRY_MS); return; } // oracle not hydrated yet
             if (st && st.activity !== "idle-at-prompt") return;           // working again
             if (reportedSince(seat, sinceIso)) return;
-            emit(seat, sinceIso);
+            emit(seat, sinceIso);                                         // still no state after retries: persisted idle evidence stands
           } catch { /* never crash the daemon */ }
-        }, dueIn));
+        }, ms));
+        };
+        arm(0, dueIn);
       }
     } catch { /* never crash the daemon */ }
   };

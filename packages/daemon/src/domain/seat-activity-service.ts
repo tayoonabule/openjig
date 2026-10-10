@@ -112,7 +112,11 @@ export class SeatActivityService {
         lastActivityEpochSeconds = null;
       }
     }
-    if (lastActivityEpochSeconds === null) return null;
+    if (lastActivityEpochSeconds === null) {
+      // no timestamp: any content baseline is now stale; recovery must not compare against it
+      this.contentByPane.delete(paneId);
+      return null;
+    }
 
     const observedAt = this.now();
     const ageSeconds = observedAt.getTime() / 1000 - lastActivityEpochSeconds;
@@ -126,7 +130,8 @@ export class SeatActivityService {
       try {
         const cap = captures?.get(paneId);
         if (cap) text = cap.text;
-        else if (!captures && this.tmux.capturePaneContent) text = await this.tmux.capturePaneContent(paneId, 40);
+        // no batch, or this target omitted from a partial batch (its capture failed): read it per target
+        else if (this.tmux.capturePaneContent) text = await this.tmux.capturePaneContent(paneId, 40);
       } catch { text = null; }
       if (text === null) {
         // no content evidence (unavailable/failed): keep the raw window reading, never invent idle

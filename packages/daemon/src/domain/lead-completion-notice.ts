@@ -48,6 +48,7 @@ export function startLeadCompletionNotice(deps: {
   const workingSince = new Map<string, Date>();
   const prevStretch = new Map<string, { start: Date; end: Date }>();
   const deferred = new Map<string, unknown>();
+  let disposed = false;
 
   const reportedSince = (seat: string, iso: string): boolean => !!(
     deps.db.prepare(
@@ -59,6 +60,7 @@ export function startLeadCompletionNotice(deps: {
   );
 
   const emit = (seat: string, sinceIso: string): void => {
+    if (disposed) return;
     // Debounce: one open notice per seat at a time.
     const open = deps.db.prepare(
       "SELECT 1 FROM queue_items WHERE state IN ('pending','in-progress','blocked') AND tags LIKE ? LIMIT 1",
@@ -153,6 +155,7 @@ export function startLeadCompletionNotice(deps: {
         deferred.set(seat, schedule(() => {
           deferred.delete(seat);
           try {
+            if (disposed) return;
             const st = deps.seatActivity.getSeatStateBySession(seat);
             if (!st && attempt < RECOVERY_HYDRATION_RETRIES) { arm(attempt + 1, RECOVERY_HYDRATION_RETRY_MS); return; } // oracle not hydrated yet
             if (st && st.activity !== "idle-at-prompt") return;           // working again
@@ -167,7 +170,7 @@ export function startLeadCompletionNotice(deps: {
   };
   recover();
 
-  return deps.eventBus.subscribe((event) => {
+  const unsubscribe = deps.eventBus.subscribe((event) => {
     const e = event as unknown as { type?: string; sessionName?: string };
     const seat = e.sessionName;
     if (e.type !== "seat.activity_changed" || !seat || !seat.startsWith("main-lead@") || seat === advisor) return;
@@ -208,4 +211,12 @@ export function startLeadCompletionNotice(deps: {
       emit(seat, sinceIso);
     } catch { /* never crash the daemon */ }
   });
+
+  // Dispose: unsubscribe AND cancel every pending deferred/recovery timer; a disposed notice never queries or creates.
+  return () => {
+    disposed = true;
+    for (const h of deferred.values()) { try { cancel(h); } catch { /* ignore */ } }
+    deferred.clear();
+    unsubscribe();
+  };
 }

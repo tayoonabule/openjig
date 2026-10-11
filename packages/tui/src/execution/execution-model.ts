@@ -691,6 +691,26 @@ function touchedRows(detail: SliceDetailSnap | null, width: number, timeZone = D
   ];
 }
 
+/** Actors derived from the bound queue rows when the per-slice event history is not served. */
+function workedByRows(slice: SliceFacts, width: number): ContentLine[] {
+  return [
+    ...slice.workedBy.slice(0, 5).flatMap(w => wrappedCardField("actor", `${w.seat} · ${w.rows} row${w.rows === 1 ? "" : "s"}, ${w.done} done · last ${w.last_at}`, width)),
+    cardField("history", `${slice.workedBy.length} seat${slice.workedBy.length === 1 ? "" : "s"} from bound queue rows`),
+  ];
+}
+
+/** The lead's status.yaml items for this slice: state, review, QA, candidate hash and branch. */
+function leadRecordRows(slice: SliceFacts, width: number): ContentLine[] {
+  const summary = recordSummary(slice.records);
+  const rows: ContentLine[] = summary ? [cardField("summary", `${recordWord(slice.records) ?? "no state"} · ${summary}`)] : [];
+  for (const r of slice.records) {
+    rows.push(...wrappedCardField(`item ${r.id}`, `${r.state} · ${r.title}`, width));
+    rows.push(...wrappedCardField("  review", `review ${r.review ?? "none"} · QA ${r.qa ?? "none"}`, width));
+    if (r.hash || r.branch) rows.push(cardField("  built", `${r.hash ? r.hash.slice(0, 12) : "no hash"}${r.branch ? ` · ${r.branch}` : ""}`));
+  }
+  return rows;
+}
+
 function rulingRows(detail: SliceDetailSnap | null, width: number, timeZone = DEFAULT_TIME_ZONE): ContentLine[] {
   if (!detail) return [cardField("served data", "slice detail not loaded for this selection")];
   const latest = [...detail.decisions.rows].sort((a, b) => b.ts.localeCompare(a.ts))[0];
@@ -722,11 +742,17 @@ function sliceDetail(
     const candidateDeps = candidate.sequencing?.["depends_on"];
     return Array.isArray(candidateDeps) && candidateDeps.map(String).includes(slice.id);
   }).map((candidate) => candidate.id);
-  const ownership: ContentLine[] = [
+  const ownership: ContentLine[] = slice.lane || !slice.workedBy.length ? [
     cardField("seat", slice.lane ? str(slice.lane["seat"]) : "none — no claimed lane", slice.lane ? open(laneKey(slice.lane)) : undefined),
     cardField("activity", slice.lane ? str(activity["activity"], INDETERMINATE) : "not assigned"),
     cardField("decided by", slice.lane ? str(activity["decided_by"] ?? activity["basis"], "basis unavailable") : "—"),
     cardField("changed", slice.lane ? str(activity["changed_at"], "—") : "—"),
+  ] : [
+    // No open lane, but bound queue rows (open or closed) show who actually carried the slice.
+    cardField("seat", "none open — no claimed lane"),
+    ...wrappedCardField("worked by", slice.workedBy.map(w => `${w.seat} (${w.done}/${w.rows} rows done)`).join(", "), width),
+    cardField("decided by", "bound queue rows (all states)"),
+    cardField("changed", slice.workedBy[0]!.last_at),
   ];
   const evidence: ContentLine[] = [];
   for (const rung of RUNGS) {
@@ -775,9 +801,10 @@ function sliceDetail(
   return [
     ...identity,
     { text: "" }, ...card("OWNERSHIP", ownership, width),
-    { text: "" }, ...card("TOUCHED", touchedRows(detail, width, timeZone), width),
+    { text: "" }, ...card("TOUCHED", detail || !slice.workedBy.length ? touchedRows(detail, width, timeZone) : workedByRows(slice, width), width),
+    ...(slice.records.length ? [{ text: "" }, ...card("LEAD RECORD · status.yaml", leadRecordRows(slice, width), width)] : []),
     { text: "" }, ...proofProvenanceLines(slice.readiness, width),
-    { text: "" }, ...card(`${slice.readiness?.configured ? "CODE LINEAGE" : "EVIDENCE"} · declared ${declaredText(slice)} · ${evidenceText(slice.cells, slice.rank)}`, evidence, width),
+    { text: "" }, ...card(`${slice.readiness?.configured ? "CODE LINEAGE" : "EVIDENCE"} · declared ${declaredText(slice)} · ${slice.rank === 0 && slice.records.length ? `lead record: ${recordWord(slice.records) ?? "no state"}; daemon candidate tags not recorded` : evidenceText(slice.cells, slice.rank)}`, evidence, width),
     { text: "" }, ...card("RULING", rulingRows(detail, width, timeZone), width),
     { text: "" }, ...card("NEEDS YOU", [cardField("state", needs ?? "none on current projection")], width),
     ...wrapDetailLines([

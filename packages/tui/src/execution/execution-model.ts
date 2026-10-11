@@ -178,21 +178,21 @@ const RECORD_WORD: Record<string, string> = {
   ongoing: "ongoing gates", "design-only": "design only", "not-started": "not started", accepted: "accepted",
 };
 function recordWord(records: readonly MissionStatusItemSnap[]): string | null {
-  const live = records.filter(r => r.state !== "excluded");
+  const live = records.filter(r => r.state !== "excluded" && r.state !== "deferred" && r.state !== "folded");
   if (!live.length) return null;
   if (live.every(r => r.state === "accepted")) return "accepted";
   const lead = RECORD_ORDER.find(state => live.some(r => r.state === state));
   return lead ? RECORD_WORD[lead]! : null;
 }
 function recordSummary(records: readonly MissionStatusItemSnap[]): string | null {
-  const live = records.filter(r => r.state !== "excluded");
+  const live = records.filter(r => r.state !== "excluded" && r.state !== "deferred" && r.state !== "folded");
   if (!live.length) return null;
   const accepted = live.filter(r => r.state === "accepted").length;
   const built = live.filter(r => r.state === "merged-incomplete" || r.state === "built-awaiting-gates").length;
   return `${accepted}/${live.length} accepted${built ? ` · ${built} built` : ""}`;
 }
 function qaSummary(records: readonly MissionStatusItemSnap[]): string | null {
-  const live = records.filter(r => r.state !== "excluded");
+  const live = records.filter(r => r.state !== "excluded" && r.state !== "deferred" && r.state !== "folded");
   if (!live.length) return null;
   const word = (v: string | null) => (v ?? "none").split(/[\s(]/)[0]!.toLowerCase();
   const passed = live.filter(r => word(r.qa) === "pass").length;

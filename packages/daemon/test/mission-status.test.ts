@@ -44,16 +44,16 @@ items:
     fs.utimesSync(path.join(dir, "status.yaml"), (NOW - MISSION_STATUS_STALE_MS - 60_000) / 1000, (NOW - MISSION_STATUS_STALE_MS - 60_000) / 1000);
     expect(readMissionStatus(dir, NOW)!.stale).toBe(true);
   });
-  it("freshness: mixed age, fresh mtime but stale authored updated_at is STALE (older of the two)", () => {
+  it("freshness: fresh mtime with old authored updated_at is NOT stale (freshest of the two)", () => {
     write(`updated_at: 2026-10-09T01:00:00Z\nitems:\n  - {id: a, title: A, state: not-started}\n`);
     fs.utimesSync(path.join(dir, "status.yaml"), NOW / 1000, NOW / 1000);
-    expect(readMissionStatus(dir, NOW)!.stale).toBe(true);
+    expect(readMissionStatus(dir, NOW)!.stale).toBe(false);
   });
-  it("freshness: mixed age, fresh updated_at but stale mtime is STALE (older of the two)", () => {
+  it("freshness: fresh updated_at with old mtime is NOT stale (freshest of the two)", () => {
     write(`updated_at: 2026-10-10T07:59:00Z\nitems:\n  - {id: a, title: A, state: not-started}\n`);
     const old = (NOW - MISSION_STATUS_STALE_MS - 60_000) / 1000;
     fs.utimesSync(path.join(dir, "status.yaml"), old, old);
-    expect(readMissionStatus(dir, NOW)!.stale).toBe(true);
+    expect(readMissionStatus(dir, NOW)!.stale).toBe(false);
   });
   it("containment: a status.yaml symlink escaping the root is refused; an in-root one is read", () => {
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "mstatus-out-"));
@@ -81,5 +81,34 @@ items:
     write(`updated_at: 2026-10-10T07:59:00Z\nitems:\n  - {id: a, title: A, state: built-awaiting-gates, hash: 34e7702, review: approve, qa: pending}\n  - {id: b, title: B, state: not-started, hash: 1234567}\n`);
     const s = readMissionStatus(dir, NOW)!;
     expect(s.items[0]!.hash).toBe("34e7702"); expect(s.items[1]!.hash).toBe("1234567"); expect(s.items[1]!.id).toBe("b");
+  });
+
+  it("accepted: review approve + (accepted_evidence OR qa starting pass/ACCEPTED) counts; bare accepted is refused", () => {
+    write(`updated_at: 2026-10-10T07:59:00Z
+items:
+  - {id: a, title: A, state: accepted, review: approve, qa: "ACCEPTED 11:06Z (see accepted_evidence)", accepted_evidence: "ACCEPTED by lead on exact hash"}
+  - {id: b, title: B, state: accepted, review: approve, qa: "pass-partial (39/39 on 0f981dc)"}
+  - {id: c, title: C, state: accepted, review: approve, qa: "see notes", accepted_evidence: "lead ruling 04:37Z"}
+  - {id: d, title: D, state: accepted, review: approve, qa: pending}
+  - {id: e, title: E, state: accepted, review: none, qa: pass, accepted_evidence: "x"}
+`);
+    const s = readMissionStatus(dir, NOW)!;
+    expect(s.accepted).toBe(3);
+    expect(s.issues.join(" ")).toMatch(/item d: marked accepted without/);
+    expect(s.issues.join(" ")).toMatch(/item e: marked accepted without/);
+  });
+  it("deferred and folded-into-* are valid buckets, not not-started, and keep the total", () => {
+    write(`updated_at: 2026-10-10T07:59:00Z
+items:
+  - {id: a, title: A, state: not-started}
+  - {id: b, title: B, state: deferred}
+  - {id: c, title: C, state: deferred}
+  - {id: d, title: D, state: folded-into-24}
+`);
+    const s = readMissionStatus(dir, NOW)!;
+    expect(s.total).toBe(4);
+    expect(s.counts["not-started"]).toBe(1); expect(s.counts["deferred"]).toBe(2); expect(s.counts["folded"]).toBe(1);
+    expect(s.issues).toEqual([]);
+    expect(s.items.find(i => i.id === "d")).toMatchObject({ state: "folded", foldedInto: "24" });
   });
 });

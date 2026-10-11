@@ -70,20 +70,26 @@ export function statusAge(ms: number | null): string {
 
 /** One-line glance. Counts only: never a percentage, never registered/scoped as implemented. */
 export function missionStatusHeadline(st: MissionStatusSnap): string {
-  return `${st.accepted} of ${st.total} accepted${st.stale ? " · STALE" : ""}`;
+  return `${st.accepted} of ${st.total} accepted${deferredFoldedText(st)}${st.stale ? " · STALE" : ""}`;
+}
+
+function deferredFoldedText(st: MissionStatusSnap): string {
+  const d = st.counts["deferred"] ?? 0, f = st.counts["folded"] ?? 0;
+  return `${d ? ` · ${d} deferred` : ""}${f ? ` · ${f} folded` : ""}`;
 }
 
 const STATUS_ROWS: Array<[key: string, label: string, token: Token]> = [
   ["accepted", "accepted", "ok"], ["in-progress", "in progress", "accent"], ["built-awaiting-gates", "built, awaiting review/QA", "warn"],
   ["merged-incomplete", "merged, outcome incomplete", "warn"], ["design-only", "design only (nothing built)", "dim"], ["not-started", "not started", "dim"], ["ongoing", "ongoing gates", "info"],
+  ["deferred", "deferred", "dim"], ["folded", "folded into another item", "dim"],
 ];
 
 /** The operator at-a-glance block for a mission with a status.yaml record. */
 export function missionStatusLines(st: MissionStatusSnap | null | undefined, width: number): ContentLine[] {
   if (!st) return [];
   const lines: ContentLine[] = [rule("STATUS", width)];
-  lines.push(semantic([{ text: "  " }, { text: `${st.accepted} of ${st.total} accepted`, token: st.accepted === st.total && st.total > 0 ? "ok" : "bright", bold: true },
-    { text: "  · accepted = reviewer approve + exact-hash QA in a real browser · no percentage", token: "dim" }], width));
+  lines.push(semantic([{ text: "  " }, { text: `${st.accepted} of ${st.total} accepted${deferredFoldedText(st)}`, token: st.accepted === st.total && st.total > 0 ? "ok" : "bright", bold: true },
+    { text: "  · accepted = reviewer approve + lead acceptance evidence or passing QA · no percentage", token: "dim" }], width));
   for (const [key, label, token] of STATUS_ROWS) {
     const n = st.counts[key] ?? 0;
     if (n === 0 && key !== "accepted") continue;

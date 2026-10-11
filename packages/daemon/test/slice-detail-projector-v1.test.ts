@@ -23,6 +23,7 @@ import { eventsSchema } from "../src/db/migrations/003_events.js";
 import { streamItemsSchema } from "../src/db/migrations/023_stream_items.js";
 import { queueItemsSchema } from "../src/db/migrations/024_queue_items.js";
 import { queueTransitionsSchema } from "../src/db/migrations/025_queue_transitions.js";
+import { queueItemSummarySchema } from "../src/db/migrations/044_queue_item_summary.js";
 import { workflowSpecsSchema } from "../src/db/migrations/033_workflow_specs.js";
 import { workflowInstancesSchema } from "../src/db/migrations/034_workflow_instances.js";
 import { workflowStepTrailsSchema } from "../src/db/migrations/035_workflow_step_trails.js";
@@ -514,5 +515,17 @@ describe("qitem-render-driver B — projector acceptance rows share the composer
     const acceptance = projector.project(slice).acceptance;
     const ticked = acceptance.items.find((i) => i.text === "the ticked promise")!;
     expect(ticked.done).toBe(true);
+  });
+});
+
+describe("decisions from lead-bound queue rows", () => {
+  it("surfaces a closed qitem addressed to a lead seat as a ruling", () => {
+    const db = createDb();
+    migrate(db, [coreSchema, eventsSchema, queueItemsSchema, queueItemSummarySchema, queueTransitionsSchema, missionControlActionsSchema]);
+    db.prepare(`INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, tags, body, closure_reason, summary)
+      VALUES ('qd','2026-10-10T10:00:00Z','2026-10-10T10:05:00Z','impl@r','main-lead@r','done','normal','[]','b','no-follow-on','Decision needed: X')`).run();
+    const rows = new (SliceDetailProjector as any)({ db, indexer: {} }).buildDecisions({ qitemIds: ["qd"] });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ actor: "main-lead@r", qitemId: "qd", reason: "Decision needed: X" });
   });
 });

@@ -781,6 +781,8 @@ function sliceDetail(
     const value = rung === "built" ? (cell.state === "yes" ? shortSha(cell.value) : "undetermined") : cell.state;
     evidence.push(...wrappedCardField(rung === "adopted" && cell.state === "N/A" ? "daemon live" : RUNG_WORD[rung], `${value} · ${cell.basis}`, width));
   }
+  const proofCell = record(slice.ladder["proof"]);
+  if (typeof proofCell["total"] === "number") evidence.push(cardField("PROOF", `${str(proofCell["accepted"], "0")}/${str(proofCell["total"], "0")} accepted · ${str(proofCell["basis"], "status.yaml")}`));
   const legs = record(slice.ladder["reviewed"])["legs"];
   if (Array.isArray(legs)) for (const leg of legs) {
     const l = record(leg);

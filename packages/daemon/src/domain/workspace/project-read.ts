@@ -3,11 +3,13 @@ import * as path from "node:path";
 import { parse, YAMLParseError } from "yaml";
 import type { SettingsStore } from "../user-settings/settings-store.js";
 import { NODE_FILE_PRECEDENCE } from "../scope/node-file.js";
-import { catalogProjectRigs, readProjectCatalog, selectCatalogProject, yamlObject, ProjectReadError } from "./project-catalog.js";
+import { catalogProjectRigs, catalogProjectRepos, readProjectCatalog, selectCatalogProject, yamlObject, ProjectReadError } from "./project-catalog.js";
 
 export interface ProjectRead { id: string; root: string; name: string; sourcePath: string | null; missionsRoot: string; error?: string;
   /** Rigs the catalog entry claims (`projects[].rigs`); mission-only queue rows from these rigs belong to the project. */
-  rigs?: string[] }
+  rigs?: string[];
+  /** Git repos the project is bound to: catalog `repos`, else child directories of the root that are git repos. */
+  repos?: string[] }
 type ReadContext = { get: (key: never) => unknown; req: { query: (key: string) => string | undefined } };
 export function projectCatalogPaths(c: Pick<ReadContext, "get">) {
   const store = c.get("settingsStore" as never) as SettingsStore | undefined;
@@ -77,7 +79,19 @@ function lookupProject(c: Pick<ReadContext, "get">, id: string): ProjectRead {
   if (!p) throw new ProjectReadError("project_not_found", `Project ${id} is unavailable`);
   // Keep declaredProject permissive for callers that need to report authored/unavailable state.
   // selectedProject applies root identity and usability checks, while catalog rig claims flow into the execution view.
-  return selected ? { ...p, rigs: catalogProjectRigs(catalog, selected.id) } : p;
+  return selected
+    ? { ...p, rigs: catalogProjectRigs(catalog, selected.id), repos: projectRepos(p.root, catalogProjectRepos(catalog, selected.id)) }
+    : { ...p, repos: projectRepos(p.root, []) };
+}
+function projectRepos(root: string, declared: string[]): string[] {
+  const found: string[] = [];
+  const add = (dir: string) => { try { if (fs.existsSync(path.join(dir, ".git"))) found.push(fs.realpathSync(dir)); } catch { /* unreadable: not bound */ } };
+  if (declared.length) for (const d of declared) add(path.resolve(root, d));
+  else {
+    add(root);
+    try { for (const e of fs.readdirSync(root, { withFileTypes: true })) if (e.isDirectory() && !e.name.startsWith(".") && e.name !== "missions" && e.name !== "node_modules") add(path.join(root, e.name)); } catch { /* none */ }
+  }
+  return [...new Set(found)];
 }
 function usableProject(p: ProjectRead): ProjectRead {
   if (p.error) throw new ProjectReadError("project_unavailable", `${p.id}: ${p.error}`);

@@ -139,6 +139,16 @@ export function catalogProjectRigs(catalogPath: string, id: string): string[] {
   return [];
 }
 
+/** Repos a catalog entry binds (workspace.yaml `projects[].repos`, paths relative to the project root); absent reads as none. */
+export function catalogProjectRepos(catalogPath: string, id: string): string[] {
+  for (const entry of catalogEntries(catalogPath)) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const { id: entryId, repos } = entry as { id?: unknown; repos?: unknown };
+    if (entryId === id && Array.isArray(repos) && repos.every((r) => typeof r === "string")) return repos as string[];
+  }
+  return [];
+}
+
 /** Membership for a row already bound to a mission inside the selected project.
  *  An explicit `project:` tag decides. A row with no `project:` tag belongs when its
  *  destination or source seat's rig is one the catalog says this project claims, the

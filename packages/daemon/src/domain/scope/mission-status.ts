@@ -79,7 +79,7 @@ export function readMissionStatus(missionDir: string, now = Date.now(), containR
   // freshness uses the FRESHEST of the authored timestamp and the file mtime (a lead edit or a refreshed updated_at both count as a real update)
   const older = Number.isNaN(authored) ? mtime.getTime() : Math.max(authored, mtime.getTime());
   const ageMs = Math.max(0, now - older);
-  const integration = Object.entries((doc.integration ?? {}) as Record<string, any>).map(([repo, v]) => ({ repo, branch: str(v?.branch), hash: str(v?.hash) }));
+  const integration = Object.entries((doc.integration ?? {}) as Record<string, any>).map(([repo, v]) => ({ repo, branch: str(v?.branch), hash: str(v?.hash) })).filter(i => i.hash !== null);
   return { sourcePath: file, updatedAt, fileModifiedAt: mtime.toISOString(), ageMs, stale: ageMs > MISSION_STATUS_STALE_MS, integration,
     total: items.length - counts.excluded, counts, accepted, reviewOrQaPending: pending, blocked, issues, items };
 }

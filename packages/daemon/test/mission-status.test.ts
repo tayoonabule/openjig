@@ -72,6 +72,19 @@ items:
     const s = readMissionStatus(dir, NOW)!;
     expect(s.issues.join(" ")).toMatch(/updated_at/); expect(s.stale).toBe(false);
   });
+  it("integration: only entries with a hash are reported (scalar/list keys such as not_pushed are skipped)", () => {
+    write(`updated_at: 2026-10-10T07:59:00Z
+integration:
+  api: {branch: jisc/main, hash: ae527a01}
+  not_pushed: all
+  candidates: [x, y]
+  web: {branch: main}
+items:
+  - {id: a, title: A, state: not-started}
+`);
+    const s = readMissionStatus(dir, NOW)!;
+    expect(s.integration).toEqual([{ repo: "api", branch: "jisc/main", hash: "ae527a01" }]);
+  });
   it("malformed yaml: explicit unavailable-style summary, zero counts, stale", () => {
     write("items: [ {id: a\n");
     const s = readMissionStatus(dir, NOW)!;

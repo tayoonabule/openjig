@@ -1492,3 +1492,51 @@ describe("execution view — S27 (OPR.0.5.6.27)", () => {
     expect(() => projector.show("no-such-view")).toThrow(ViewProjectorError);
   });
 });
+
+// Ladder from the lead record: queue rows carry no candidate:* tag, so built/reviewed/folded
+// come from status.yaml item hashes tested by git ancestry in the project's bound repos.
+describe("execution view ladder from status.yaml + bound repos", () => {
+  let tmp: string, repo: string, missionsRoot: string, base: string, tip: string, side: string, db: Database.Database;
+  const MISSION = "m-status";
+  const g = (...a: string[]) => execFileSync("git", ["-C", repo, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" }).trim();
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "exec-status-"));
+    repo = path.join(tmp, "api"); fs.mkdirSync(repo);
+    g("init", "-q", "-b", "jmain"); g("commit", "--allow-empty", "-qm", "a"); base = g("rev-parse", "HEAD");
+    g("commit", "--allow-empty", "-qm", "b"); tip = g("rev-parse", "HEAD");
+    g("checkout", "-q", "-b", "side"); g("commit", "--allow-empty", "-qm", "unmerged"); side = g("rev-parse", "HEAD"); g("checkout", "-q", "jmain");
+    missionsRoot = path.join(tmp, "missions");
+    const dir = path.join(missionsRoot, MISSION, "slices", "03-share");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "SPEC.md"), "---\nid: S03\nslice: 03-share\nmission: m-status\n---\n\nbody\n");
+    fs.writeFileSync(path.join(missionsRoot, MISSION, "status.yaml"), [
+      "updated_at: 2026-10-10T22:00:00Z", "integration:", "  api:", "    branch: jmain", `    hash: ${tip}`, "items:",
+      `- {id: '4', title: a, slice: '03', state: accepted, review: approve, qa: pass, hash: ${base.slice(0, 7)}}`,
+      `- {id: '5', title: b, slice: '03', state: merged-incomplete, review: approve, qa: pending, hash: ${tip.slice(0, 7)}}`,
+      `- {id: '6', title: c, slice: '03', state: built-awaiting-gates, review: none, qa: none, hash: ${side.slice(0, 7)}}`,
+      "- {id: '7', title: d, slice: '04', state: not-started}", ""].join("\n"));
+    db = createDb();
+    migrate(db, [coreSchema, bindingsSessionsSchema, eventsSchema, queueItemsSchema, queueItemSummarySchema, queueTransitionsSchema, queueTransitionWakesSchema, viewsCustomSchema]);
+    db.prepare(`INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, tier, tags, body)
+      VALUES ('q1','2026-10-10T00:00:00Z','2026-10-10T00:00:00Z','x@r','y@r','done','normal','light',?, 'b')`).run(JSON.stringify([`mission:${MISSION}`, "slice:03-share"]));
+  });
+  afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
+  const ladder = async (repos: string[]) => {
+    const doc = await buildExecutionView({ db, slicesRoot: () => missionsRoot, rigsRoot: () => path.join(tmp, "rigs") }, { mission: MISSION, project: "p", projectRepos: repos });
+    return (doc.q4_ladder as Record<string, any>[]).find(s => s.dir === "03-share")!;
+  };
+  it("derives built, reviewed and folded from status.yaml hashes and git ancestry in the bound repo", async () => {
+    const l = await ladder([repo]);
+    expect(l.built.candidate_sha).toBe(side.slice(0, 7));
+    expect(l.built.basis).toContain("status.yaml");
+    expect(l.folded.value).toBe(false); // item 6 is on a side branch, not an ancestor of the integration hash
+    expect(l.folded.basis).toContain("2 of 3");
+    expect(l.reviewed.value).toBe(false); // item 6 has no review approval
+    expect(l.proof).toMatchObject({ accepted: 1, total: 3 });
+  });
+  it("without a bound repo the git rungs stay INDETERMINATE, never guessed", async () => {
+    const l = await ladder([]);
+    expect(l.folded.value).toBe("INDETERMINATE");
+    expect(l.proof).toMatchObject({ accepted: 1, total: 3 });
+  });
+});

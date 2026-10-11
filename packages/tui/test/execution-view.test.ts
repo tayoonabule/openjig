@@ -228,6 +228,48 @@ describe("mission execution story — readable rows over the shipped projections
     expect(body).not.toContain("Planned: unknown");
   });
 
+  it("slice detail shows the lead's status.yaml record, who worked it and review/QA/merge facts instead of none/undetermined", () => {
+    const execution = executionFixture(3);
+    for (const s of execution.q2_sequencing) { (s as Record<string, unknown>)["planned_owners"] = []; (s as Record<string, unknown>)["work_rows"] = []; }
+    execution.q1_lanes = [];
+    (execution.q2_sequencing[1] as Record<string, unknown>)["worked_by"] = [
+      { seat: "frontend-impl-2@provineer", rows: 4, done: 3, last_at: "2026-10-11T10:00:00Z" },
+      { seat: "backend-impl-2@provineer", rows: 2, done: 2, last_at: "2026-10-10T10:00:00Z" },
+    ];
+    const scopes = executionScopes(3, () => "draft").map(m => ({ ...m, slices: m.slices.map(s => ({ ...s, proofReport: null })) }));
+    const item = (id: string, slice: string, state: string, review: string | null, qa: string | null, hash: string | null, branch: string | null) =>
+      ({ id, title: `Item ${id}`, state, review, qa, hash, branch, blockedBy: null, note: null, slice });
+    scopes[0]!.status = {
+      updatedAt: null, fileModifiedAt: "2026-10-10T00:00:00Z", ageMs: 0, stale: false, integration: [],
+      total: 2, counts: {}, accepted: 0, reviewOrQaPending: 0, blocked: 0, issues: [],
+      items: [item("6", "02", "merged-incomplete", "approve (security too)", "PASS full suite 1716", "c2acbf607127cd96fb98e27b66e83469dd2ff673", "jisc/main")],
+    };
+    const detail = text(executionContentLines(execution, scopes, [], "slice:OPR.0.5.8.2", 150));
+    expect(detail).toContain("worked by");
+    expect(detail).toContain("frontend-impl-2@provineer");
+    expect(detail).not.toContain("none — no claimed lane");
+    expect(detail).toContain("LEAD RECORD");
+    expect(detail).toContain("item 6");
+    expect(detail).toContain("merged, incomplete");
+    expect(detail).toContain("review approve");
+    expect(detail).toContain("QA PASS");
+    expect(detail).toContain("c2acbf607");
+    expect(detail).toContain("jisc/main");
+    expect(detail).toContain("lead record: merged, incomplete");
+    // the daemon-derived rung cells are not rewritten; the lead record is shown beside them
+    expect(detail).toContain("undetermined");
+    expect(detail).not.toContain("actors:       none in the served slice event history");
+  });
+
+  it("slice detail without a status.yaml record or worked_by keeps the honest none/undetermined wording", () => {
+    const execution = executionFixture(3);
+    execution.q1_lanes = [];
+    const scopes = executionScopes(3, () => "draft");
+    const detail = text(executionContentLines(execution, scopes, [], "slice:OPR.0.5.8.3", 150));
+    expect(detail).not.toContain("LEAD RECORD");
+    expect(detail).toContain("none — no claimed lane");
+  });
+
   it("stacks every mission node at narrow width and leaves overflow to the content scroller", () => {
     const lines = executionContentLines(executionFixture(12), executionScopes(12), [], null, 58);
     const body = text(lines);

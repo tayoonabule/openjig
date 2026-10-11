@@ -13,6 +13,9 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type Database from "better-sqlite3";
@@ -527,5 +530,22 @@ describe("decisions from lead-bound queue rows", () => {
     const rows = new (SliceDetailProjector as any)({ db, indexer: {} }).buildDecisions({ qitemIds: ["qd"] });
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ actor: "main-lead@r", qitemId: "qd", reason: "Decision needed: X" });
+  });
+});
+
+describe("slice membership for a project that claims rigs", () => {
+  it("binds mission/slice-tagged rows from claimed rigs; drops other rigs", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "idx-rigs-"));
+    fs.mkdirSync(path.join(tmp, "03-x"), { recursive: true });
+    fs.writeFileSync(path.join(tmp, "03-x", "SPEC.md"), "---\nslice: 03-x\n---\nbody\n");
+    const db = createDb();
+    migrate(db, [coreSchema, eventsSchema, queueItemsSchema, queueItemSummarySchema, queueTransitionsSchema]);
+    const ins = db.prepare(`INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, tags, body) VALUES (?,?,?,?,?,'done','normal',?,'b')`);
+    ins.run("q-mine", "2026-10-10T10:00:00Z", "2026-10-10T10:00:00Z", "a@mine", "main-lead@mine", JSON.stringify(["slice:03-x"]));
+    ins.run("q-other", "2026-10-10T10:00:01Z", "2026-10-10T10:00:01Z", "a@other", "b@other", JSON.stringify(["slice:03-x"]));
+    const ids = (rigs: string[]) => new SliceIndexer({ db, slicesRoot: tmp, dogfoodEvidenceRoot: null, projectId: "p", projectRigs: rigs } as any).get("03-x")?.qitemIds;
+    expect(ids(["mine"])).toEqual(["q-mine"]);
+    expect(ids([])).toEqual([]);
+    fs.rmSync(tmp, { recursive: true, force: true });
   });
 });

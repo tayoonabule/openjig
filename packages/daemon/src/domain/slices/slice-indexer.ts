@@ -1,4 +1,4 @@
-import { belongsToProject } from "../workspace/project-catalog.js";
+import { belongsToProjectMission } from "../workspace/project-catalog.js";
 // Slice Story View v0 — slice indexer.
 //
 // Reads slice folders from a configured filesystem root. The default
@@ -112,6 +112,8 @@ export interface SliceListEntry {
 
 export interface SliceIndexerOpts {
   projectId?: string;
+  /** Rigs the project's catalog entry claims; untagged mission rows from these rigs belong to the project. */
+  projectRigs?: readonly string[];
   missionId?: string;
   /** Root directory containing slice folders. */
   slicesRoot: string;
@@ -268,6 +270,7 @@ const STATUS_TO_BUCKET: Record<string, SliceStatus> = {
 
 export class SliceIndexer {
   readonly projectId?: string;
+  readonly projectRigs: readonly string[];
   readonly missionId?: string;
   readonly slicesRoot: string;
   readonly additionalSliceRoots: string[];
@@ -296,6 +299,7 @@ export class SliceIndexer {
 
   constructor(opts: SliceIndexerOpts) {
     this.projectId = opts.projectId;
+    this.projectRigs = opts.projectRigs ?? [];
     this.missionId = opts.missionId;
     this.slicesRoot = opts.slicesRoot;
     this.additionalSliceRoots = opts.additionalSliceRoots ?? [];
@@ -938,11 +942,11 @@ export class SliceIndexer {
     // "tags column missing" degrade nor allow a later fallback scan.
     if (!tableAbsent && tagsColumnPresent) {
       const stmt = this.db.prepare(
-        `SELECT qitem_id, tags FROM queue_items WHERE tags LIKE '%slice:%' ORDER BY ts_created DESC, qitem_id DESC`,
+        `SELECT qitem_id, tags, source_session, destination_session FROM queue_items WHERE tags LIKE '%slice:%' ORDER BY ts_created DESC, qitem_id DESC`,
       );
       const scanOrder = new Map<string, number>();
-      for (const r of stmt.iterate() as Iterable<{ qitem_id: string; tags: string | null }>) {
-        if (this.projectId && !belongsToProject(r.tags, this.projectId)) continue;
+      for (const r of stmt.iterate() as Iterable<{ qitem_id: string; tags: string | null; source_session: string | null; destination_session: string | null }>) {
+        if (this.projectId && !belongsToProjectMission(r, this.projectId, this.projectRigs)) continue;
         scanOrder.set(r.qitem_id, scanOrder.size);
         for (const tagged of parseScopeTags(r.tags).slices) {
           const bucket = typedBySlice.get(tagged);
@@ -1027,10 +1031,10 @@ export class SliceIndexer {
       const localBuckets = new Map<string, string[]>();
       for (const term of termList) localBuckets.set(term, []);
       const scan = tagsColumnPresent
-        ? this.db.prepare(`SELECT qitem_id, body, tags FROM queue_items`)
+        ? this.db.prepare(`SELECT qitem_id, body, tags, source_session, destination_session FROM queue_items`)
         : this.db.prepare(`SELECT qitem_id, body FROM queue_items`);
-      for (const r of scan.iterate() as Iterable<{ qitem_id: string; body: string; tags?: string | null }>) {
-        if (this.projectId && !belongsToProject(r.tags, this.projectId)) continue;
+      for (const r of scan.iterate() as Iterable<{ qitem_id: string; body: string; tags?: string | null; source_session?: string | null; destination_session?: string | null }>) {
+        if (this.projectId && !belongsToProjectMission({ tags: r.tags ?? null, source_session: r.source_session, destination_session: r.destination_session }, this.projectId, this.projectRigs)) continue;
         const hayBody = asciiFold(sqliteVisiblePrefix(r.body));
         const hayTags = r.tags != null ? asciiFold(sqliteVisiblePrefix(r.tags)) : null;
         if (!prefilter.test(hayBody) && !(hayTags !== null && prefilter.test(hayTags))) continue;

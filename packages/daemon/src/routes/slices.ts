@@ -184,7 +184,7 @@ export function slicesRoutes(): Hono {
         if (!mission || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name)) return c.json({ error: "exact_mission_and_slice_required" }, 400);
         const dir = projectMission(project, mission);
         workSource(project.root, path.join(dir, "slices", name));
-        const indexer = new SliceIndexer({ db: deps.indexer.db, slicesRoot: project.missionsRoot, dogfoodEvidenceRoot: null, projectId: project.id, missionId: mission });
+        const indexer = new SliceIndexer({ db: deps.indexer.db, slicesRoot: project.missionsRoot, dogfoodEvidenceRoot: null, projectId: project.id, projectRigs: project.rigs, missionId: mission });
         deps = { indexer, projector: deps.projector.withIndexer(indexer) };
       }
     } catch (err) { return projectReadResponse(err); }

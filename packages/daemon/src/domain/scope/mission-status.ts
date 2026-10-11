@@ -5,16 +5,16 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { parse } from "yaml";
 
-export const MISSION_STATUS_STATES = ["accepted", "merged-incomplete", "built-awaiting-gates", "in-progress", "design-only", "not-started", "ongoing", "excluded"] as const;
+export const MISSION_STATUS_STATES = ["accepted", "merged-incomplete", "built-awaiting-gates", "in-progress", "design-only", "not-started", "ongoing", "deferred", "folded", "excluded"] as const;
 export type MissionItemState = (typeof MISSION_STATUS_STATES)[number];
 export const MISSION_STATUS_STALE_MS = 12 * 60 * 60 * 1000; // policy: a record untouched for 12h is shown as stale
 
-export interface MissionStatusItem { id: string; title: string; state: MissionItemState; review: string | null; qa: string | null; hash: string | null; branch: string | null; blockedBy: string | null; slice: string | null; note: string | null }
+export interface MissionStatusItem { id: string; title: string; state: MissionItemState; review: string | null; qa: string | null; hash: string | null; branch: string | null; blockedBy: string | null; foldedInto?: string | null; acceptedEvidence?: string | null; slice: string | null; note: string | null }
 export interface MissionStatusSummary {
   sourcePath: string;
   updatedAt: string | null;       // authored timestamp in the record
   fileModifiedAt: string;         // filesystem mtime, so a record nobody touched cannot look fresh
-  ageMs: number | null;           // from the older of the two timestamps
+  ageMs: number | null;           // from the freshest of the two timestamps
   stale: boolean;
   integration: Array<{ repo: string; branch: string | null; hash: string | null }>;
   total: number;                  // items excluding "excluded"
@@ -54,10 +54,16 @@ export function readMissionStatus(missionDir: string, now = Date.now(), containR
     if (!id) { issues.push("an item has no id"); continue; }
     if (seen.has(id)) { issues.push(`duplicate item id ${id}`); continue; }
     seen.add(id);
-    let state = str(raw.state) as MissionItemState | null;
+    let rawState = str(raw.state);
+    let foldedInto: string | null = null;
+    const foldMatch = rawState ? /^folded-into-(.+)$/.exec(rawState) : null;
+    if (foldMatch) { rawState = "folded"; foldedInto = foldMatch[1]!; }
+    let state = rawState as MissionItemState | null;
     if (!state || !(MISSION_STATUS_STATES as readonly string[]).includes(state)) { issues.push(`item ${id}: unknown state "${raw.state}" counted as not-started`); state = "not-started"; }
     const review = str(raw.review), qa = str(raw.qa);
-    if (state === "accepted" && !(review === "approve" && qa === "pass")) { issues.push(`item ${id}: marked accepted without review=approve and qa=pass, NOT counted as accepted (shown as built-awaiting-gates)`); state = "built-awaiting-gates"; }
+    const evidence = str(raw.accepted_evidence);
+    const qaOk = !!qa && (/^pass/i.test(qa) || /^accepted/i.test(qa));
+    if (state === "accepted" && !(review === "approve" && (!!evidence || qaOk))) { issues.push(`item ${id}: marked accepted without review=approve and accepted_evidence or a passing qa, NOT counted as accepted (shown as built-awaiting-gates)`); state = "built-awaiting-gates"; }
     counts[state]++;
     const blockedBy = str(raw.blocked_by);
     if (state === "accepted") accepted++;
@@ -65,13 +71,13 @@ export function readMissionStatus(missionDir: string, now = Date.now(), containR
       if ((state === "built-awaiting-gates" || state === "merged-incomplete") && !(review === "approve" && qa === "pass")) pending++;
       if (blockedBy && state !== "excluded") blocked++;
     }
-    items.push({ id, title: str(raw.title) ?? id, state, review, qa, hash: str(raw.hash), branch: str(raw.branch), blockedBy, slice: str(raw.slice), note: str(raw.note) });
+    items.push({ id, title: str(raw.title) ?? id, state, review, qa, hash: str(raw.hash), branch: str(raw.branch), blockedBy, slice: str(raw.slice), note: str(raw.note), foldedInto, acceptedEvidence: evidence });
   }
   const updatedAt = str(doc.updated_at);
   const authored = updatedAt ? Date.parse(updatedAt) : NaN;
   if (!updatedAt || Number.isNaN(authored)) issues.push("updated_at is missing or not a timestamp; freshness uses the file modification time only");
-  // freshness uses the OLDER of the authored timestamp and the file mtime: touching the file must not make stale content look fresh
-  const older = Number.isNaN(authored) ? mtime.getTime() : Math.min(authored, mtime.getTime());
+  // freshness uses the FRESHEST of the authored timestamp and the file mtime (a lead edit or a refreshed updated_at both count as a real update)
+  const older = Number.isNaN(authored) ? mtime.getTime() : Math.max(authored, mtime.getTime());
   const ageMs = Math.max(0, now - older);
   const integration = Object.entries((doc.integration ?? {}) as Record<string, any>).map(([repo, v]) => ({ repo, branch: str(v?.branch), hash: str(v?.hash) }));
   return { sourcePath: file, updatedAt, fileModifiedAt: mtime.toISOString(), ageMs, stale: ageMs > MISSION_STATUS_STALE_MS, integration,

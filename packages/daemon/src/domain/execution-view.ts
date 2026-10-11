@@ -1,6 +1,7 @@
 import { resolveNodeFile } from "./scope/node-file.js";
 import { belongsToProject, belongsToProjectMission } from "./workspace/project-catalog.js";
 import { inspectGraph } from "./workflow-reconciliation.js";
+import { readMissionStatus, type MissionStatusItem, type MissionStatusSummary } from "./scope/mission-status.js";
 import { createProofPolicyRead, readMissionReadiness, readProjectReadiness } from "./proof/judgments.js";
 import { lifecycleObligations, requiredLifecycleSteps } from "./lifecycle-obligations.js";
 import { QueueWakeRepository } from "./queue-wake-repository.js";
@@ -644,7 +645,7 @@ async function gitAncestor(exec: ExecutionViewDeps["exec"], repoCtx: string, sha
   }
 }
 
-export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { mission?: string; rig?: string; project?: string; projectRigs?: readonly string[] }): Promise<Record<string, unknown>> {
+export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { mission?: string; rig?: string; project?: string; projectRigs?: readonly string[]; projectRepos?: readonly string[] }): Promise<Record<string, unknown>> {
   const now = deps.now ?? (() => new Date());
   const exec = deps.exec ?? defaultExec;
   const buildInfo = deps.buildInfo ?? BUILD_INFO;
@@ -847,6 +848,14 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
   // ---- Q4 ladder (also feeds Q2's deps-folded) ----
   const rigsRoot = (deps.rigsRoot ?? resolveLegacyTopologyRigsRoot)();
   const commitCache = new Map<string, string | null>();
+  const statusSummary: MissionStatusSummary | null = missionsRoot && mission !== INDETERMINATE ? readMissionStatus(path.join(missionsRoot, mission), Date.now(), missionsRoot) : null;
+  const statusItemsFor = (facts: SliceFacts): MissionStatusItem[] => {
+    const num = /^(\d+)/.exec(facts.dir)?.[1];
+    return (statusSummary?.items ?? []).filter(i => {
+      const tag = i.slice?.trim();
+      return !!tag && i.state !== "excluded" && (tag === facts.dir || (!!num && tag.padStart(num.length, "0") === num));
+    });
+  };
   const ladderOf = async (facts: SliceFacts): Promise<Record<string, unknown>> => {
     const fm = facts.frontmatter;
     const locked: Rung = typeof fm["approved-spec-at"] === "string"
@@ -928,6 +937,45 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     // The selected project has no binding to the OpenRig daemon's source.
     // Missing Git objects cannot establish applicability. Keep daemon ancestry
     // only on the legacy unscoped view, with its existing unknown/false rules.
+    // The lead's status.yaml record is the fallback evidence when no queue row carries candidate:*.
+    const recItems = statusItemsFor(facts);
+    const recHashed = recItems.filter(i => i.hash && i.state !== "excluded");
+    const proof = recItems.length ? { accepted: recItems.filter(i => i.state === "accepted").length, total: recItems.length, basis: `status.yaml items for slice ${facts.dir}` } : null;
+    if (!candidateSha && recHashed.length) {
+      const last = recHashed[recHashed.length - 1]!;
+      const built2 = { candidate_sha: last.hash!, resolved_commit: INDETERMINATE, basis: `status.yaml: ${recHashed.length} item hash(es) on this slice (latest listed: item ${last.id}); no candidate:* tag on any bound row` };
+      const repos = opts?.projectRepos ?? [];
+      let folded2: Rung;
+      if (!repos.length) folded2 = { value: INDETERMINATE, basis: "project is not bound to a repo; status.yaml hashes cannot be tested for ancestry" };
+      else {
+        const integ = (statusSummary?.integration ?? []).map(i => i.hash).filter((h): h is string => !!h);
+        let yes = 0, unknown = 0;
+        for (const it of recHashed) {
+          let verdict: boolean | null = null;
+          for (const repo of repos) {
+            const sha = await resolveCommit(exec, repo, it.hash!, commitCache);
+            if (!sha) continue;
+            let seen = false;
+            for (const ih of integ) {
+              const target = await resolveCommit(exec, repo, ih, commitCache);
+              if (!target) continue;
+              const r = await gitAncestor(exec, repo, sha, target);
+              if (r.value === true) { verdict = true; break; }
+              if (r.value === false) { verdict = false; seen = true; }
+            }
+            if (verdict === true || seen) break;
+          }
+          if (verdict === true) yes++; else if (verdict === null) unknown++;
+        }
+        folded2 = unknown === recHashed.length
+          ? { value: INDETERMINATE, basis: `no status.yaml hash resolved in the project's bound repos (${repos.length})` }
+          : { value: yes === recHashed.length, basis: `git merge-base --is-ancestor: ${yes} of ${recHashed.length} status.yaml hashes are in the recorded integration hash${unknown ? `; ${unknown} did not resolve` : ""}` };
+      }
+      const approved = recHashed.filter(i => i.review === "approve" || (i.review ?? "").startsWith("approve")).length;
+      const reviewed2 = { value: approved === recHashed.length, basis: `status.yaml review: ${approved} of ${recHashed.length} built items approved`, legs: [] };
+      return { slice_id: facts.id, dir: facts.dir, locked, built: built2, reviewed: reviewed2, folded: folded2,
+        adopted: opts?.project ? { value: "NOT_APPLICABLE", basis: "selected project has no binding to the OpenRig daemon source; daemon adoption is not project progress" } : { value: INDETERMINATE, basis: "adopted is not derivable from status.yaml" }, proof };
+    }
     const folded: Rung = !candidateSha
       ? { value: INDETERMINATE, basis: "no candidate sha to test" }
       : !repoCtx
@@ -940,7 +988,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
         : buildInfo.commit
           ? await gitAncestor(exec, repoCtx, builtResolved ?? candidateSha, buildInfo.commit)
           : { value: INDETERMINATE, basis: "daemon build stamp absent (dev run) — adopted rung underivable" };
-    return { slice_id: facts.id, dir: facts.dir, locked, built, reviewed, folded, adopted };
+    return { slice_id: facts.id, dir: facts.dir, locked, built, reviewed, folded, adopted, proof };
   };
 
   const ladderCache = new Map<string, Record<string, unknown>>();

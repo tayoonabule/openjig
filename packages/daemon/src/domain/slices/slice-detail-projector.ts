@@ -656,6 +656,40 @@ export class SliceDetailProjector {
   // --- Decisions tab ---
 
   private buildDecisions(slice: SliceRecord): DecisionRow[] {
+    return [...this.buildActionDecisions(slice), ...this.buildLeadDecisions(slice)]
+      .sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
+  }
+
+  /** Rulings that live only on the queue: a qitem addressed to or from a lead seat
+   *  (main-lead / advisor-lead) that has been closed is that lead's decision on the slice. */
+  private buildLeadDecisions(slice: SliceRecord): DecisionRow[] {
+    if (slice.qitemIds.length === 0) return [];
+    try {
+      const placeholders = slice.qitemIds.map(() => "?").join(",");
+      const rows = this.db.prepare(
+        `SELECT qitem_id, ts_updated, source_session, destination_session, state, closure_reason, summary
+           FROM queue_items
+           WHERE qitem_id IN (${placeholders}) AND state IN ('done','canceled','closed')
+             AND (destination_session LIKE 'main-lead@%' OR destination_session LIKE 'advisor-lead@%'
+               OR source_session LIKE 'main-lead@%' OR source_session LIKE 'advisor-lead@%')`
+      ).all(...slice.qitemIds) as Array<{ qitem_id: string; ts_updated: string; source_session: string; destination_session: string; state: string; closure_reason: string | null; summary: string | null }>;
+      const isLead = (s: string) => /^(main|advisor)-lead@/.test(s);
+      return rows.map((r) => ({
+        actionId: `queue:${r.qitem_id}`,
+        ts: r.ts_updated,
+        actor: isLead(r.destination_session) ? r.destination_session : r.source_session,
+        verb: r.closure_reason ?? r.state,
+        qitemId: r.qitem_id,
+        reason: r.summary,
+        beforeState: null,
+        afterState: r.state,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  private buildActionDecisions(slice: SliceRecord): DecisionRow[] {
     if (slice.qitemIds.length === 0) return [];
     try {
       const placeholders = slice.qitemIds.map(() => "?").join(",");

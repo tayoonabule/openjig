@@ -4,7 +4,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { TmuxAdapter } from "./tmux.js";
 import { shellQuote } from "./shell-quote.js";
-import { JcodeSessionReader, jcodeRuntimeDir, scanJcodeSessions, type JcodeSessionFs } from "./jcode-session.js";
+import { JcodeSessionReader, resolveJcodeServerDir, scanJcodeSessions, type JcodeSessionFs } from "./jcode-session.js";
 import { mergeManagedBlock } from "../domain/managed-blocks.js";
 import { assessNativeResumeProbe } from "../domain/native-resume-probe.js";
 import { observeJcodePosture } from "../domain/permission-drift.js";
@@ -168,7 +168,8 @@ export class JcodeRuntimeAdapter implements RuntimeAdapter {
     const priorIds = new Set(scanJcodeSessions(this.options.fsOps, this.options.home ?? os.homedir(), { idsOnly: true }).map((row) => row.id));
     for (const row of await this.reader.debug(opts.name)) priorIds.add(row.id);
     this.launchContexts.set(opts.name, { cwd: binding.cwd, since, priorIds });
-    const runtimeDir = jcodeRuntimeDir(this.options.stateRoot, opts.name);
+    const server = resolveJcodeServerDir(this.options.stateRoot, opts.name, this.options.fsOps);
+    const runtimeDir = server.dir;
     // Jcode exits with ENOENT when JCODE_RUNTIME_DIR does not exist yet.
     try { this.options.fsOps.mkdirp(runtimeDir); } catch (error) {
       return { ok: false, error: `Failed to create Jcode runtime dir ${runtimeDir}: ${(error as Error).message}` };
@@ -183,7 +184,12 @@ export class JcodeRuntimeAdapter implements RuntimeAdapter {
     // A JCODE_SOCKET inherited from the tmux server (set when it was started from a
     // jcode session) overrides the seat runtime dir, so every seat would join one shared
     // server and run its tools with that server's OPENRIG_* identity and model.
-    const command = `unset JCODE_SOCKET; if [ -S ${shellQuote(nodePath.join(runtimeDir, "jcode.sock"))} ]; then JCODE_RUNTIME_DIR=${shellQuote(runtimeDir)} jcode server stop --force >/dev/null 2>&1; fi && JCODE_RUNTIME_DIR=${shellQuote(runtimeDir)} JCODE_TEMP_SERVER=1 JCODE_DEBUG_SOCKET=1${hooks} jcode --no-update --no-selfdev -C ${shellQuote(binding.cwd)}${model ? ` -m ${shellQuote(model)}` : ""}${opts.resumeToken ? ` --resume ${shellQuote(opts.resumeToken)}` : ""}`;
+    // On a shared server the seat joins it as a client: never stop it, and no TEMP_SERVER or debug
+    // flags (the shared server owns those). Seat identity and the activity hook ride the client env.
+    const clientTail = `jcode --no-update --no-selfdev -C ${shellQuote(binding.cwd)}${model ? ` -m ${shellQuote(model)}` : ""}${opts.resumeToken ? ` --resume ${shellQuote(opts.resumeToken)}` : ""}`;
+    const command = server.shared
+      ? `unset JCODE_SOCKET; JCODE_RUNTIME_DIR=${shellQuote(runtimeDir)}${hooks} ${clientTail}`
+      : `unset JCODE_SOCKET; if [ -S ${shellQuote(nodePath.join(runtimeDir, "jcode.sock"))} ]; then JCODE_RUNTIME_DIR=${shellQuote(runtimeDir)} jcode server stop --force >/dev/null 2>&1; fi && JCODE_RUNTIME_DIR=${shellQuote(runtimeDir)} JCODE_TEMP_SERVER=1 JCODE_DEBUG_SOCKET=1${hooks} ${clientTail}`;
     const launch = await this.options.tmux.sendShellCommand(binding.tmuxSession,
       this.options.launchPath ? `PATH=${shellQuote(this.options.launchPath)}; ${command}` : command);
     if (!launch.ok) return { ok: false, error: `Failed to send launch command: ${launch.message}` };

@@ -36,6 +36,24 @@ export function jcodeRuntimeDir(stateRoot: string, sessionName: string): string 
   return nodePath.join(stateRoot, sessionName, "runtime");
 }
 
+/** Where a seat's jcode server lives. A seat is per-seat by default; a marker file
+ *  `<stateRoot>/<seat>/shared-server` holding a runtime dir path opts the seat into one shared
+ *  server that hosts many seats (reads are then scoped to the seat by `openrig_seat`). */
+export function resolveJcodeServerDir(
+  stateRoot: string,
+  sessionName: string,
+  fsx: { exists(path: string): boolean; readFile(path: string): string },
+): { dir: string; shared: boolean } {
+  const marker = nodePath.join(stateRoot, sessionName, "shared-server");
+  try {
+    if (fsx.exists(marker)) {
+      const dir = fsx.readFile(marker).trim();
+      if (dir) return { dir, shared: true };
+    }
+  } catch { /* fall back to the per-seat dir */ }
+  return { dir: jcodeRuntimeDir(stateRoot, sessionName), shared: false };
+}
+
 /** How long one jcode self-report stays authoritative. The sweep polls at 1Hz, so a live
  *  socket refreshes it long before this; a dead socket's last answer expires and the seat
  *  falls back to sampling instead of freezing on a stale verdict. */
@@ -107,11 +125,17 @@ export async function readJcodeSelfReportEvidence(input: {
   now?: () => Date;
   query?: (socketPath: string) => Promise<string | null>;
   exists?: (path: string) => boolean;
+  readMarker?: (path: string) => string;
 }): Promise<ActivityEvidence | null> {
-  const socket = nodePath.join(jcodeRuntimeDir(input.stateRoot, input.sessionName), "jcode-debug.sock");
-  if (!(input.exists ?? fs.existsSync)(socket)) return null;
-  const output = await (input.query ?? queryJcodeDebugSocket)(socket);
-  if (output === null) return null;
+  const exists = input.exists ?? fs.existsSync;
+  const server = resolveJcodeServerDir(input.stateRoot, input.sessionName, {
+    exists, readFile: input.readMarker ?? ((p) => fs.readFileSync(p, "utf-8")),
+  });
+  const socket = nodePath.join(server.dir, "jcode-debug.sock");
+  if (!exists(socket)) return null;
+  const raw = await (input.query ?? queryJcodeDebugSocket)(socket);
+  if (raw === null) return null;
+  const output = server.shared ? filterSessionsRowsToSeat(raw, input.sessionName) : raw;
   const activity = jcodeActivityFromSessions(output);
   if (!activity) return null;
   const at = (input.now ?? (() => new Date()))();
@@ -125,6 +149,15 @@ export async function readJcodeSelfReportEvidence(input: {
     activity,
     validForMs: JCODE_SELF_REPORT_VALID_MS,
   };
+}
+
+/** Keep only the rows a shared server attributes to `seat` (its `openrig_seat` field). */
+export function filterSessionsRowsToSeat(output: string, seat: string): string {
+  try {
+    const rows: unknown = JSON.parse(output);
+    if (!Array.isArray(rows)) return "[]";
+    return JSON.stringify(rows.filter((r) => r && typeof r === "object" && (r as { openrig_seat?: unknown }).openrig_seat === seat));
+  } catch { return "[]"; }
 }
 
 export function readJcodeDebugSessions(socket: string, exec: (socket: string) => string | Promise<string>): Promise<JcodeSession[]> {
@@ -206,9 +239,13 @@ export class JcodeSessionReader {
   }
 
   async debug(sessionName: string): Promise<JcodeSession[]> {
-    const socket = nodePath.join(jcodeRuntimeDir(this.options.stateRoot, sessionName), "jcode.sock");
+    const server = resolveJcodeServerDir(this.options.stateRoot, sessionName, this.fs);
+    const socket = nodePath.join(server.dir, "jcode.sock");
     if (!this.fs.exists(socket)) return [];
-    return readJcodeDebugSessions(socket, this.execDebug);
+    const exec = server.shared
+      ? async (sock: string) => filterSessionsRowsToSeat(await this.execDebug(sock), sessionName)
+      : this.execDebug;
+    return readJcodeDebugSessions(socket, exec);
   }
 
   async capture(sessionName: string, cwd?: string, since = 0, priorIds: ReadonlySet<string> = new Set()): Promise<string | undefined> {

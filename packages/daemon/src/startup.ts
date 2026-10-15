@@ -2122,7 +2122,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       herdrAgentBridge ??= bridge;
       herdrAgentBridges.push(bridge);
       return bridge;
-    });
+    }, () => deps.managedHerdrViews);
     if (herdrAgentBridge) deps.herdrAgentBridge = herdrAgentBridge;
     deps.herdrAgentBridges = herdrAgentBridges;
     const { ManagedHerdrViews, managedViewInventory, listObserverClients } = await import("./domain/terminal/managed-herdr-views.js");

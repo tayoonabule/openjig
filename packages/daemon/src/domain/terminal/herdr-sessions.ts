@@ -14,6 +14,7 @@ export function createHerdrProviders(
   env: NodeJS.ProcessEnv = process.env,
   input?: ReadFollowInput,
   agentBridgeFactory?: (transport: HerdrTransport) => Pick<HerdrAgentBridge, "registerLayout">,
+  managedRigSpaces?: () => { reconcile(): Promise<void> } | undefined,
 ) {
   env = { ...env };
   if (env.XDG_CONFIG_HOME !== undefined) env.XDG_CONFIG_HOME = path.resolve(env.XDG_CONFIG_HOME);
@@ -29,13 +30,17 @@ export function createHerdrProviders(
     const transportFactory = createHerdrSocketTransport(createHerdrSocketRpc(endpoint.socketPath));
     const transport = transportFactory();
     return new HerdrAdapter({
-    transportFactory,
-    following: new HerdrFollowView({ socketPath: endpoint.socketPath, run: createHerdrViewerRun(endpoint, env), transport, input }),
-    launch: endpoint,
-    viewer: viewer(endpoint),
-    newLaunchToken: () => `l${++launch}`,
-    ...(agentBridgeFactory ? { agentBridge: agentBridgeFactory(transport) } : {}),
-  }); };
+      transportFactory,
+      following: new HerdrFollowView({ socketPath: endpoint.socketPath, run: createHerdrViewerRun(endpoint, env), transport, input }),
+      launch: endpoint,
+      viewer: viewer(endpoint),
+      newLaunchToken: () => `l${++launch}`,
+      ...(agentBridgeFactory ? { agentBridge: agentBridgeFactory(transport) } : {}),
+      // Managed rig spaces are reconciled over the daemon's shared/default
+      // transport. Explicit session endpoints may be separate Herdr servers.
+      ...(managedRigSpaces && endpoint.socketPath === defaultSocket ? { managedRigSpaces } : {}),
+    });
+  };
   const sessions = new Map<string, HerdrAdapter>();
   return {
     defaultProvider: make({ socketPath: defaultSocket, ...(env.HERDR_SESSION ? { session: env.HERDR_SESSION } : {}) }),

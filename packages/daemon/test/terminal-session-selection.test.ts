@@ -53,7 +53,12 @@ async function serve(socket: string): Promise<Request[]> {
   return requests;
 }
 
-async function fixture(options: { xdg?: boolean; configuredSession?: string; socketOverride?: boolean } = {}) {
+async function fixture(options: {
+  xdg?: boolean;
+  configuredSession?: string;
+  socketOverride?: boolean;
+  managedRigSpaces?: () => { reconcile(): Promise<void> } | undefined;
+} = {}) {
   // Keep socket names short and inside the runner's permitted IPC directory.
   const root = fs.mkdtempSync(path.join(tmpdir(), "hs-")); roots.push(root); vi.stubEnv("HOME", root);
   const configHome = path.join(root, options.xdg ? "xdg" : ".config");
@@ -64,7 +69,7 @@ async function fixture(options: { xdg?: boolean; configuredSession?: string; soc
   const env = { HOME: root, XDG_CONFIG_HOME: options.xdg ? configHome : undefined,
     HERDR_SOCKET_PATH: options.socketOverride === false ? undefined : paths.configured,
     HERDR_SESSION: options.configuredSession ?? "daemon-configured" };
-  const providers = createHerdrProviders(env);
+  const providers = createHerdrProviders(env, undefined, undefined, options.managedRigSpaces);
   const cmux: TerminalProvider = {
     name: "cmux", status: async () => ({ provider: "cmux", available: true, capabilities: {} }), liveness: async () => ({ alive: true }),
     openView: vi.fn(async view => ({ provider: "cmux", ok: true, opened: view.opened.map(p => p.seat), absent: [], degraded: [], pages: view.pages.length })),
@@ -121,6 +126,17 @@ describe.skipIf(process.platform === "win32")("per-request Herdr session selecti
     expect(await (await f.open({ view: "prod", session: "missing" })).json()).toMatchObject({ ok: false, code: "herdr_unavailable", opened: [] });
     expect(layouts(f.hits.configured)).toHaveLength(2);
     expect(f.hits.default).toEqual([]);
+  });
+
+  it("does not apply the daemon managed-space manager to a separate session socket", async () => {
+    let lookups = 0;
+    const f = await fixture({ managedRigSpaces: () => { lookups++; return undefined; } });
+    expect(await (await f.open({ view: "build" })).json()).toMatchObject({ ok: true });
+    expect(lookups).toBe(1);
+    expect(await (await f.open({ view: "prod", session: "prod" })).json()).toMatchObject({ ok: true, session: "prod" });
+    expect(lookups).toBe(1);
+    expect(layouts(f.hits.configured)).toHaveLength(2);
+    expect(layouts(f.hits.prod)).toHaveLength(2);
   });
 
   it("concurrent requests use separate sessions while the daemon's configured endpoint remains intact", async () => {

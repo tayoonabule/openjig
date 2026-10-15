@@ -446,6 +446,59 @@ describe("Up API route", () => {
       const body = await res.json();
       expect(body.snapshotKind).toBe("auto-pre-down");
     });
+
+    it("latest GOOD snapshot wins: a newer corrupt snapshot is skipped, never restored", async () => {
+      const rig = rigRepo.createRig("latest-good-rig");
+      rigRepo.addNode(rig.id, "worker", { role: "worker" });
+      const good = snapshotCapture.captureSnapshot(rig.id, "auto-periodic");
+      await new Promise((r) => setTimeout(r, 10));
+      const bad = snapshotCapture.captureSnapshot(rig.id, "auto-pre-down");
+      db.prepare("UPDATE snapshots SET data = ?, created_at = datetime('now', '+1 minute') WHERE id = ?").run("{not json", bad.id);
+
+      const res = await app.request("/api/up", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sourceRef: "latest-good-rig" }),
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.snapshotId).toBe(good.id);
+      expect(body.snapshotKind).toBe("auto-periodic");
+    });
+
+    it("no usable snapshot: 404 no_snapshot echoes rigId and starts nothing", async () => {
+      const rig = rigRepo.createRig("no-good-snap");
+      const restoreSpy = vi.spyOn(restoreOrchestrator, "restore");
+
+      const res = await app.request("/api/up", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sourceRef: "no-good-snap" }),
+      });
+
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body).toMatchObject({ code: "no_snapshot", rigId: rig.id });
+      expect(restoreSpy).not.toHaveBeenCalled();
+      expect(db.prepare("SELECT COUNT(*) AS n FROM snapshots WHERE rig_id = ?").get(rig.id)).toEqual({ n: 0 });
+    });
+
+    it("restore failure echoes rigId/rigName so the CLI can print recovery commands", async () => {
+      const rig = rigRepo.createRig("restore-fails");
+      rigRepo.addNode(rig.id, "worker", { role: "worker" });
+      snapshotCapture.captureSnapshot(rig.id, "auto-pre-down");
+      vi.spyOn(restoreOrchestrator, "restore").mockResolvedValue({ ok: false, code: "restore_error", message: "boom" });
+
+      const res = await app.request("/api/up", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sourceRef: "restore-fails" }),
+      });
+
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: "boom", code: "restore_error", rigId: rig.id, rigName: "restore-fails" });
+    });
   });
 
   // OPR.0.3.4.4 — `--plan` must be READ-ONLY on the rig_name restore path.

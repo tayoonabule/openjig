@@ -156,7 +156,9 @@ describe("JcodeRuntimeAdapter", () => {
     });
     const result = await adapter.launchHarness(binding(), { name: "seat", resumeToken: ID });
     expect(result).toMatchObject({ ok: false, recovery: "attention_required" });
-    expect(vi.mocked(tmux.sendText).mock.calls[0]![1]).toContain(`--resume '${ID}'`);
+    const command = vi.mocked(tmux.sendText).mock.calls[0]![1];
+    expect(command).toContain(`-m 'gpt-5.5'`);
+    expect(command).toContain(`--resume '${ID}'`);
   });
 
   it("treats a resumed session that is already busy as resumed", async () => {

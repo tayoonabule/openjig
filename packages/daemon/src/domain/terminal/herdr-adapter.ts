@@ -837,11 +837,14 @@ export class HerdrAdapter implements TerminalProvider {
     await managed.reconcile().catch(() => undefined);
     let workspaceId: string | undefined;
     let tiled: Set<string>;
+    let focusNote = `Focused the rig's managed space "${label}".`;
     try {
       const rows = ((await this.transport.request("workspace.list", {}))["workspaces"] as Array<{ workspace_id?: string; label?: string }> | undefined) ?? [];
       workspaceId = rows.find((w) => w.label === label && w.workspace_id)?.workspace_id;
       if (!workspaceId) return fail(`the daemon has not opened a Herdr space for ${label} yet; see GET /api/terminal/managed-views`);
-      await this.transport.request("workspace.focus", { workspace_id: workspaceId }).catch(() => undefined);
+      await this.transport.request("workspace.focus", { workspace_id: workspaceId }).catch((err: unknown) => {
+        focusNote = `herdr did not focus the rig's managed space "${label}": ${err instanceof Error ? err.message : String(err)}`;
+      });
       const panes = ((await this.transport.request("pane.list", { workspace_id: workspaceId }))["panes"] as Array<{ label?: string }> | undefined) ?? [];
       tiled = new Set(panes.map((p) => p.label).filter((l): l is string => typeof l === "string"));
     } catch (err) {
@@ -853,6 +856,6 @@ export class HerdrAdapter implements TerminalProvider {
       if (tiled.has(pane.seat.split("@")[0]!) || tiled.has(pane.label)) opened.push(pane.seat);
       else degraded.push({ seat: pane.seat, host: HERDR_SURFACE_HOST, reason: "no tile yet; the daemon adds it to the rig's space within about 10s" });
     }
-    return { provider: this.name, ok: opened.length > 0 || view.opened.length === 0, opened, absent, degraded, pages: 0, notes: [`Focused the rig's managed space "${label}".`] };
+    return { provider: this.name, ok: opened.length > 0 || view.opened.length === 0, opened, absent, degraded, pages: 0, notes: [focusNote] };
   }
 }

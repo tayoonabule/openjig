@@ -729,6 +729,8 @@ describe("RestoreOrchestrator", () => {
     expect(forecast.nodes[0]!.intendedAction).toBe("awaiting-decision");
     expect(forecast.nodes[0]!.reason).toBe(result.result.nodes[0]!.error);
     expect(tmux.createSession).not.toHaveBeenCalled();
+  });
+
   it.each([
     { currentModel: "current-model-B", expectedModel: "current-model-B", label: "explicit current model" },
     { currentModel: null, expectedModel: null, label: "unconfigured current model" },
@@ -836,7 +838,7 @@ describe("RestoreOrchestrator", () => {
     expect(snapshotRepo.getSnapshot(snap.id)?.data.nodes[0]?.runtime).toBe("claude-code");
   });
 
-  it("holds a Jcode resume when the current model differs from the saved snapshot model", async () => {
+  it("pins a Jcode disk resume to the current policy model when the saved model differs", async () => {
     const snap = seedRigAndSnapshot({
       nodes: [{ logicalId: "worker", role: "worker", runtime: "jcode", model: "snapshot-model-A" }],
       edges: [],
@@ -847,18 +849,18 @@ describe("RestoreOrchestrator", () => {
     rigRepo.setNodeModel(node.id, "current-model-B");
     const jcode = {
       canResume: vi.fn(() => true),
-      resume: vi.fn(async () => ({ ok: true as const })),
+      resume: vi.fn(async (_session: string, _type: string | null, _token: string | null, _cwd: string, model?: string | null) => {
+        expect(model).toBe("current-model-B");
+        return { ok: true as const };
+      }),
     } as unknown as JcodeResumeAdapter;
 
     const result = await createOrchestrator({ jcode }).restore(snap.id);
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.result.nodes.find((entry) => entry.nodeId === node.id)).toMatchObject({
-      status: "attention_required",
-      error: expect.stringContaining("held for native model verification"),
-    });
-    expect(jcode.resume).not.toHaveBeenCalled();
+    expect(result.result.nodes.find((entry) => entry.nodeId === node.id)).toMatchObject({ status: "resumed" });
+    expect(jcode.resume).toHaveBeenCalledTimes(1);
     expect(snapshotRepo.getSnapshot(snap.id)?.data.nodes[0]?.model).toBe("snapshot-model-A");
   });
 
@@ -5325,7 +5327,7 @@ describe("RestoreOrchestrator", () => {
 
     it("a fresh terminal seat beside resumed agents -> fully_restored; a fresh agent stays partial", () => {
       const resumed = { nodeId: "n1", logicalId: "a", status: "resumed" as const };
-      expect(rollupRestoreRigResult([resumed, { nodeId: "n2", logicalId: "op", status: "fresh-primed", runtime: "terminal" }]))
+      expect(rollupRestoreRigResult([resumed, { nodeId: "n2", logicalId: "op", status: "fresh-primed", runtime: "terminal", noConversation: true }]))
         .toBe("fully_restored");
       expect(rollupRestoreRigResult([resumed, { nodeId: "n2", logicalId: "b", status: "fresh-primed" }]))
         .toBe("partially_restored");

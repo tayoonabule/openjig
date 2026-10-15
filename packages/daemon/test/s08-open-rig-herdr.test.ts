@@ -393,6 +393,21 @@ describe("one Herdr space per rig when the daemon manages rig spaces", () => {
     expect(res.degraded).toEqual([]);
   });
 
+  it("does not claim focus when Herdr rejects focusing the managed space", async () => {
+    const tiles = rows.map((row) => row.canonicalSessionName.split("@")[0]!);
+    const { transport } = herdrTransport((method) => {
+      if (method === "workspace.list") return { type: "workspaces", workspaces: [{ workspace_id: "wM", label: RIG }] };
+      if (method === "pane.list") return { type: "pane_list", panes: tiles.map((label, i) => ({ pane_id: `p${i}`, label })) };
+      if (method === "workspace.focus") throw new Error("focus refused");
+      return { type: "ok" };
+    });
+    const adapter = new HerdrAdapter({ transportFactory: () => transport, managedRigSpaces: () => ({ reconcile: async () => {} }) });
+    const res = await service(adapter).svc.openView({ view: `rig:${RIG}` });
+    expect(res.ok).toBe(true);
+    expect(res.opened).toHaveLength(rows.length);
+    expect(res.notes).toEqual([TEAM_HANDOFF_NOTE, `herdr did not focus the rig's managed space "${RIG}": focus refused`]);
+  });
+
   it("a seat with no tile yet is named, not given a stray tab", async () => {
     const { transport, requests } = managedTransport([{ workspace_id: "wM", label: RIG }], ["seat-01"]);
     const adapter = new HerdrAdapter({ transportFactory: () => transport, managedRigSpaces: () => ({ reconcile: async () => {} }) });

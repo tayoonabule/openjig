@@ -296,7 +296,14 @@ Examples:
         }
       }
       if (isRigName && !opts.existing) {
-        try {
+        // An already-managed STOPPED rig owns its name: `rig up <name>`
+        // restores it from its latest good snapshot (the same rig-name route
+        // as --existing) instead of stopping at a rig-vs-library ambiguity.
+        // Running rigs and library-only names resolve exactly as before.
+        const nameMatches = (await fetchRigSummaries()).filter((r) => r.name === source);
+        const stoppedRigOwnsName = nameMatches.length === 1
+          && (nameMatches[0]!.lifecycleState === "stopped" || nameMatches[0]!.lifecycleState === "recoverable");
+        if (!stoppedRigOwnsName) try {
           const { resolveLibrarySpec } = await import("./specs.js");
           const entry = await resolveLibrarySpec(client, source, { kind: "rig" });
           // Library match found — check for existing-rig collision
@@ -481,6 +488,9 @@ Examples:
           console.error(`Preflight check failed:\n${errors.map((e) => `  ${e}`).join("\n")}\nFix: resolve the issues above and retry.`);
         } else if (code === "pre_restore_validation_failed") {
           printRestoreNotAttempted(res.data as RestoreNotAttemptedData);
+        } else if (isRigName && (code === "no_snapshot" || code === "restore_error" || code === "rig_not_stopped"
+          || code === "snapshot_unusable" || code === "no_usable_snapshot" || code === "restore_in_progress")) {
+          printRestoreFallback(source, res.data);
         } else if (code === "invalid_topology_manifest") {
           const errors = (res.data["errors"] as string[]) ?? [];
           console.error(`Topology manifest invalid:\n${errors.map((e) => `  ${e}`).join("\n")}\nFix: the manifest key set is CLOSED — rigs[]{source, host?} plus optional concurrency.`);
@@ -623,6 +633,8 @@ Examples:
           }
         }
 
+        printDetachedSeats(source, rigId, nodes);
+
         if (rigResult === "partially_restored" || rigResult === "failed" || rigResult === "not_attempted" || nodes.some((n) => n.status === "failed" || n.status === "awaiting-decision")) {
           process.exitCode = 1;
         }
@@ -747,6 +759,58 @@ interface RestoreNotAttemptedData {
   error?: string;
   rigResult?: string;
   blockers?: RestoreBlocker[];
+}
+
+/** Restore of a named rig could not run, or stopped part-way. This prints
+ *  the safe next steps. A restore_error may already have started some seats,
+ *  so the message only claims "no sessions were started" for refusals that
+ *  happen before any restore step runs. */
+export function printRestoreFallback(name: string, data: Record<string, unknown>): void {
+  const rigId = typeof data["rigId"] === "string" ? data["rigId"] : "<rigId>";
+  console.error(`Could not restore rig "${name}": ${String(data["error"] ?? data["code"] ?? "restore failed")}`);
+  const code = data["code"];
+  if (code === "rig_not_stopped") {
+    console.error(`  The rig still has live sessions, so it was not restored.`);
+    console.error(`  Inspect them first:  rig ps --nodes --rig ${name}`);
+    console.error(`  Only if you deliberately choose to stop every live seat: run rig down ${name}, then rig up ${name}.`);
+    return;
+  }
+  if (code === "restore_error") {
+    // The restore ran and stopped part-way: some seats may already be up.
+    console.error(`The restore stopped part-way, so some seats may already be running.`);
+    console.error(`  Check before retrying:              rig ps --nodes --rig ${name}`);
+  } else {
+    // Refused before any restore step ran: no session was started.
+    console.error(`The restore did not run, so no sessions were started.`);
+  }
+  console.error(`Next steps:`);
+  console.error(`  Preview what a restore would do:   rig up ${name} --existing --plan`);
+  console.error(`  List this rig's snapshots:         rig snapshot list ${rigId}`);
+  console.error(`  Restore an exact snapshot:         rig restore <snapshotId> --rig ${rigId}`);
+  console.error(`  Deliberately start seats fresh:    rig up ${name} --existing --fresh <seat...>  (loses those seats' conversations)`);
+}
+
+/** After a restore, name every seat that has no live session (detached) or is
+ *  live but blocked, with the command that recovers it. */
+export function printDetachedSeats(
+  name: string,
+  rigId: string,
+  nodes: Array<{ logicalId: string; status: string; error?: string }>,
+): void {
+  const detached = nodes.filter((n) => n.status === "failed" || n.status === "awaiting-decision");
+  const blocked = nodes.filter((n) => n.status === "attention_required");
+  if (detached.length === 0 && blocked.length === 0) return;
+  if (detached.length > 0) {
+    console.log(`Detached seats (no running session): ${detached.map((n) => n.logicalId).join(", ")}`);
+    for (const n of detached.filter((d) => d.status === "failed")) {
+      console.log(`  ${n.logicalId}: relaunch with  rig launch ${rigId} ${n.logicalId}`);
+    }
+    // awaiting-decision seats already got their explicit --fresh choice above.
+  }
+  if (blocked.length > 0) {
+    console.log(`Live seats waiting on a prompt (not detached): ${blocked.map((n) => n.logicalId).join(", ")}`);
+    console.log(`  Attach and answer the prompt; find each session with:  rig ps --nodes --rig ${name}`);
+  }
 }
 
 function printRestoreNotAttempted(data: RestoreNotAttemptedData): void {

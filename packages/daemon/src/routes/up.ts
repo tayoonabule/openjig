@@ -118,6 +118,7 @@ async function restoreByRigId(rigId: string, rigName: string | null, deps: Retur
       return c.json({
         error: `Rig exists but ${staleSnapshot ? "its restore snapshots name an older occupant" : "has no restore-usable snapshot"} and current DB state is insufficient for rehydrate. Start fresh with: rig up <spec-path>`,
         code: "no_snapshot",
+        rigId,
         blockers: eligibility.blockers,
       }, 404);
     }
@@ -170,7 +171,7 @@ async function restoreByRigId(rigId: string, rigName: string | null, deps: Retur
         remediation: result.result.blockers?.map((blocker) => blocker.remediation) ?? [],
       }, 409);
     }
-    return c.json({ error: result.message, code: result.code }, result.code === "rig_not_stopped" ? 409 : 400);
+    return c.json({ error: result.message, code: result.code, rigId, rigName }, result.code === "rig_not_stopped" ? 409 : 400);
   }
 
   // Compute attach command from first running node (same logic as /api/rigs/:id/up)

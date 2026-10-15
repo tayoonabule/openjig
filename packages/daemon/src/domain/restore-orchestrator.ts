@@ -1,6 +1,5 @@
 import { nonInterruptiveNotice, nonInterruptiveSummary } from "../adapters/non-interruptive.js";
 import os from "node:os";
-import { readSavedJcodeModel } from "../adapters/jcode-session.js";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type Database from "better-sqlite3";
@@ -1574,15 +1573,9 @@ export class RestoreOrchestrator {
     }
 
     if (this.jcodeResume?.canResume(resumeType, resumeToken)) {
-      // Only hold when the session's saved model could differ from policy; if it already equals policy,
-      // jcode restoring it is exactly what policy wants.
-      if (model && readSavedJcodeModel(os.homedir(), resumeToken!) !== model) {
-        return {
-          kind: "attention_required",
-          message: `Jcode may restore the model saved inside this session rather than current policy ${model}; restore is held for native model verification. No new turn was started.`,
-        };
-      }
-      warnings?.push("Jcode restore has no OpenRig model pin; the native saved/runtime-selected model was not observed.");
+      // Jcode applies this explicit model override only when restoring from disk.
+      // Existing live-session attachments remain untouched by that override.
+      if (!model) warnings?.push("Jcode restore has no OpenRig model pin; the native saved/runtime-selected model was not observed.");
       const result = await this.jcodeResume.resume(sessionName, resumeType, resumeToken, cwd, model);
       const afterResume = modelAuthority ? this.readCurrentRestoreModel(nodeId, modelAuthority) : currentModel;
       if (!afterResume.ok) return { kind: "attention_required", message: afterResume.message };

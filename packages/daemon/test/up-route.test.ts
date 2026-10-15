@@ -9,6 +9,7 @@ import type { SnapshotCapture } from "../src/domain/snapshot-capture.js";
 import type { RestoreOrchestrator } from "../src/domain/restore-orchestrator.js";
 import { createFullTestDb, createTestApp } from "./helpers/test-app.js";
 import { buildAttentionResponse } from "../src/routes/up.js";
+import { assessCurrentStateRehydrateEligibility } from "../src/domain/rehydrate-eligibility.js";
 
 const VALID_SPEC = `
 schema_version: 1
@@ -458,6 +459,93 @@ describe("Up API route", () => {
 
       expect(res.status).toBe(400);
       expect(await res.json()).toEqual({ error: "boom", code: "restore_error", rigId: rig.id, rigName: "restore-fails" });
+    });
+
+    // Stopped creative-itc/kadence shape: the seat's occupant came from a
+    // recorded fresh launch, auto-pre-down captured it, then clean `rig down`
+    // marked it exited. The snapshot names the SAME occupant and must restore
+    // (resume the original conversation), not 404 as "older occupant".
+    function seedFreshLaunchedThenStopped(rigName: string) {
+      const rig = rigRepo.createRig(rigName);
+      const node = rigRepo.addNode(rig.id, "main.lead", { runtime: "claude-code" });
+      const old = sessionRegistry.registerSession(node.id, `main-lead@${rigName}`);
+      sessionRegistry.markSuperseded(old.id);
+      const current = sessionRegistry.registerSession(node.id, `main-lead@${rigName}`, "fresh");
+      sessionRegistry.updateResumeToken(current.id, "claude_id", "native-current", "hook");
+      sessionRegistry.updateStatus(current.id, "running");
+      const generation = sessionRegistry.currentOccupantTenure(node.id)!.generationUuid;
+      db.prepare("INSERT INTO events (rig_id, type, payload) VALUES (?, 'seat.fresh_launched', ?)")
+        .run(rig.id, JSON.stringify({ nodeId: node.id, sessionId: current.id, newGeneration: generation }));
+      const snapshot = snapshotCapture.captureSnapshot(rig.id, "auto-pre-down");
+      sessionRegistry.updateStatus(current.id, "exited");
+      return { rig, node, current, snapshot };
+    }
+
+    it("stopped rig whose fresh-launched occupant exited on clean down restores from its snapshot", async () => {
+      const { rig, snapshot } = seedFreshLaunchedThenStopped("kadence-shape");
+      const restoreSpy = vi.spyOn(restoreOrchestrator, "restore").mockResolvedValue({
+        ok: true,
+        result: { rigResult: "fully_restored", nodes: [], warnings: [] },
+      } as never);
+
+      const res = await app.request("/api/up", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sourceRef: "kadence-shape" }),
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({ status: "restored", rigId: rig.id, snapshotId: snapshot.id, snapshotKind: "auto-pre-down" });
+      expect(body.warnings).toEqual([]);
+      expect(restoreSpy).toHaveBeenCalledTimes(1);
+      expect(restoreSpy.mock.calls[0]![0]).toBe(snapshot.id);
+      // No auto-rehydrate snapshot was invented.
+      expect(db.prepare("SELECT COUNT(*) AS n FROM snapshots WHERE rig_id = ? AND kind = 'auto-rehydrate'").get(rig.id)).toEqual({ n: 0 });
+    });
+
+    it("scope guard: the same shape WITHOUT a usable snapshot is still not rehydrate-eligible (fix is matcher-only)", async () => {
+      const { rig, snapshot } = seedFreshLaunchedThenStopped("kadence-no-snap");
+      db.prepare("DELETE FROM snapshots WHERE id = ?").run(snapshot.id);
+      const current = rigRepo.getRig(rig.id)!;
+      const eligibility = assessCurrentStateRehydrateEligibility(db, current);
+      expect(eligibility.ok).toBe(false);
+      expect(eligibility.blockers).toContain("rig has no persisted sessions to rehydrate");
+      const restoreSpy = vi.spyOn(restoreOrchestrator, "restore");
+
+      const res = await app.request("/api/up", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sourceRef: "kadence-no-snap" }),
+      });
+
+      expect(res.status).toBe(404);
+      expect(await res.json()).toMatchObject({ code: "no_snapshot", rigId: rig.id });
+      expect(restoreSpy).not.toHaveBeenCalled();
+    });
+
+    it("a genuinely different current occupant still refuses the old snapshot (no_snapshot, nothing started)", async () => {
+      const { rig, node, current } = seedFreshLaunchedThenStopped("kadence-moved-on");
+      // A later deliberate fresh launch replaced the snapshot's occupant.
+      sessionRegistry.markSuperseded(current.id);
+      const successor = sessionRegistry.registerSession(node.id, "main-lead@kadence-moved-on", "fresh");
+      const generation = sessionRegistry.currentOccupantTenure(node.id)!.generationUuid;
+      db.prepare("INSERT INTO events (rig_id, type, payload) VALUES (?, 'seat.fresh_launched', ?)")
+        .run(rig.id, JSON.stringify({ nodeId: node.id, sessionId: successor.id, newGeneration: generation }));
+      sessionRegistry.updateStatus(successor.id, "exited");
+      const restoreSpy = vi.spyOn(restoreOrchestrator, "restore");
+
+      const res = await app.request("/api/up", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sourceRef: "kadence-moved-on" }),
+      });
+
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body).toMatchObject({ code: "no_snapshot", rigId: rig.id });
+      expect(body.error).toContain("older occupant");
+      expect(restoreSpy).not.toHaveBeenCalled();
     });
   });
 

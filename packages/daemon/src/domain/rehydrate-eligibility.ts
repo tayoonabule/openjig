@@ -28,7 +28,7 @@ export function snapshotMatchesCurrentOccupants(
             s.resume_type AS resumeType, s.resume_token AS resumeToken
        FROM sessions s
        JOIN nodes n ON n.id = s.node_id
-       WHERE n.rig_id = ? AND s.status NOT IN ('superseded', 'exited')`
+       WHERE n.rig_id = ? AND s.status != 'superseded'`
   ).all(rig.rig.id) as Array<{
     id: string;
     nodeId: string;
@@ -39,7 +39,14 @@ export function snapshotMatchesCurrentOccupants(
 
   const recorded = readFreshOccupantRelations(db, rig.rig.id);
   for (const node of rig.nodes) {
-    const current = resolveActiveOccupantRow(rows, Object.prototype.hasOwnProperty.call(recorded, node.id) ? recorded : undefined, node.id);
+    // A recorded fresh-launch relation names its occupant by id. A clean
+    // `rig down` marks that occupant exited, so the relation must still be able
+    // to see exited rows or it reads as dangling and the matching snapshot is
+    // wrongly rejected as an older occupant. Without a relation, exited rows
+    // stay out of legacy inference as before.
+    const hasRelation = Object.prototype.hasOwnProperty.call(recorded, node.id);
+    const candidates = hasRelation ? rows : rows.filter((row) => row.status !== "exited");
+    const current = resolveActiveOccupantRow(candidates, hasRelation ? recorded : undefined, node.id);
     if (current.kind === "none") continue;
     if (current.kind === "ambiguous") return false;
     const captured = resolveActiveSnapshotSession(snapshot.data, node.id);

@@ -110,7 +110,7 @@ async function restoreByRigId(rigId: string, rigName: string | null, deps: Retur
     if (joined && sameLaunchChoice()) return renderExistingRestore(rigId, rigName, deps, c, joined, true);
   }
   const choice = chooseRestoreSnapshot(deps, rigId);
-  if (!choice.ok) return c.json(choice.body, choice.status);
+  if (!choice.ok) return c.json({ ...choice.body, rigId, rigName }, choice.status);
   const { rig } = choice;
 
   // OPR.0.3.4.4 — read-only plan gate, BEFORE any restore mutation. The
@@ -136,7 +136,7 @@ async function renderExistingRestore(
   rigId: string, rigName: string | null, deps: ReturnType<typeof getDeps>,
   c: { json: (data: unknown, status?: number) => Response }, outcome: ExistingRigRestoreOutcome, joined: boolean,
 ) {
-  if (!outcome.ok) return c.json(outcome.choice.body, outcome.choice.status);
+  if (!outcome.ok) return c.json({ ...outcome.choice.body, rigId, rigName }, outcome.choice.status);
   const { snapshot, capturedCurrentState, result, staleSnapshot } = outcome;
   const joinedWarning = joined ? [JOINED_AUTOMATIC_RESTORE_WARNING] : [];
   if (!result.ok && result.code === "restore_unavailable") {
@@ -155,7 +155,7 @@ async function renderExistingRestore(
         remediation: result.result.blockers?.map((blocker) => blocker.remediation) ?? [],
       }, 409);
     }
-    return c.json({ error: result.message, code: result.code, ...(joined ? { warnings: joinedWarning } : {}) }, result.code === "rig_not_stopped" ? 409 : 400);
+    return c.json({ error: result.message, code: result.code, rigId, rigName, ...(joined ? { warnings: joinedWarning } : {}) }, result.code === "rig_not_stopped" ? 409 : 400);
   }
 
   // Compute attach command from first running node (same logic as /api/rigs/:id/up)

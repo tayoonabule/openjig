@@ -33,7 +33,7 @@ export function assessSnapshotCurrentOccupants(
             s.resume_type AS resumeType, s.resume_token AS resumeToken
        FROM sessions s
        JOIN nodes n ON n.id = s.node_id
-       WHERE n.rig_id = ? ORDER BY s.created_at DESC, s.id DESC`
+       WHERE n.rig_id = ? AND s.status != 'superseded' ORDER BY s.created_at DESC, s.id DESC`
   ).all(rig.rig.id) as Array<{
     id: string;
     nodeId: string;

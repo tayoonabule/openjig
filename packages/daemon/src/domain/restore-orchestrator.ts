@@ -128,8 +128,7 @@ export function rollupRestoreRigResult(nodes: RestoreNodeResult[]): RestoreRigRe
   if (nodes.some((node) => (node.guidanceGaps?.length ?? 0) > 0)) return "partially_restored";
   // A fresh launch loses a conversation unless this is an explicitly no-conversation terminal seat.
   const lostConversation = (node: RestoreNodeResult) =>
-    (node.status === "fresh" || node.status === "fresh-primed") && !node.noConversation
-      && !(node.runtime === "terminal" && node.status === "fresh-primed");
+    (node.status === "fresh" || node.status === "fresh-primed") && !node.noConversation;
   if (nodes.some((node) => lostConversation(node) || node.status === "awaiting-decision" || node.status === "failed" || node.status === "attention_required")) {
     return "partially_restored";
   }
@@ -169,7 +168,7 @@ export function snapshotLaunchOutcome(data: SnapshotData, nodeId: string, runtim
     : occupant.kind === "none" && resumePeriodicCarry ? data.periodicResumeSourcesByNode?.[nodeId] ?? null : null;
   if (session && session.nodeId !== nodeId) return { kind: "decision", why: "the periodic resume source belongs to another agent" };
   const runtimeError = restoreRuntimeCompatibilityError(runtime,
-    data.nodeStartupContext?.[nodeId]?.runtime);
+    data.nodeStartupContext?.[nodeId]?.runtime ?? savedRuntime);
   if (runtimeError) return { kind: "decision", why: runtimeError };
   if (!session) {
     // The restore's own rule for a seat stopped at capture whose earlier occupant left a token.
@@ -1062,6 +1061,7 @@ export class RestoreOrchestrator {
     const node = entry.node;
     const liveNode = this.rigRepo.getRig(rigId)?.nodes.find(current => current.logicalId === node.logicalId
       && (!opts?.selectedHistory || current.id === node.id));
+    const runtimeAtPreparation = liveNode ? liveNode.runtime : node.runtime;
     const nodeId = node.id;
     const selectedHistory = opts?.selectedHistory;
     if (selectedHistory && (!liveNode || selectedHistory.nodeId !== nodeId || !selectedHistory.beforeEffect())) {
@@ -1124,7 +1124,7 @@ export class RestoreOrchestrator {
       return { nodeId, logicalId: node.logicalId, status: "awaiting-decision", error: stoppedSnapshotReason(node.logicalId, data.rig.name) };
     }
     const runtimeError = restoreRuntimeCompatibilityError(liveNode ? liveNode.runtime : node.runtime,
-      data.nodeStartupContext?.[nodeId]?.runtime);
+      data.nodeStartupContext?.[nodeId]?.runtime ?? node.runtime);
     if (runtimeError) {
       return { nodeId, logicalId: node.logicalId, status: "awaiting-decision", error: runtimeError };
     }
@@ -1363,7 +1363,7 @@ export class RestoreOrchestrator {
       warnings?.push(...launchResult.warnings);
     }
 
-    const restored = await this.postLaunchRestore(entry, rigId, data, launchResult.sessionName, launchResult,
+    const restored = await this.postLaunchRestore(entry, rigId, data, runtimeAtPreparation, launchResult.sessionName, launchResult,
       { ...opts, ...(claudeExecutable ? { claudeExecutable } : {}) }, warnings, priorState, seatRehydration, resumeSession);
     const checked = { ...this.checkRestoredGuidance(restored, entry.node, rigId, data, warnings),
       ...(keptPane ? { launchStarted: true as const } : {}) };
@@ -1482,6 +1482,7 @@ export class RestoreOrchestrator {
     entry: PlanEntry,
     rigId: string,
     data: SnapshotData,
+    runtimeAtPreparation: string | null,
     sessionName: string,
     launchResult?: { ok: true; sessionName: string; session: import("./types.js").Session; binding: import("./types.js").Binding },
     opts?: { adapters?: Record<string, import("./runtime-adapter.js").RuntimeAdapter>; fsOps?: { exists(path: string): boolean }; freshLogicalIds?: string[]; selectedHistory?: SelectedRestoreHistory; claudeExecutable?: string; keepPane?: boolean },
@@ -1646,7 +1647,7 @@ export class RestoreOrchestrator {
           } catch { /* best-effort: without it a rotation stays unproved, as before */ }
         }
         if (selected && !selected.beforeNative(launchedSessionId, launchResult?.binding.id)) return { nodeId: node.id, logicalId: node.logicalId, status: "attention_required", error: "The selected seat, settings or history changed after shell creation; native resume was not dispatched." };
-        const resumeOutcome = await this.attemptResume(node.id, sessionName, resumeType, resumeToken, node.cwd ?? "/", this.liveCodexProfile(rigId, node, selected?.nodeId), modelForRestore(), this.resolveRestorePosture(node.id, rigId), effortForRestore(), { rigId, logicalId: node.logicalId, runtime: node.runtime }, warnings, node.advisor,
+        const resumeOutcome = await this.attemptResume(node.id, sessionName, resumeType, resumeToken, node.cwd ?? "/", this.liveCodexProfile(rigId, node, selected?.nodeId), modelForRestore(), this.resolveRestorePosture(node.id, rigId), effortForRestore(), { rigId, logicalId: node.logicalId, runtime: runtimeAtPreparation }, warnings, node.advisor,
           selected ? () => selected.beforeNative(launchedSessionId, launchResult?.binding.id) : undefined, opts?.claudeExecutable);
         if (resumeOutcome.kind === "resumed") {
           baseStatus = "resumed";
@@ -1906,7 +1907,7 @@ export class RestoreOrchestrator {
               skipHarnessLaunch: !shouldLaunchHarness,
               resumeToken: (isPodAware && resumeRequested) ? resumeToken ?? undefined : undefined,
               resumeType: (isPodAware && resumeRequested) ? resumeType ?? undefined : undefined,
-              modelAuthority: { rigId, logicalId: node.logicalId, runtime: node.runtime },
+              modelAuthority: { rigId, logicalId: node.logicalId, runtime: runtimeAtPreparation },
               sessionName: sessionName,
               allowFreshFallback: !(isPodAware && resumeRequested),
               ...(selected ? { beforeNativeLaunch: () => selected.beforeNative(launchResult.session.id, launchResult.binding.id) } : {}),
@@ -1937,7 +1938,7 @@ export class RestoreOrchestrator {
                 : baseStatus;
               if (finalStatus === "resumed") {
                 return this.finishJoinedResume(node, sessionName, resumeToken, launchResult?.session.id,
-                  isPodAware && node.runtime === "claude-code", startupResult.resumedProcess,
+                  isPodAware && startupRuntime === "claude-code", startupResult.resumedProcess,
                   selected ? () => selected.beforeNative(launchResult?.session.id, launchResult?.binding.id) : undefined);
               }
               return { nodeId: node.id, logicalId: node.logicalId, status: finalStatus, ...(noConversation && finalStatus === "fresh-primed" ? { noConversation: true as const } : {}) };
@@ -2347,15 +2348,9 @@ export class RestoreOrchestrator {
     }
 
     if (this.jcodeResume?.canResume(resumeType, resumeToken)) {
-      // Only hold when the session's saved model could differ from policy; if it already equals policy,
-      // jcode restoring it is exactly what policy wants.
-      if (model && readSavedJcodeModel(os.homedir(), resumeToken!) !== model) {
-        return {
-          kind: "attention_required",
-          message: `Jcode may restore the model saved inside this session rather than current policy ${model}; restore is held for native model verification. No new turn was started.`,
-        };
-      }
-      warnings?.push("Jcode restore has no OpenRig model pin; the native saved/runtime-selected model was not observed.");
+      // Jcode applies this explicit model override only when restoring from disk.
+      // Existing live-session attachments remain untouched by that override.
+      if (!model) warnings?.push("Jcode restore has no OpenRig model pin; the native saved/runtime-selected model was not observed.");
       const result = await this.jcodeResume.resume(sessionName, resumeType, resumeToken, cwd, model);
       const afterResume = modelAuthority ? this.readCurrentRestoreModel(nodeId, modelAuthority) : currentModel;
       if (!afterResume.ok) return { kind: "attention_required", message: afterResume.message };

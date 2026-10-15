@@ -202,6 +202,36 @@ describe("SnapshotCapture", () => {
     expect(snapshotMatchesCurrentOccupants(db, rigRepo.getRig(rig.id)!, snapshot)).toBe(true);
   });
 
+  it("matches a recorded fresh occupant that a clean down marked exited, but not after a different id or token", () => {
+    const { rig, n1 } = seedRig();
+    const occupant = sessionRegistry.registerSession(n1.id, "r99-demo1-lead", "fresh");
+    sessionRegistry.updateResumeToken(occupant.id, "claude_id", "native-a", "hook");
+    sessionRegistry.updateStatus(occupant.id, "running");
+    const generation = sessionRegistry.currentOccupantTenure(n1.id)!.generationUuid;
+    db.prepare("INSERT INTO events (rig_id, type, payload) VALUES (?, 'seat.fresh_launched', ?)")
+      .run(rig.id, JSON.stringify({ nodeId: n1.id, sessionId: occupant.id, newGeneration: generation }));
+    const snapshot = capture.captureSnapshot(rig.id, "auto-pre-down");
+    sessionRegistry.updateStatus(occupant.id, "exited");
+    const current = rigRepo.getRig(rig.id)!;
+    expect(snapshotMatchesCurrentOccupants(db, current, snapshot)).toBe(true);
+    // Same row, different native identity: still an older occupant.
+    sessionRegistry.updateResumeToken(occupant.id, "claude_id", "native-b", "hook");
+    expect(snapshotMatchesCurrentOccupants(db, current, snapshot)).toBe(false);
+  });
+
+  it("legacy path without a fresh relation still ignores exited rows", () => {
+    const { rig, n1 } = seedRig();
+    const s = sessionRegistry.registerSession(n1.id, "r99-demo1-lead");
+    sessionRegistry.updateStatus(s.id, "running");
+    const snapshot = capture.captureSnapshot(rig.id, "auto-pre-down");
+    sessionRegistry.updateStatus(s.id, "exited");
+    // Exited row is invisible to legacy inference -> node counts as "none" -> match.
+    expect(snapshotMatchesCurrentOccupants(db, rigRepo.getRig(rig.id)!, snapshot)).toBe(true);
+    // A new live row with no relation is a different occupant -> mismatch.
+    sessionRegistry.registerSession(n1.id, "r99-demo1-lead");
+    expect(snapshotMatchesCurrentOccupants(db, rigRepo.getRig(rig.id)!, snapshot)).toBe(false);
+  });
+
   it("assembles correct SnapshotData (rig + nodes + edges + bindings)", () => {
     const { rig, n1 } = seedRig();
 

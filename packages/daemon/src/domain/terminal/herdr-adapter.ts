@@ -327,6 +327,12 @@ export interface HerdrAdapterDeps {
   tabPrefix?: string;
   /** Optional best-effort external agent reporter for panes created by this adapter. */
   agentBridge?: Pick<HerdrAgentBridge, "registerLayout">;
+  /**
+   * The daemon's managed views, when on. They own each rig's space (named after the rig,
+   * a lead tab plus one tab per pod), so a rig view reconciles and focuses that space
+   * instead of building a second one beside it.
+   */
+  managedRigSpaces?: () => { reconcile(): Promise<void> } | undefined;
 }
 
 /** Herdr lays out 4×4 per tab (OPR.0.6.0.8); cmux keeps the composer default. */
@@ -419,6 +425,9 @@ export class HerdrAdapter implements TerminalProvider {
         code: "herdr_unavailable",
       };
     }
+
+    const managed = view.id.startsWith("rig:") ? this.deps.managedRigSpaces?.() : undefined;
+    if (managed) return this.openManagedRig(view, managed, { absent, degraded });
 
     const launchToken = this.newLaunchToken();
     const plan = planHerdrLayout(view, launchToken, this.tabPrefix);
@@ -683,5 +692,43 @@ export class HerdrAdapter implements TerminalProvider {
       degraded,
       pages,
     };
+  }
+
+  /**
+   * A rig view when managed views are on: bring the rig's one space up to date, focus it
+   * and report which seats have a tile. Never creates a workspace or adds a tab, because
+   * a second space (or a foreign tab) is exactly what stalls the managed views.
+   */
+  private async openManagedRig(
+    view: ComposedView,
+    managed: { reconcile(): Promise<void> },
+    carry: { absent: AbsentSeat[]; degraded: DegradedSeat[] },
+  ): Promise<OpenViewResult> {
+    const { absent, degraded } = carry;
+    const label = readableWorkspaceLabel(view.id);
+    const fail = (error: string): OpenViewResult => {
+      for (const pane of view.opened) degraded.push({ seat: pane.seat, host: HERDR_SURFACE_HOST, reason: error });
+      return { provider: this.name, ok: view.opened.length === 0, opened: [], absent, degraded, pages: 0, ...(view.opened.length ? { error, code: "herdr_workspace_failed" } : {}) };
+    };
+    await managed.reconcile().catch(() => undefined);
+    let workspaceId: string | undefined;
+    let tiled: Set<string>;
+    try {
+      const rows = ((await this.transport.request("workspace.list", {}))["workspaces"] as Array<{ workspace_id?: string; label?: string }> | undefined) ?? [];
+      workspaceId = rows.find((w) => w.label === label && w.workspace_id)?.workspace_id;
+      if (!workspaceId) return fail(`the daemon has not opened a Herdr space for ${label} yet; see GET /api/terminal/managed-views`);
+      await this.transport.request("workspace.focus", { workspace_id: workspaceId }).catch(() => undefined);
+      const panes = ((await this.transport.request("pane.list", { workspace_id: workspaceId }))["panes"] as Array<{ label?: string }> | undefined) ?? [];
+      tiled = new Set(panes.map((p) => p.label).filter((l): l is string => typeof l === "string"));
+    } catch (err) {
+      return fail(`herdr did not answer: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    // Managed tiles are labelled with the seat's session name before `@`.
+    const opened: string[] = [];
+    for (const pane of view.opened) {
+      if (tiled.has(pane.seat.split("@")[0]!) || tiled.has(pane.label)) opened.push(pane.seat);
+      else degraded.push({ seat: pane.seat, host: HERDR_SURFACE_HOST, reason: "no tile yet; the daemon adds it to the rig's space within about 10s" });
+    }
+    return { provider: this.name, ok: opened.length > 0 || view.opened.length === 0, opened, absent, degraded, pages: 0, notes: [`Focused the rig's managed space "${label}".`] };
   }
 }

@@ -302,3 +302,55 @@ describe("S08 — cmux is unchanged", () => {
     expect(planHerdrLayout(view, "t").workspaceLabel).toBe("mission:4.6");
   });
 });
+
+describe("one Herdr space per rig when the daemon manages rig spaces", () => {
+  const managedTransport = (spaces: Array<{ workspace_id: string; label: string }>, tiles: string[]) =>
+    herdrTransport((m) => {
+      if (m === "workspace.list") return { type: "workspaces", workspaces: spaces };
+      if (m === "pane.list") return { type: "pane_list", panes: tiles.map((label, i) => ({ pane_id: `p${i}`, label })) };
+      if (m === "workspace.create" || m === "layout.apply" || m === "tab.close") throw new Error(`forbidden: ${m}`);
+      return { type: "ok" };
+    });
+
+  it("focuses the managed space named after the rig and never creates a second space or tab", async () => {
+    // Managed tiles are labelled with the session name before `@` (seat-01), not the logical id.
+    const { transport, requests } = managedTransport([{ workspace_id: "wM", label: RIG }], rows.map((r) => r.canonicalSessionName.split("@")[0]!));
+    let reconciled = 0;
+    const adapter = new HerdrAdapter({ transportFactory: () => transport, managedRigSpaces: () => ({ reconcile: async () => { reconciled++; } }) });
+    const res = await service(adapter).svc.openView({ view: `rig:${RIG}` });
+    expect(reconciled).toBe(1);
+    expect(requests.map((r) => r.method)).not.toContain("workspace.create");
+    expect(requests.map((r) => r.method)).not.toContain("layout.apply");
+    expect(requests.find((r) => r.method === "workspace.focus")?.params).toEqual({ workspace_id: "wM" });
+    expect(res.ok).toBe(true);
+    expect(res.opened).toHaveLength(17);
+    expect(res.degraded).toEqual([]);
+  });
+
+  it("a seat with no tile yet is named, not given a stray tab", async () => {
+    const { transport, requests } = managedTransport([{ workspace_id: "wM", label: RIG }], ["seat-01"]);
+    const adapter = new HerdrAdapter({ transportFactory: () => transport, managedRigSpaces: () => ({ reconcile: async () => {} }) });
+    const res = await service(adapter).svc.openView({ view: `rig:${RIG}` });
+    expect(requests.map((r) => r.method)).not.toContain("layout.apply");
+    expect(res.opened).toEqual([rows[0]!.canonicalSessionName]);
+    expect(res.degraded).toHaveLength(16);
+    expect(res.degraded[0]!.reason).toContain("no tile yet");
+  });
+
+  it("with no managed space yet it reports honestly and still creates nothing", async () => {
+    const { transport, requests } = managedTransport([], []);
+    const adapter = new HerdrAdapter({ transportFactory: () => transport, managedRigSpaces: () => ({ reconcile: async () => {} }) });
+    const res = await service(adapter).svc.openView({ view: `rig:${RIG}` });
+    expect(requests.map((r) => r.method)).not.toContain("workspace.create");
+    expect(res.ok).toBe(false);
+    expect(res.code).toBe("herdr_workspace_failed");
+    expect(res.degraded).toHaveLength(17);
+  });
+
+  it("without managed views a rig view still opens its own space (unchanged)", async () => {
+    const { transport, requests } = herdrTransport();
+    const adapter = new HerdrAdapter({ transportFactory: () => transport, managedRigSpaces: () => undefined });
+    await service(adapter).svc.openView({ view: `rig:${RIG}` });
+    expect(requests.filter((r) => r.method === "workspace.create")).toHaveLength(1);
+  });
+});

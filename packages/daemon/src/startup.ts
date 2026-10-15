@@ -1835,6 +1835,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       // FB4: herdr speaks its unix control socket (there is no `layout` CLI).
       transportFactory: () => herdrTransport,
       agentBridge: herdrAgentBridge,
+      managedRigSpaces: () => deps.managedHerdrViews,
     });
     deps.herdrAgentBridge = herdrAgentBridge;
     const { ManagedHerdrViews, managedViewInventory, listObserverClients } = await import("./domain/terminal/managed-herdr-views.js");

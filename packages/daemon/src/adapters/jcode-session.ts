@@ -53,7 +53,6 @@ export function resolveJcodeServerDir(
   } catch { /* fall back to the per-seat dir */ }
   return { dir: jcodeRuntimeDir(stateRoot, sessionName), shared: false };
 }
-
 /** How long one jcode self-report stays authoritative. The sweep polls at 1Hz, so a live
  *  socket refreshes it long before this; a dead socket's last answer expires and the seat
  *  falls back to sampling instead of freezing on a stale verdict. */
@@ -159,7 +158,6 @@ export function filterSessionsRowsToSeat(output: string, seat: string): string {
     return JSON.stringify(rows.filter((r) => r && typeof r === "object" && (r as { openrig_seat?: unknown }).openrig_seat === seat));
   } catch { return "[]"; }
 }
-
 export function readJcodeDebugSessions(socket: string, exec: (socket: string) => string | Promise<string>): Promise<JcodeSession[]> {
   return Promise.resolve().then(() => exec(socket)).then((output) => {
     const entries: unknown = JSON.parse(output);

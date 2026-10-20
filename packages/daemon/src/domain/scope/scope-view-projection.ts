@@ -184,6 +184,31 @@ function readLocks(fm: string): ScopeLocks {
   };
 }
 
+function readProofReport(fs: ScopeFsDeps, sliceDir: string): SliceScopeSummary["proofReport"] {
+  const file = "PROOF.md";
+  const proofPath = path.join(sliceDir, file);
+  if (!fs.exists(proofPath)) return null;
+  const content = fs.readFile(proofPath) ?? "";
+  const frontmatter = extractFrontmatterRaw(content);
+  const frontmatterVerdict = frontmatter ? fmValue(frontmatter, "verdict") : null;
+  if (frontmatterVerdict) {
+    return { file, verdict: frontmatterVerdict.match(/^[a-z][a-z-]*/i)?.[0]?.toLowerCase() ?? null, detail: frontmatterVerdict };
+  }
+
+  let inFence = false;
+  for (const line of content.split(/\r?\n/)) {
+    if (/^\s*(```|~~~)/.test(line)) { inFence = !inFence; continue; }
+    if (inFence || /^\s*>/.test(line) || /^\s{4,}\S/.test(line)) continue;
+    const match = /^\s*(?:\*\*)?Verdict(?:\*\*)?\s*:\s*(.*?)\s*$/i.exec(line)
+      ?? /^\s*Closed by:\s*.*?\s+Verdict:\s*(.*?)\s*$/i.exec(line);
+    if (!match) continue;
+    const detail = match[1]!.replace(/\*\*/g, "").trim();
+    const verdict = detail.match(/^[a-z][a-z-]*/i)?.[0]?.toLowerCase() ?? null;
+    return { file, verdict, detail: verdict ? detail : null };
+  }
+  return { file, verdict: null, detail: null };
+}
+
 /** Join drops → contract items: a drop's evidence ref matches an item by its 1-based
  *  index (the shipped `--evidences "4,5"` convention) or by exact item text. */
 function pairContract(items: ReturnType<typeof readProofContract>, drops: C1Drop[]): ProofContractItem[] {

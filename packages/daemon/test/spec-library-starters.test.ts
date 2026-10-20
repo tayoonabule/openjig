@@ -199,7 +199,7 @@ describe("Starter specs", () => {
 
     const rigs = lib.list({ kind: "rig" });
     expect(rigs.map((entry) => entry.name).sort()).toEqual([
-      "code-review", "factory", "kernel", "pm", "research", "secrets-manager", "starter",
+      "code-review", "factory", "first-project-jcode", "implementation-pair-jcode", "kernel", "pm", "research", "secrets-manager", "starter",
     ]);
   });
 

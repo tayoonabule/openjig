@@ -44,16 +44,16 @@ items:
     fs.utimesSync(path.join(dir, "status.yaml"), (NOW - MISSION_STATUS_STALE_MS - 60_000) / 1000, (NOW - MISSION_STATUS_STALE_MS - 60_000) / 1000);
     expect(readMissionStatus(dir, NOW)!.stale).toBe(true);
   });
-  it("freshness: fresh mtime with old authored updated_at is NOT stale (freshest of the two)", () => {
+  it("freshness: fresh mtime with old authored updated_at is stale (older of the two)", () => {
     write(`updated_at: 2026-10-09T01:00:00Z\nitems:\n  - {id: a, title: A, state: not-started}\n`);
     fs.utimesSync(path.join(dir, "status.yaml"), NOW / 1000, NOW / 1000);
-    expect(readMissionStatus(dir, NOW)!.stale).toBe(false);
+    expect(readMissionStatus(dir, NOW)!.stale).toBe(true);
   });
-  it("freshness: fresh updated_at with old mtime is NOT stale (freshest of the two)", () => {
+  it("freshness: fresh updated_at with old mtime is stale (older of the two)", () => {
     write(`updated_at: 2026-10-10T07:59:00Z\nitems:\n  - {id: a, title: A, state: not-started}\n`);
     const old = (NOW - MISSION_STATUS_STALE_MS - 60_000) / 1000;
     fs.utimesSync(path.join(dir, "status.yaml"), old, old);
-    expect(readMissionStatus(dir, NOW)!.stale).toBe(false);
+    expect(readMissionStatus(dir, NOW)!.stale).toBe(true);
   });
   it("containment: a status.yaml symlink escaping the root is refused; an in-root one is read", () => {
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "mstatus-out-"));
@@ -95,7 +95,6 @@ items:
     const s = readMissionStatus(dir, NOW)!;
     expect(s.items[0]!.hash).toBe("34e7702"); expect(s.items[1]!.hash).toBe("1234567"); expect(s.items[1]!.id).toBe("b");
   });
-
   it("accepted: review approve + (accepted_evidence OR qa starting pass/ACCEPTED) counts; bare accepted is refused", () => {
     write(`updated_at: 2026-10-10T07:59:00Z
 items:

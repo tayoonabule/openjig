@@ -14,7 +14,7 @@ export interface MissionStatusSummary {
   sourcePath: string;
   updatedAt: string | null;       // authored timestamp in the record
   fileModifiedAt: string;         // filesystem mtime, so a record nobody touched cannot look fresh
-  ageMs: number | null;           // from the freshest of the two timestamps
+  ageMs: number | null;           // from the older of the two timestamps
   stale: boolean;
   integration: Array<{ repo: string; branch: string | null; hash: string | null }>;
   total: number;                  // items excluding "excluded"
@@ -76,8 +76,8 @@ export function readMissionStatus(missionDir: string, now = Date.now(), containR
   const updatedAt = str(doc.updated_at);
   const authored = updatedAt ? Date.parse(updatedAt) : NaN;
   if (!updatedAt || Number.isNaN(authored)) issues.push("updated_at is missing or not a timestamp; freshness uses the file modification time only");
-  // freshness uses the FRESHEST of the authored timestamp and the file mtime (a lead edit or a refreshed updated_at both count as a real update)
-  const older = Number.isNaN(authored) ? mtime.getTime() : Math.max(authored, mtime.getTime());
+  // Freshness uses the older timestamp so touching the file cannot make stale authored content look fresh.
+  const older = Number.isNaN(authored) ? mtime.getTime() : Math.min(authored, mtime.getTime());
   const ageMs = Math.max(0, now - older);
   const integration = Object.entries((doc.integration ?? {}) as Record<string, any>).map(([repo, v]) => ({ repo, branch: str(v?.branch), hash: str(v?.hash) })).filter(i => i.hash !== null);
   return { sourcePath: file, updatedAt, fileModifiedAt: mtime.toISOString(), ageMs, stale: ageMs > MISSION_STATUS_STALE_MS, integration,

@@ -86,7 +86,6 @@ export function terminalRoutes(opts?: { bearerToken?: string | null }): Hono {
     const result = await svc.followView({ ...parsed, view: parsed.view ?? "", ...controls });
     return c.json(result, statusForOpen(result.ok, result.code));
   });
-
   app.get("/managed-views", c => {
     const controller = c.get("managedHerdrViews" as never) as { status(): Record<string, string> } | undefined;
     return c.json({ enabled: !!controller, findings: controller?.status() ?? {} });

@@ -1385,6 +1385,39 @@ export class TmuxAdapter {
     }
   }
 
+  /** True when a pane's shell has a non-shell process below it; null when process data is unavailable. */
+  async paneHasNonShellDescendant(paneId: string, isShell: (command: string) => boolean): Promise<boolean | null> {
+    const root = await this.getPanePid(paneId);
+    if (root == null) return null;
+    try {
+      const table = await this.exec("ps -A -o pid= -o ppid= -o comm=");
+      const children = new Map<number, Array<{ pid: number; comm: string }>>();
+      for (const line of table.split("\n")) {
+        const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+        if (!match) continue;
+        const entry = { pid: Number(match[1]), comm: match[3]!.trim() };
+        const ppid = Number(match[2]);
+        const list = children.get(ppid) ?? [];
+        list.push(entry);
+        children.set(ppid, list);
+      }
+      const queue = [root];
+      const seen = new Set<number>(queue);
+      while (queue.length) {
+        for (const child of children.get(queue.shift()!) ?? []) {
+          if (seen.has(child.pid)) continue;
+          seen.add(child.pid);
+          const base = child.comm.split("/").pop() ?? child.comm;
+          if (!isShell(base)) return true;
+          queue.push(child.pid);
+        }
+      }
+      return false;
+    } catch {
+      return null;
+    }
+  }
+
   /** KI-14: the server's `default-shell` option — what a createSession pane runs when no command is
    *  given. Used to make a respawn EXPLICIT about the blank shell instead of inheriting whatever
    *  command the pane was created with. Returns null if unavailable (caller falls back). */
@@ -1476,45 +1509,6 @@ export class TmuxAdapter {
       if (eq > 0) inherited[line.slice(0, eq)] = line.slice(eq + 1);
     }
     return inherited;
-  }
-
-  /**
-   * Does any process under the pane's shell run something other than a shell?
-   * A seat launched through a `/bin/sh <script>` wrapper reports `sh` as its
-   * pane command while the agent runtime runs as that script's child, so the
-   * pane command alone cannot tell a bare shell from a wrapped runtime.
-   * Returns null when the process table cannot be read.
-   */
-  async paneHasNonShellDescendant(paneId: string, isShell: (command: string) => boolean): Promise<boolean | null> {
-    const root = await this.getPanePid(paneId);
-    if (root == null) return null;
-    try {
-      const table = await this.exec(`ps -A -o pid= -o ppid= -o comm=`);
-      const children = new Map<number, Array<{ pid: number; comm: string }>>();
-      for (const line of table.split("\n")) {
-        const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
-        if (!match) continue;
-        const entry = { pid: Number(match[1]), comm: match[3]!.trim() };
-        const ppid = Number(match[2]);
-        const list = children.get(ppid) ?? [];
-        list.push(entry);
-        children.set(ppid, list);
-      }
-      const queue = [root];
-      const seen = new Set<number>(queue);
-      while (queue.length) {
-        for (const child of children.get(queue.shift()!) ?? []) {
-          if (seen.has(child.pid)) continue;
-          seen.add(child.pid);
-          const base = child.comm.split("/").pop() ?? child.comm;
-          if (!isShell(base)) return true;
-          queue.push(child.pid);
-        }
-      }
-      return false;
-    } catch {
-      return null;
-    }
   }
 
   /** OPR.0.4.3.28 Part C — usable-presence check for a session-env variable.

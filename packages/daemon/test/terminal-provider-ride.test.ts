@@ -560,6 +560,8 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
           if ((params as Record<string, unknown>)["label"] != null) throw new Error("unknown param: label");
           return { type: "workspace_created", workspace_id: "wH" };
         }
+        if (method === "layout.apply") return { type: "layout_apply", layout: { workspace_id: "wH", tab_id: "wH:t1" } };
+        if (method === "pane.list") return { type: "pane_list", panes: [{ tab_id: "wH:t1", label: pane.label }] };
         return { type: "layout_apply" };
       },
     });
@@ -568,16 +570,37 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
     expect(res.ok).toBe(true);
     expect(res.opened).toEqual(["a@r"]);
     // Existing workspace/tab checks run before creation; the label retry then falls back once.
-    // This create reply has no tab id, so the adapter cannot verify panes or focus a tab.
-    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.list", "workspace.create", "workspace.list", "workspace.create", "layout.apply"]);
+    // The create reply has no tab id; layout.apply supplies the tab identity for confirmation.
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.list", "workspace.create", "workspace.list", "workspace.create", "layout.apply", "pane.list", "tab.focus"]);
     expect((requests[6]!.params as Record<string, unknown>)["workspace_id"]).toBe("wH");
     expect(res.notes?.join(" ")).toContain('refused the workspace name "v"');
   });
 
   it("an existing complete roster gets a fresh workspace on relaunch", async () => {
     const { transport, requests } = fakeSocketTransport({
+      respond: async (method, params) => {
+        if (method === "tab.list") return { tabs: [{ workspace_id: "wOld", label: "openrig:v#old" }] };
+        if (method === "workspace.list") return { workspaces: [{ workspace_id: "wOld", label: "v" }] };
+        if (method === "pane.list") {
+          const workspaceId = (params as Record<string, unknown>)["workspace_id"];
+          return { panes: [{ tab_id: workspaceId === "wOld" ? "wOld:t1" : "wNew:t2", label: "pod.a · s02" }] };
+        }
+        if (method === "workspace.create") return { type: "workspace_created", workspace: { workspace_id: "wNew", tab: { tab_id: "wNew:t1" } } };
+        if (method === "layout.apply") return { type: "layout_apply", layout: { workspace_id: "wNew", tab_id: "wNew:t2" } };
+        return { type: "ok" };
+      },
+    });
+    const adapter = new HerdrAdapter({ transportFactory: () => transport, newLaunchToken: () => "new" });
+    const res = await adapter.openView(view);
+    expect(res.ok).toBe(true);
+    expect(requests.map((request) => request.method)).toContain("workspace.create");
+    expect(requests.find((request) => request.method === "layout.apply")?.params).toMatchObject({ workspace_id: "wNew" });
+  });
+
+  it("reuses an exact launch-token tab", async () => {
+    const { transport, requests } = fakeSocketTransport({
       respond: async (method) => {
-        if (method === "tab.list") return { tabs: [{ workspace_id: "wX", label: "openrig:vv#l2" }, { workspace_id: "wOld", label: "openrig:v#l1" }] };
+        if (method === "tab.list") return { tabs: [{ workspace_id: "wOld", label: "openrig:v#tok" }] };
         if (method === "pane.list") return { panes: [{ pane_id: "wOld:p2", label: "pod.a · s02" }] };
         return { type: "ok" };
       },
@@ -586,8 +609,10 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
     const res = await adapter.openView(view);
     expect(res.ok).toBe(true);
     expect(res.opened).toEqual(["a@r"]);
-    expect(requests.map((r) => r.method)).toEqual(["tab.list", "pane.list", "workspace.list", "workspace.create", "layout.apply", "pane.list", "tab.focus"]);
-    expect(requests.some((r) => r.method === "workspace.focus" || r.method === "workspace.rename")).toBe(false);
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.rename", "workspace.focus", "pane.list"]);
+    expect(requests[1]!.params).toEqual({ workspace_id: "wOld", label: "v" });
+    expect(requests[2]!.params).toEqual({ workspace_id: "wOld" });
+    expect(requests[3]!.params).toEqual({ workspace_id: "wOld" });
   });
 
   it("REGRESSION roster growth: seats added after the workspace was made get ONE new tab; existing tiles untouched", async () => {
@@ -641,9 +666,14 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
 
   it("an older complete workspace is left intact while a fresh relaunch opens separately", async () => {
     const { transport, requests } = fakeSocketTransport({
-      respond: async (method) => {
+      respond: async (method, params) => {
         if (method === "workspace.list") return { workspaces: [{ workspace_id: "wOld", label: "openrig:v#l1" }, { workspace_id: "wX", label: "openrig:vv#l2" }] };
-        if (method === "pane.list") return { panes: [{ label: "pod.a · s02" }] };
+        if (method === "pane.list") {
+          const workspaceId = (params as Record<string, unknown>)["workspace_id"];
+          return { panes: [{ tab_id: workspaceId === "wOld" ? "wOld:t1" : "wNew:t2", label: "pod.a · s02" }] };
+        }
+        if (method === "workspace.create") return { type: "workspace_created", workspace: { workspace_id: "wNew", tab: { tab_id: "wNew:t1" } } };
+        if (method === "layout.apply") return { type: "layout_apply", layout: { workspace_id: "wNew", tab_id: "wNew:t2" } };
         return { type: "ok" };
       },
     });

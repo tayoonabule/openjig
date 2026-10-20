@@ -72,6 +72,7 @@ export class SeatActivityService {
   private readonly eventBus: EventBus | null;
   private readonly now: () => Date;
   private readonly latestByPaneId = new Map<string, SeatActivity>();
+  private readonly contentByPane = new Map<string, { hash: string; changedAtMs: number }>();
   // Single-flight guard: one whole-fleet window-activity sweep at a time, mirroring
   // seat-structural-activity-service (MUST-FIX 2). A slowed tmux can never accumulate
   // overlapping whole-fleet sweeps — at most one sweep's worth is ever in flight.
@@ -82,8 +83,6 @@ export class SeatActivityService {
   // with NO transcript change, which read as endless "working". Per pane: hash of the last captured content
   // and the epoch-ms it last CHANGED. An active-by-window reading with unchanged content for a full silence
   // window is repaint chrome, so it reports idle. Capture failure/unavailable = the raw reading stands.
-  private readonly contentByPane = new Map<string, { hash: string; changedAtMs: number }>();
-
   private readonly selfReportReader: SeatActivityServiceDeps["selfReportReader"] | null;
 
   private readonly restoreHookEvidence: SeatActivityServiceDeps["restoreHookEvidence"] | null;
@@ -745,7 +744,6 @@ export class SeatActivityService {
       if (rung === "lifecycle-hooks" && evd.activity === "idle-at-prompt" && evd.livenessSeconds
           && (this.latestByRung(seat, rung)?.needsInput?.count ?? 0) === 0
           && nowMs - Date.parse(evd.observedAt) > 2 * 1000 * evd.livenessSeconds) continue;
-      if (rung === "lifecycle-hooks" && nowMs - Date.parse(evd.observedAt) > HOOK_AUTHORITY_WINDOW_MS) continue;
       return evd;
     }
     return null;

@@ -76,7 +76,7 @@ export interface UsageHostOptions {
 const toEpoch = (iso: string) => Math.floor(Date.parse(iso) / 1000);
 // Keep the default fixture clock before its fixed reset; elapsed-time checks still use real timers.
 const DEFAULT_NOW = "2026-10-13T23:30:00.000Z";
-export const DEFAULT_RESET = "2026-10-20T00:00:00.000Z";
+export const DEFAULT_RESET = "2027-10-20T00:00:00.000Z";
 
 export class UsageHost {
   readonly requests: Array<{ method: string; path: string }> = [];

@@ -326,9 +326,25 @@ function runsForThisSeatsProject(env = process.env) {
 }
 // --- end seat project boundary ---
 
+function jcodeHookPayload(env) {
+  // Jcode supplies lifecycle data in environment variables rather than stdin.
+  const jcodeEvents = {
+    turn_start: "UserPromptSubmit",
+    turn_end: "Stop",
+    session_start: "SessionStart",
+    session_end: "SessionEnd",
+  };
+  const payload = parseJson(env.JCODE_HOOK_PAYLOAD);
+  return {
+    ...payload,
+    hookEvent: jcodeEvents[env.JCODE_HOOK_EVENT] || env.JCODE_HOOK_EVENT,
+    session_id: env.JCODE_HOOK_SESSION_ID || payload.session_id,
+  };
+}
+
 async function main() {
   // Before anything is read, posted or recorded: a Claude started elsewhere inside this seat is not the seat.
-  if (!process.env.JCODE_HOOK_EVENT && !runsForThisSeatsProject()) return;
+  if (!runsForThisSeatsProject()) return;
   const providerPayload = process.env.JCODE_HOOK_EVENT
     ? jcodeHookPayload(process.env)
     : parseJson(await readStdin());

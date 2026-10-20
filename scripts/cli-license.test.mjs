@@ -9,7 +9,7 @@ test("the CLI build carries the unchanged repository LICENSE and README into npm
   const root = mkdtempSync(join(tmpdir(), "cli-license-"));
   try {
     const cli = join(root, "packages/cli");
-    const bin = join(root, "bin");
+    const bin = join(cli, "node_modules/.bin");
     for (const dir of [cli, bin, join(cli, "src/schemas"), join(cli, "src/lib/scope-templates")]) mkdirSync(dir, { recursive: true });
     copyFileSync("LICENSE", join(root, "LICENSE"));
     copyFileSync("README.md", join(root, "README.md"));

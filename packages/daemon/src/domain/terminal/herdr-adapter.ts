@@ -90,6 +90,11 @@ export const HERDR_PANES_UNCONFIRMED_NOTE = "herdr could not confirm these panes
 
 const normalLabel = (label: string): string => label.trim().replace(/\s+/g, " ");
 
+/** Sidebar name for a view: the rig name for `rig:<name>`, the view id otherwise. */
+export function readableWorkspaceLabel(viewId: string): string {
+  return viewId.startsWith("rig:") ? viewId.slice("rig:".length) : viewId;
+}
+
 /** A listed label matches a composed one exactly, or as a prefix (a truncated label, with or without a trailing ellipsis). */
 function labelMatches(listed: string, composed: string): boolean {
   const shown = normalLabel(listed).replace(/(…|\.\.\.)$/, "").trimEnd();
@@ -258,11 +263,6 @@ export interface HerdrLayoutPlan {
    */
   workspaceLabel: string;
   pages: HerdrPagePlan[];
-}
-
-/** Sidebar name for a view: the rig name for `rig:<name>`, the view id otherwise. */
-export function readableWorkspaceLabel(viewId: string): string {
-  return viewId.startsWith("rig:") ? viewId.slice("rig:".length) : viewId;
 }
 
 /**
@@ -537,9 +537,8 @@ export class HerdrAdapter implements TerminalProvider {
       };
     }
 
-    // An existing workspace is reused only to fill roster growth. A relaunch with
-    // the same complete roster continues to the fresh-workspace path below, so it
-    // cannot replace or silently reuse the prior launch's tiles.
+    // Retries carrying the exact launch token are idempotent. A new open gets a
+    // fresh token and therefore a fresh workspace unless the existing roster grew.
     try {
       const prefix = `${this.tabPrefix}:${view.id}#`;
       const keyed = (rows: unknown) =>
@@ -547,6 +546,18 @@ export class HerdrAdapter implements TerminalProvider {
           (r) => typeof r.label === "string" && r.label.startsWith(prefix) && r.workspace_id,
         );
       const tabs = await this.transport.request("tab.list", {}).catch(() => ({}) as HerdrResult);
+      const exactLabel = plan.pages[0]?.tabLabel;
+      const exact = ((tabs["tabs"] as Array<{ workspace_id?: string; label?: string }> | undefined) ?? [])
+        .find((tab) => tab.label === exactLabel && tab.workspace_id);
+      if (exact?.workspace_id) {
+        await this.transport
+          .request("workspace.rename", { workspace_id: exact.workspace_id, label: plan.workspaceLabel })
+          .catch(() => undefined);
+        await this.transport.request("workspace.focus", { workspace_id: exact.workspace_id });
+        // Reuse the same pane confirmation/degradation path as roster growth. A failed
+        // pane.list must not turn a known exact-token retry into a duplicate workspace.
+        return this.fillExisting(exact.workspace_id, view, launchToken, { absent, degraded });
+      }
       const existingId =
         keyed(tabs["tabs"])?.workspace_id ??
         keyed((await this.transport.request("workspace.list", {}))["workspaces"])?.workspace_id;

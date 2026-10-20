@@ -113,6 +113,11 @@ General engineering skills OpenRig ships as vendored copies. Open when the task 
 - **frontend-design** — designing frontend / UI.
 - **dogfood** — web-QA / dogfooding a shipped UI.
 
+### Shared workspace guidance — read when the task matches
+These are canonical workspace documents, not generated skills. They apply across rigs and seats.
+
+- **Jira ticket writing** — before creating or editing any Jira ticket, read `~/.openrig/workspace/knowledge/jira-ticket-writing-guide.md`. Search Jira/Rovo first and extend existing work where appropriate; avoid open-ended investigations; use an outcome title and the required Context, Goal, Scope, Technical notes, Effort, and testable Acceptance Criteria sections; follow the guide's comment and linking rules.
+
 ## When OpenRig itself misbehaves
 
 Run `rig context get help`: the one help guide for your installed version, from symptom to next step, known problems,

@@ -6,7 +6,7 @@ import { Command } from "commander";
 import { DaemonClient } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
-import { isGitHubBundleLink, importGitHubBundle, bundleIdentityLines, printBundleLinkError } from "../lib/bundle-source.js";
+import { isGitHubBundleLink, importGitHubBundle, bundleIdentityLines, printBundleLinkError, rigSpecName } from "../lib/bundle-source.js";
 import { checkBundleFolder } from "../lib/bundle-check.js";
 import type { StatusDeps } from "./status.js";
 import { showBundleBehaviourBeforeAction } from "../bundle-behaviour.js";
@@ -29,9 +29,20 @@ export function getCliVersion(): string {
 }
 
 /** Keep the daemon's messages readable in human output; JSON retains the original body. */
-export function bundleInstallError(data: Record<string, unknown>): unknown {
+export function bundleInstallError(data: Record<string, unknown>, includeWarnings = true): string {
   const error = data.error ?? data.errors ?? "Install failed";
-  return Array.isArray(error) ? error.join("\n") : error;
+  const lines = (Array.isArray(error) ? error : [error]).map(String);
+  if (typeof data.detail === "string") lines.push(data.detail);
+  for (const conflict of Array.isArray(data.conflicts) ? data.conflicts : []) {
+    if (typeof conflict?.description === "string") lines.push(conflict.description);
+  }
+  for (const resolution of Array.isArray(data.resolutions) ? data.resolutions : []) {
+    if (typeof resolution === "string") lines.push(resolution);
+  }
+  for (const warning of includeWarnings && Array.isArray(data.warnings) ? data.warnings : []) {
+    if (typeof warning === "string") lines.push(`Warning: ${warning}`);
+  }
+  return [...new Set(lines)].join("\n");
 }
 
 /**
@@ -65,8 +76,9 @@ export function bundleCommand(depsOverride?: StatusDeps): Command {
   cmd.command("create <spec>")
     .description("Create a .rigbundle from a rig spec or GitHub folder link")
     .requiredOption("-o, --output <path>", "Output path for .rigbundle")
-    .option("--name <name>", "Bundle name", "my-bundle")
+    .option("--name <name>", "Bundle name (default: the rig's name in rig.yaml)")
     .option("--bundle-version <ver>", "Bundle version", "0.1.0")
+    .option("--include-login-files", "Include harness login files only if recipients should have them and their owner agrees (for example, an internal test bundle); record exact paths in the manifest")
     .option("--include-packages <refs...>", "Package refs to include (default: all from spec)")
     .option("--rig-root <root>", "Root directory for pod-aware resolution")
     .option("--context-pack <dir>", "Carry the context pack in <dir> (its manifest.yaml and declared files), which may sit outside the rig folder; repeatable", (dir: string, dirs: string[]) => [...dirs, dir], [] as string[])
@@ -78,7 +90,7 @@ export function bundleCommand(depsOverride?: StatusDeps): Command {
     .option("--min-cli-version <ver>", "Minimum CLI version required to install this bundle (Item 2 compatibility)")
     .option("--allow-drift", "Bundle a spec that disagrees with the running rig of the same name; the divergence is stamped into bundle provenance")
     .option("--json", "JSON output")
-    .action(async (spec: string, opts: { output: string; name: string; bundleVersion: string; includePackages?: string[]; rigRoot?: string; contextPack?: string[]; projectDir?: string; preset?: string; seat?: string[]; notes?: string; minDaemonVersion?: string; minCliVersion?: string; allowDrift?: boolean; json?: boolean }) => {
+    .action(async (spec: string, opts: { output: string; name?: string; bundleVersion: string; includePackages?: string[]; includeLoginFiles?: boolean; rigRoot?: string; contextPack?: string[]; projectDir?: string; preset?: string; seat?: string[]; notes?: string; minDaemonVersion?: string; minCliVersion?: string; allowDrift?: boolean; json?: boolean }) => {
       const deps = getDepsF();
       if (isGitHubBundleLink(spec)) {
         try {
@@ -117,6 +129,7 @@ export function bundleCommand(depsOverride?: StatusDeps): Command {
       // them against ITS cwd. Nothing is uploaded — the files must exist on the daemon's host.
       // A chosen configuration is applied to an owned copy of the rig folder; the author's folder is never changed.
       let specPath = nodePath.resolve(spec);
+      const bundleName = opts.name ?? rigSpecName(specPath) ?? "my-bundle";
       let rigRoot = opts.rigRoot ? nodePath.resolve(opts.rigRoot) : undefined;
       let chosen: ChosenConfiguration | undefined;
       let stagingDir: string | undefined;
@@ -138,8 +151,9 @@ export function bundleCommand(depsOverride?: StatusDeps): Command {
         }
       }
       const res = await client.post<Record<string, unknown>>("/api/bundles/create", {
-        specPath, bundleName: opts.name, bundleVersion: opts.bundleVersion, outputPath: nodePath.resolve(opts.output),
+        specPath, bundleName, bundleVersion: opts.bundleVersion, outputPath: nodePath.resolve(opts.output),
         includePackages: opts.includePackages,
+        ...(opts.includeLoginFiles ? { includeLoginFiles: true } : {}),
         rigRoot,
         ...(opts.contextPack?.length ? { contextPackDirs: opts.contextPack.map((dir) => nodePath.resolve(dir)) } : {}),
         ...(opts.projectDir ? { projectDir: nodePath.resolve(opts.projectDir) } : {}),
@@ -245,6 +259,7 @@ export function bundleCommand(depsOverride?: StatusDeps): Command {
       console.log(`Digest valid: ${res.data["digestValid"]}`);
       const ir = res.data["integrityResult"] as Record<string, unknown>;
       console.log(`Integrity: ${ir["passed"] ? "PASS" : "FAIL"}`);
+      for (const error of (ir["errors"] as string[] | undefined) ?? []) console.error(error);
       // What install will add before any seat launches
       const packs = m["contextPacks"] as string[] | undefined;
       if (packs?.length) console.log(`Context packs: ${packs.join(", ")}`);
@@ -349,7 +364,7 @@ export function bundleCommand(depsOverride?: StatusDeps): Command {
       if (opts.json) console.log(JSON.stringify(result));
       else {
         console.log(`Bundle standard: ${result.standardVersion} (advisory)`);
-        for (const check of result.checks) console.log(`${check.status}: ${check.ruleId}: ${check.reason}`);
+        for (const check of result.checks) console.log(`${check.status}: ${check.ruleId}: ${check.reason}${check.path ? ` (${check.path})` : ""}`);
       }
       if (result.checks.some(check => check.status === "finding")) process.exitCode = 1;
     });
@@ -381,6 +396,10 @@ export function bundleCommand(depsOverride?: StatusDeps): Command {
         console.error(res.data["error"] ?? "History fetch failed");
         process.exitCode = 2;
         return;
+      }
+      // An advisory (e.g. a since that isn't a date or time) goes to stderr, so stdout stays the listing.
+      for (const advisory of Array.isArray(res.data["advisories"]) ? res.data["advisories"] : []) {
+        console.error(`Note: ${advisory}`);
       }
       const records = Array.isArray(res.data["records"]) ? res.data["records"] as Array<Record<string, unknown>> : [];
       if (records.length === 0) {

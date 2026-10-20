@@ -437,7 +437,7 @@ exit 1
     expect(env.stdout).not.toContain("TRACE GAP");
   });
 
-  it("leaves a standalone run with no daemon answer on the old cwd inference and gap text", () => {
+  it("keeps standalone cwd inference and names literal-path recovery when unresolved", () => {
     const f = fixture();
     const inside = trace(["--trees", "work"], unpinned(f.env), f.workStart);
     expect(inside.status).toBe(0);
@@ -447,7 +447,7 @@ exit 1
     const outside = trace(["--trees", "work"], unpinned(f.env), dirname(f.workspace));
     expect(outside.status).toBe(0);
     expect(outside.stdout).toContain(
-      "TRACE GAP — current work node is unresolved; set OPENRIG_REFOCUS_WORK_NODE",
+      "TRACE GAP — current work node is unresolved; pass --work-start with a literal absolute path (or configure OPENRIG_REFOCUS_WORK_NODE separately)",
     );
   });
 
@@ -475,9 +475,8 @@ exit 1
     expect(publicText).not.toMatch(/v-openrig-build|release-0\.5\.5|qitem-/i);
   });
 
-  // One fire used to start 7 rig processes on a typed slice: queue whoami, two config gets,
-  // whoami, and one resolver call per level. The hook now reads both roots with one config read
-  // and the script takes a canonical seat from OPENRIG_SESSION_NAME, which leaves 5.
+  // A typed fire uses queue whoami and one config read. Notes resolve locally,
+  // and a canonical OPENRIG_SESSION_NAME avoids a separate identity process.
   describe("rig processes per fire", () => {
     const typed = (workNodePath: string) =>
       JSON.stringify({ currentWork: { workNodePath }, currentWorkBasis: "one typed in-progress work node" });
@@ -524,10 +523,7 @@ exit 1
       return { ...result, context, calls: f.calls() };
     }
 
-    const resolverCalls = (f: ReturnType<typeof fixture>, nodes: string[]) =>
-      nodes.map((node) => `scope resolve-notes ${join(realpathSync(f.workspace), node)} --json`);
-
-    it("spends 5 rig processes on a typed fire and 3 on the no-baton fallback", () => {
+    it("spends 2 rig processes on both typed and no-baton fires", () => {
       const f = fixture();
       const typedFire = hook(f);
       expect(typedFire.status).toBe(0);
@@ -539,15 +535,24 @@ exit 1
       expect(typedFire.calls).toEqual([
         "queue whoami --json",
         "config --json",
-        ...resolverCalls(f, ["", "missions/release", "missions/release/slices/feature"]),
       ]);
 
       const fallback = hook(f, { RIG_QUEUE_WHOAMI_STDOUT: JSON.stringify({ currentWork: null, currentWorkBasis: NO_BATON }) });
       expect(fallback.status).toBe(0);
       expect(fallback.context).toContain(`FALLBACK — no current typed baton (${NO_BATON})`);
       expect(fallback.context).toContain("Builder learned");
-      expect(fallback.calls).toEqual(["queue whoami --json", "config --json", ...resolverCalls(f, [""])]);
+      expect(fallback.calls).toEqual(["queue whoami --json", "config --json"]);
     });
+
+    it("local notes avoid a delayed CLI inside the unchanged default trace cap", () => {
+      const f = fixture();
+      const result = hook(f, { RIG_SLOW_RESOLVE: "3", OPENRIG_REFOCUS_BUDGET_MS: "" });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.context).toContain("Deliver refocus");
+      expect(result.context).toContain("NOTES · NOTES.md");
+      expect(result.context).not.toContain("TRACE GAP");
+      expect(result.calls.filter(call => call.startsWith("scope resolve-notes"))).toEqual([]);
+    }, 15_000);
 
     it("sets no root from a failed or malformed config read, so the script's own lookup runs as before", () => {
       const f = fixture();
@@ -717,6 +722,14 @@ exit 1
 });
 
 describe("openrig-core refocus hook — delivery state", () => {
+  // These cases exercise delivery state; the real dual-tree trace is covered above.
+  function successfulTrace(home: string): string {
+    const script = join(home, "trace-success");
+    writeFileSync(script, '#!/bin/sh\nprintf "WORK TRACE: fixture intent\\n"\n');
+    chmodSync(script, 0o755);
+    return script;
+  }
+
   it("retains due state at Stop, then consumes one context-visible delivery", () => {
     root = mkdtempSync(join(tmpdir(), "refocus-delivery-state-"));
     const home = join(root, "home");
@@ -725,6 +738,7 @@ describe("openrig-core refocus hook — delivery state", () => {
     mkdirSync(join(home, "refocus"), { recursive: true });
     writeFileSync(state, JSON.stringify({ lastBytes: 0 }), "utf8");
     writeFileSync(transcript, "due transcript bytes", "utf8");
+    const python = successfulTrace(home);
 
     const invoke = (event: string) => spawnSync(process.execPath, [HOOK, "--runtime", "claude"], {
       input: JSON.stringify({ hook_event_name: event, transcript_path: transcript }),
@@ -739,6 +753,7 @@ describe("openrig-core refocus hook — delivery state", () => {
         OPENRIG_REFOCUS_TREES: "work",
         OPENRIG_WORKSPACE_ROOT: home,
         OPENRIG_REFOCUS_WORK_NODE: home,
+        PYTHON: python,
       },
     });
 
@@ -754,6 +769,7 @@ describe("openrig-core refocus hook — delivery state", () => {
     const delivered = invoke("UserPromptSubmit");
     expect(delivered.status).toBe(0);
     expect(JSON.parse(delivered.stdout).hookSpecificOutput.additionalContext).toContain("REFOCUS (");
+    expect(delivered.stdout).not.toContain("TRACE GAP");
     const deliveredState = JSON.parse(readFileSync(state, "utf8"));
     expect(deliveredState).toMatchObject({
       lastBytes: Buffer.byteLength("due transcript bytes"),
@@ -771,6 +787,7 @@ describe("openrig-core refocus hook — delivery state", () => {
     const home = join(root, "home");
     const state = join(home, "refocus", "seat@test__postcompact-occupant.json");
     mkdirSync(home, { recursive: true });
+    const python = successfulTrace(home);
     const invoke = (event: string) => spawnSync(process.execPath, [HOOK, "--runtime", "codex"], {
       input: JSON.stringify({ hook_event_name: event, session_id: "postcompact-occupant", transcript_path: "" }),
       encoding: "utf8",
@@ -782,6 +799,9 @@ describe("openrig-core refocus hook — delivery state", () => {
         OPENRIG_REFOCUS_TREES: "work",
         OPENRIG_WORKSPACE_ROOT: home,
         OPENRIG_REFOCUS_WORK_NODE: home,
+        OPENRIG_REFOCUS_CONTENT_REF: undefined,
+        OPENRIG_REFOCUS_CONTENT_FILE: undefined,
+        PYTHON: python,
       },
     });
 
@@ -793,6 +813,7 @@ describe("openrig-core refocus hook — delivery state", () => {
     const delivered = invoke("UserPromptSubmit");
     expect(delivered.status).toBe(0);
     expect(JSON.parse(delivered.stdout).hookSpecificOutput.additionalContext).toContain("just compacted");
+    expect(delivered.stdout).not.toContain("TRACE GAP");
     expect(JSON.parse(readFileSync(state, "utf8"))).not.toHaveProperty("pendingOn");
   });
 });

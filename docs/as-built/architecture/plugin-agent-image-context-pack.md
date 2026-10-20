@@ -9,14 +9,14 @@ applies-when: |
   agent-image capture/fork/protection, or Claude guided-compaction behavior.
 siblings: [packaging-bootstrap-bundles.md, agent-spec-and-startup.md]
 prerequisite-reads: [../README.md, agent-spec-and-startup.md]
-last-verified-against-source: a350c59b5a5fb37ee4a21b1026b595068b603df1
-last-updated: 2026-10-05
+last-verified-against-source: e8f0ab340db773392ec8be75b072d1c0f3068a50
+last-updated: 2026-10-08
 ---
 
 # Content libraries and compaction
 
 This module describes source at main commit
-`a350c59b5a5fb37ee4a21b1026b595068b603df1`. Source paths below are repository-relative.
+`e8f0ab340db773392ec8be75b072d1c0f3068a50`. Source paths below are repository-relative.
 Context packs, plugins and agent images have filesystem-backed content and daemon-side
 discovery. Their consumers can read database identity, mutate files, deliver messages or
 launch sessions; the whole layer is not a read-only catalog.
@@ -130,6 +130,16 @@ topology and project selections. It projects skills into `<cwd>/.claude/skills` 
 composed projection and reconciles it only with `--apply`; `rig skill audit` is a separate
 read-only provenance and freshness audit. Launch applies the selected loadout per seat.
 
+For a Claude Code or Codex seat, the profile resolver also adds each selected plugin's skills to
+that loadout (`packages/daemon/src/domain/profile-resolver.ts:309–330`, with
+`resolvePluginSkills()` at `skill-catalog.ts:460`). Neither runtime reads skills from the plugin
+folder projected into the working directory. The skills are projected under their plain names,
+and a skill the profile already selects keeps its source. A kept plugin copy (an edited or
+user-owned one, or OpenRig's own copy whose plugin source changed or moved after the loadout
+was resolved, `skill-catalog.ts:1060–1068`) gives a `plugin_skill_kept` warning, and an unreadable one gives
+`plugin_skill_skipped`. If plugin skills can't be projected at all, the seat starts without them
+and gets a `plugin_skills_not_projected` warning (`rigspec-instantiator.ts:2045`).
+
 ## Agent images and forks
 
 `packages/daemon/src/domain/agent-images/agent-image-library-service.ts` implements
@@ -178,7 +188,8 @@ The routes mount at `/api/agent-images` and expose list/sync, snapshot/fork,
 entry/preview, pin/unpin, delete and prune.
 `packages/cli/src/commands/agent-image.ts` owns the image library commands. The top-level
 `rig fork` verb (`packages/cli/src/commands/fork.ts`) drives `POST /fork`; `--keep-image`
-also captures a pinned image.
+also captures a pinned image. Forking a Claude Code seat needs Claude Code 2.0.73 or later,
+because the fork is launched with its own `--session-id`.
 
 ## Plugins
 
@@ -223,8 +234,12 @@ changed files but never deletes files the new version dropped.
 `ensureSkillGlobally()` projects a named plugin skill using a vendor-version marker.
 An existing unversioned global skill remains externally owned. Startup wires this service
 and its filesystem implementation; inspect that wiring when changing projection roots. At
-startup only `openrig-core` is vendored, and it is projected globally as `openrig-skills` into
-`~/.claude/skills` and `~/.agents/skills`.
+startup only `openrig-core` is vendored, and its `openrig-skills` and `refocusing` skills are
+projected globally into `~/.claude/skills` and `~/.agents/skills`
+(`packages/daemon/src/startup.ts:877–886`). The packaged `rigs` skill
+(`packages/daemon/assets/skills/rigs`) is not a plugin skill: `ensureSkillDirGlobally()`
+projects it into the same roots under the daemon version, so each upgrade refreshes it
+(`startup.ts:891–899`). A failed global projection is logged and does not stop startup.
 
 `ensureLatest()` performs local vendoring before `attemptAutoFetch()`. The latter
 requests a release asset with a bounded timeout and logs failures; even its successful
@@ -249,18 +264,36 @@ Code. Its implementation requires Claude Code, observed usage and a valid intege
 post-restore cooldown (10 minutes), the deduplication window (60 seconds) and the
 already-triggered latch; an active manual attempt also blocks it.
 
+While the policy is enabled with a valid threshold (`managedCompactionActive` in
+`packages/daemon/src/adapters/kernel-authority.ts`, using the enforcer's exported `isValidThresholdPercent`),
+`operationalLaunchArgs` merges `idleCompaction: false` into the Claude launch's one `--settings` value, adding one
+when there is none. Fresh launch, fork, resume (`claude-code-adapter.ts`) and restore (`claude-resume.ts`) all build
+their Claude arguments there. The policy is read at each launch; a running session keeps the settings it was launched
+with. Claude Code before 2.1.290 ignores the key, Claude's managed settings take precedence over `--settings`, and
+`autoCompactEnabled` is not set.
+
 `/compact` is held behind a preparation attempt:
 
 1. The first above-threshold tick starts an attempt with its own ID, the seat's occupant
    generation, a restore-map path and a completion marker, then sends only the prep prompt.
    An unknown occupant generation stops the attempt at once.
-2. Later ticks return `preparation_pending` until the attempt's `RESTORE-MAP.md` exists and
-   ends with that exact marker. The map path is under the seat's working directory
+2. The agent writes `RESTORE-MAP.md.tmp` with its file-edit tool, completion marker last.
+   Later ticks return `preparation_pending` until that exact map is complete. The map path is under the seat's working directory
    (`.openrig/compaction/preparation/<session>/<attempt>/`, with a `.gitignore` of `*`) when
    that is writable, otherwise under `compaction/preparation/` in the OpenRig home.
-3. Only then is `/compact` sent, with the map path appended to the compact instruction.
+3. The daemon atomically renames the completed temp file to `RESTORE-MAP.md` in its existing
+   final send checks, after rechecking the attempt and occupant. An already-complete final map
+   remains compatible. Only then is `/compact` sent, with the final map path appended to the
+   compact instruction. Publication failure cannot authorize `/compact`.
 4. The continuation then runs below the threshold: turn boundary, restore prompt, then a
-   read-depth audit prompt (each item marked `FULL`, `PARTIAL` or `NOT_READ`).
+   read-depth audit prompt (each item marked `FULL`, `PARTIAL` or `NOT_READ`), one stage per
+   poll tick. A seat refreshes its usage sample only when it takes a turn, so when the sample is
+   stale, unknown or has no percentage and a stage is pending, the monitor drains that stage
+   without one (`context-monitor.ts:175`, `claude-compaction-enforcer.ts:436`). Only a fresh,
+   known sample can start a compaction. The sample-less drain reads readiness from the pane alone
+   and counts a timer-less live status row, such as `✻ Compacting conversation…`, as work
+   (`session-transport.ts:153-161`); a recent hook showing work or a waiting person still
+   refuses. It records no width receipt, because the only figure would be the pre-compact one.
 
 An automatic attempt has a 25-minute ceiling that starts once the prep is delivered. A stale
 occupant generation, the policy becoming disabled, or the deadline passing stops it. A prep
@@ -276,7 +309,7 @@ over the global extra file, and an extra file that declares a different seat is 
 manually through `/api/compaction/trigger`, `cancel` and `state`, which use the terminal
 bearer-token middleware; it passes every request through when no token is configured.
 `--skip-map` skips the map requirement once, `--cancel` ends the preparation, and `--state`
-shows the attempt, its expected map and its deadline. A manual attempt has 120 seconds for
+shows the attempt, its expected map and its deadline. Ordinary approval prompts during preparation can be answered within that same deadline; OpenRig waits without answering them. A manual attempt has 180 seconds for
 preparation and the idle wait.
 
 The below-threshold continuation checks policy enablement too, except for an explicitly

@@ -38,15 +38,11 @@ export function snapshotMatchesCurrentOccupants(
   }>;
 
   const recorded = readFreshOccupantRelations(db, rig.rig.id);
+  // A clean down exits the fresh occupant without revoking its relation.
+  // Keep that row for snapshot comparison, but exclude unrelated exited history.
+  const candidates = rows.filter((row) => row.status !== "exited" || recorded[row.nodeId] === row.id);
   for (const node of rig.nodes) {
-    // A recorded fresh-launch relation names its occupant by id. A clean
-    // `rig down` marks that occupant exited, so the relation must still be able
-    // to see exited rows or it reads as dangling and the matching snapshot is
-    // wrongly rejected as an older occupant. Without a relation, exited rows
-    // stay out of legacy inference as before.
-    const hasRelation = Object.prototype.hasOwnProperty.call(recorded, node.id);
-    const candidates = hasRelation ? rows : rows.filter((row) => row.status !== "exited");
-    const current = resolveActiveOccupantRow(candidates, hasRelation ? recorded : undefined, node.id);
+    const current = resolveActiveOccupantRow(candidates, Object.prototype.hasOwnProperty.call(recorded, node.id) ? recorded : undefined, node.id);
     if (current.kind === "none") continue;
     if (current.kind === "ambiguous") return false;
     const captured = resolveActiveSnapshotSession(snapshot.data, node.id);

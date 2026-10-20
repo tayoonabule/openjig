@@ -204,6 +204,17 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     const snap = await hydrateSnapshot(fixtureClient(), undefined, undefined, undefined, undefined, context);
     expect(snap.health).toBeUndefined();
   });
+  it("hydrates the seat queue on the focused topology table so Q / WORK / NOW can fill", async () => {
+    const row = (qitemId: string, state: string, destinationSession: string) => ({ qitemId, state, destinationSession, blockedOn: null, handedOffTo: null, tier: null, tags: ["slice:OPR.1.0.2.7"], summary: `work ${qitemId}`, body: "", claimedAt: null, tsUpdated: "2026-09-12T10:00:00.000Z" });
+    const context = { section: "topology" as const, viewTab: "table" as const, drill: [{ kind: "rig" as const, name: "myrig" }] };
+    const snap = await hydrateSnapshot(fixtureClient({}, {
+      "/api/queue/list?state=in-progress": [row("qi1", "in-progress", "dev-a@rig")],
+      "/api/queue/list?state=pending&limit=50": [row("qp1", "pending", "dev-a@rig")],
+    }), undefined, undefined, undefined, undefined, context);
+    expect(snap.inProgress.map((q) => q.qitemId)).toEqual(["qi1"]);
+    expect(snap.pending.map((q) => q.qitemId)).toEqual(["qp1"]);
+    expect(snap.recentlyFinished).toEqual([]);
+  });
   it("marks health unavailable when the selected health view read fails", async () => {
     const context = { section: "topology" as const, viewTab: "health" as const, drill: [] };
     const snap = await hydrateSnapshot(fixtureClient({ "/api/health?limit=200": { status: 503 } }), undefined, undefined, undefined, undefined, context);
@@ -407,6 +418,7 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
 
   it("gives failed, attention, and needs-input truth precedence over terminal active/idle", async () => {
     const base = (FIXTURES["/api/rigs/01JRIG/nodes"] as Array<Record<string, unknown>>)[0]!;
+
     const nodes = [
       { ...base, logicalId: "dev.failed", startupStatus: "failed", lifecycleState: "attention_required", terminalActive: true },
       { ...base, logicalId: "dev.attention", startupStatus: "attention_required", lifecycleState: "attention_required", terminalActive: false },
@@ -433,6 +445,57 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     const output = renderScreen(view.get(), snap, { cols: 140, rows: 34 });
     expect(output.lines.find((line) => /\bmismatch\s/.test(line))).not.toContain("run ▸");
     expect(output.lines.find((line) => /\bmissing\s/.test(line))).not.toContain("run ▸");
+  });
+  it("shows a quiet community harness as unknown, never idle, and leaves built-in rows as they were", async () => {
+    const base = (FIXTURES["/api/rigs/01JRIG/nodes"] as Array<Record<string, unknown>>)[0]!;
+    const quiet = { startupStatus: "ready", sessionStatus: "running", terminalActive: false, agentActivity: { state: "unknown" },
+      activityState: { activity: "unknown", display: "unknown", needsInput: { count: 0, reason: null }, decidedBy: null } };
+    const nodes = [
+      { ...base, ...quiet, logicalId: "dev.app-quiet", runtime: "synth-harness", communityHarness: { harness: "synth-harness" } },
+      { ...base, ...quiet, logicalId: "dev.app-moving", runtime: "synth-harness", communityHarness: { harness: "synth-harness" }, terminalActive: true },
+      { ...base, ...quiet, logicalId: "dev.app-prompt", runtime: "synth-harness", communityHarness: { harness: "synth-harness" }, agentActivity: { state: "needs_input" } },
+      { ...base, ...quiet, logicalId: "dev.pi-quiet", runtime: "pi" },
+      { ...base, ...quiet, logicalId: "dev.claude-quiet", runtime: "claude-code" },
+    ];
+    const snap = await hydrateSnapshot(fixtureClient({}, { "/api/rigs/01JRIG/nodes": nodes }));
+    const statuses = Object.fromEntries(snap.hosts[0]!.rigs[0]!.pods[0]!.agents.map((agent) => [agent.name, agent.status]));
+    expect(statuses).toEqual({
+      "dev.app-quiet": "unknown",
+      "dev.app-moving": "active",
+      "dev.app-prompt": "needs_input",
+      "dev.pi-quiet": "idle",
+      "dev.claude-quiet": "idle",
+    });
+  });
+
+  it("shows confirmed missing sessions as detached unless lifecycle still requires attention", async () => {
+    const base = (FIXTURES["/api/rigs/01JRIG/nodes"] as Array<Record<string, unknown>>)[0]!;
+    const nodes = [
+      {
+        ...base,
+        logicalId: "dev.missing-session",
+        sessionStatus: "detached",
+        startupStatus: "failed",
+        lifecycleState: "detached",
+        terminalActive: false,
+        identityVerdict: { verdict: "pane_missing", reason: "session_missing" },
+      },
+      {
+        ...base,
+        logicalId: "dev.missing-attention",
+        sessionStatus: "detached",
+        startupStatus: "attention_required",
+        lifecycleState: "attention_required",
+        terminalActive: false,
+        identityVerdict: { verdict: "pane_missing", reason: "session_missing" },
+      },
+    ];
+    const snap = await hydrateSnapshot(fixtureClient({}, { "/api/rigs/01JRIG/nodes": nodes }));
+    const statuses = Object.fromEntries(snap.hosts[0]!.rigs[0]!.pods[0]!.agents.map((agent) => [agent.name, agent.status]));
+    expect(statuses).toEqual({
+      "dev.missing-session": "detached",
+      "dev.missing-attention": "attention_required",
+    });
   });
 
   it("joins Specs↔Topology over existing reads: rig agentRefs + agent usedByRigs", async () => {
@@ -591,10 +654,10 @@ describe("footer stream tail via the bounded latest-active projection", () => {
 });
 
 describe("S05 authored source and observed consumers", () => {
-  it("shows the shipped first-project summary as its purpose", async () => {
-    const raw = readFileSync(new URL("../../daemon/specs/rigs/launch/first-project/rig.yaml", import.meta.url), "utf8");
+  it("shows the shipped starter summary as its purpose", async () => {
+    const raw = readFileSync(new URL("../../daemon/specs/rigs/launch/starter/rig.yaml", import.meta.url), "utf8");
     const { summary } = parseYaml(raw) as { summary: string };
-    expect(summary).toContain("Two Codex seats");
+    expect(summary).toContain("Claude Code builder and a Codex reviewer");
     const snap = await hydrateSnapshot(fixtureClient({}, {
       "/api/specs/library/a1/review": { ...(FIXTURES["/api/specs/library/a1/review"] as object), raw },
     }));
@@ -646,6 +709,7 @@ describe("S05 authored source and observed consumers", () => {
     const failed = await hydrateSnapshot(fixtureClient({ "/api/specs/library/a1/review": { status: 404 } }, { "/api/specs/library": [{ ...(FIXTURES["/api/specs/library"] as object[])[0], summary: "Stale index purpose" }] }), cache, undefined, undefined, undefined, context);
     const view = createViewState({ instanceId: "proof", getSnapshot: () => failed });
     view.dispatch({ type: "drill", resource: "spec", name: "myrig" });
+    view.dispatch({ type: "tab", tab: "configuration" });
     const screen = renderScreen(view.get(), failed, { cols: 90, rows: 40 });
     const body = screen.lines.join("\n");
     expect(body).toContain("Source unavailable");

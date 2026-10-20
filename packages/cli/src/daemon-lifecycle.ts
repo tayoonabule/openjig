@@ -6,15 +6,13 @@ import { blockedConnectionGuidance, isBlockedConnectionCode } from "./daemon-rea
 import type { DaemonStartLock } from "./daemon-start-lock.js";
 import { DAEMON_STOP_WAIT_MS, DAEMON_SHUTDOWN_RECEIPT, type DaemonShutdownReceipt } from "@openrig/daemon/daemon-shutdown";
 import { ConfigStore } from "./config-store.js";
-import { readLocalOrigin } from "./local-origin.js";
 import { OPENRIG_HOME, LEGACY_RIGGED_HOME, readOpenRigEnv } from "./openrig-compat.js";
-import {
-  ensureDefaultWorkspace,
-  ensureOpenRigInstance,
-  formatInstanceInitializationConflicts,
-  type InitializationFsOps,
-  type InitWorkspaceResult,
-  type ManagedPathKind,
+// Types only: the module itself (with the daemon's yaml-reading system world) is imported where an
+// instance is initialized, so a command that only talks to the daemon never loads it.
+import type {
+  InitializationFsOps,
+  InitWorkspaceResult,
+  ManagedPathKind,
 } from "@openrig/daemon/instance-initialization";
 
 export interface DaemonState {
@@ -201,8 +199,12 @@ export interface LifecycleDeps {
   // /healthz body (event-loop evidence). Optional so existing mocks that
   // return `{ ok }` are unchanged; production (realDeps) supplies it.
   fetch: (url: string) => Promise<{ ok: boolean; json?: () => Promise<unknown> }>;
+  /** Exclusive bind check used only after a no-state health probe times out. */
+  isPortOccupied?: (host: string, port: number) => Promise<boolean>;
   kill: (pid: number, signal: string) => boolean;
   readFile: (path: string) => string | null;
+  fileSize?: (path: string) => number;
+  readFileFrom?: (path: string, offset: number) => string | null;
   writeFile: (path: string, content: string) => void;
   removeFile: (path: string) => void;
   exists: (path: string) => boolean;
@@ -277,7 +279,8 @@ function lifecycleInitializationFs(deps: LifecycleDeps): InitializationFsOps {
   };
 }
 
-export function ensureWorkspaceScaffold(root: string, deps: LifecycleDeps): WorkspaceScaffoldResult {
+export async function ensureWorkspaceScaffold(root: string, deps: LifecycleDeps): Promise<WorkspaceScaffoldResult> {
+  const { ensureDefaultWorkspace } = await import("@openrig/daemon/instance-initialization");
   return ensureDefaultWorkspace({ root, fs: lifecycleInitializationFs(deps) });
 }
 
@@ -598,6 +601,10 @@ export async function verifyRequiredListeners(input: {
   return { ok: true, verified };
 }
 
+function occupiedPortGuidance(port: number): string {
+  return `Address already in use (EADDRINUSE) on port ${port}. Inspect the listener before stopping it, or run 'rig daemon start --port <unused-port>'.`;
+}
+
 class StartupIdentityError extends Error {}
 class StartupChildPendingError extends Error {}
 
@@ -644,9 +651,11 @@ async function startOwnedDaemon(opts: StartOptions, deps: LifecycleDeps, lock: D
     try {
       await fetchDaemonProbe(deps, `http://${formatDaemonHostForUrl(probeHost)}:${port}/healthz`, HEALTHZ_PROBE_TIMEOUT_MS);
       recoveredRunning = true;
-    } catch (err) {
-      if (err instanceof HealthProbeTimeoutError) {
-        throw new Error(`Daemon on port ${port} is unresponsive, and daemon state is missing — recover it before starting a new daemon.`);
+    } catch (error) {
+      // WSL2 can silently drop probes to an unused port. A slow live daemon can
+      // also time out: do not run a second child's initialization against its DB.
+      if (error instanceof HealthProbeTimeoutError && await deps.isPortOccupied?.(probeHost, port)) {
+        throw new Error(occupiedPortGuidance(port));
       }
     }
     if (recoveredRunning) {
@@ -655,6 +664,7 @@ async function startOwnedDaemon(opts: StartOptions, deps: LifecycleDeps, lock: D
   }
   const daemonEntry = path.join(getDaemonPath(), "dist/index.js");
 
+  const { ensureOpenRigInstance, formatInstanceInitializationConflicts } = await import("@openrig/daemon/instance-initialization");
   const initialization = ensureOpenRigInstance({
     home: OPENRIG_DIR,
     workspaceRoot: opts.workspaceRoot,
@@ -667,6 +677,7 @@ async function startOwnedDaemon(opts: StartOptions, deps: LifecycleDeps, lock: D
     throw new Error(`OpenRig instance initialization blocked: ${formatInstanceInitializationConflicts(initialization)}`);
   }
 
+  const logOffset = deps.fileSize?.(LOG_FILE) ?? Buffer.byteLength(deps.readFile(LOG_FILE) ?? "");
   const logFd = deps.openForAppend(LOG_FILE);
 
   let child: ChildProcess;
@@ -699,7 +710,13 @@ async function startOwnedDaemon(opts: StartOptions, deps: LifecycleDeps, lock: D
     rejectExit(childFailure);
   };
   const onExit = (code: number | null, signal: string | null): void => {
-    childFailure = new Error(`Daemon child ${child.pid ?? "unknown"} exited before startup completed (code ${code}, signal ${signal ?? "none"})`);
+    const startupLog = deps.readFileFrom
+      ? deps.readFileFrom(LOG_FILE, logOffset) ?? ""
+      : Buffer.from(deps.readFile(LOG_FILE) ?? "").subarray(logOffset).toString();
+    const guidance = /\bEADDRINUSE\b/.test(startupLog)
+      ? ` ${occupiedPortGuidance(port)}`
+      : ` See ${LOG_FILE} for details.`;
+    childFailure = new Error(`Daemon child ${child.pid ?? "unknown"} exited before startup completed (code ${code}, signal ${signal ?? "none"}).${guidance}`);
     rejectExit(childFailure);
     resolveExit();
   };
@@ -1179,7 +1196,8 @@ export async function fetchSelfHostIdentity(
 
 /** Resolve this instance's persisted identity even during an outage; never read it from the target. */
 export async function resolveOriginSelfHostId(_deps: LifecycleDeps): Promise<string | undefined> {
-  return readLocalOrigin();
+  // Imported here, not at the top: it loads better-sqlite3 and yaml, which most commands never reach.
+  return (await import("./local-origin.js")).readLocalOrigin();
 }
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));

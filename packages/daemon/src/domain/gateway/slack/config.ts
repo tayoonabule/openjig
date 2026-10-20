@@ -10,6 +10,9 @@ import path from "node:path";
 import { getOpenRigHome } from "../../../openrig-compat.js";
 import { OWNER_NOTIFICATION_LEVELS, type OwnerNotificationLevel } from "../../queue-transition-log.js";
 import { BASELINE_REQUIRED_SCOPES } from "./capabilities.js";
+import { unsupportedChannelMapFields, validateChannelMap, type ChannelMapEntry } from "./channel-map.js";
+import { botInboxProblems, type BotInboxConfig } from "./bot-inbox.js";
+import { forwardChannelProblems, type ForwardChannel } from "./forwarding.js";
 
 export interface SlackConnectorConfig {
   enabled: boolean;
@@ -34,6 +37,24 @@ export interface SlackConnectorConfig {
   queueUrl: string | null;
   minimumLevelThatPosts: OwnerNotificationLevel;
   minimumLevelThatInterrupts: OwnerNotificationLevel;
+  /**
+   * #192: optional per-rig / per-seat outbound channels (channel-map.ts). Absent or empty = every
+   * item posts to `channel`, as before. Deliberately not in DEFAULT_CONFIG, so a config without
+   * it saves and digests unchanged.
+   */
+  channelMap?: ChannelMapEntry[];
+  /**
+   * Optional named-bot delivery (bot-inbox.ts): posts by the named bots in one channel reach one seat,
+   * marked as a bot. Absent = every bot post is dropped, as before. Not in DEFAULT_CONFIG, like
+   * `channelMap`. An invalid block leaves the bot inbox off and is named by staticReadiness.
+   */
+  botInbox?: BotInboxConfig;
+  /**
+   * One shared app across machines: on the hub (the machine with the app-level token), the
+   * channels another machine owns, each relayed to that machine's daemon (forwarding.ts). Absent =
+   * every channel is handled here, as before. Not in DEFAULT_CONFIG, like `channelMap`.
+   */
+  forwardChannels?: ForwardChannel[];
 }
 
 export const DEFAULT_CONFIG: SlackConnectorConfig = {
@@ -55,9 +76,12 @@ function validateLevel(field: string, value: unknown): asserts value is OwnerNot
   }
 }
 
-function validateConfig(cfg: SlackConnectorConfig): void {
+/** `reading`: a channel-map entry field written by a newer OpenRig is ignored (and reported by
+ *  staticReadiness and the gateway log) rather than failing the connector after a downgrade. */
+function validateConfig(cfg: SlackConnectorConfig, opts: { reading?: boolean } = {}): void {
   validateLevel("minimumLevelThatPosts", cfg.minimumLevelThatPosts);
   validateLevel("minimumLevelThatInterrupts", cfg.minimumLevelThatInterrupts);
+  validateChannelMap(cfg, { allowUnknownFields: opts.reading });
 }
 
 export function configPathFor(home?: string): string {
@@ -74,7 +98,7 @@ export function loadConfig(home?: string): SlackConnectorConfig {
   }
   const { alertTag: _retiredAlertTag, ...supported } = raw;
   const cfg = { ...DEFAULT_CONFIG, ...supported };
-  validateConfig(cfg);
+  validateConfig(cfg, { reading: true });
   return cfg;
 }
 
@@ -112,5 +136,42 @@ export function staticReadiness(cfg: SlackConnectorConfig, hasBotToken: boolean,
     { ok: cfg.channel !== null, label: "channel", detail: cfg.channel ?? "unset (outbound cannot post)" },
     { ok: Boolean(cfg.inboundDestination), label: "inbound-destination", detail: cfg.inboundDestination },
     { ok: cfg.enabled, label: "enabled", detail: cfg.enabled ? "yes" : "no (run `rig slack enable`)" },
+    ...channelMapReadiness(cfg),
+    ...botInboxReadiness(cfg),
+    ...forwardReadiness(cfg),
   ];
+}
+
+/** One row only when a bot inbox is set: what it delivers, or why it is off. */
+function botInboxReadiness(cfg: SlackConnectorConfig): ReadinessItem[] {
+  if (cfg.botInbox === undefined) return [];
+  const problems = botInboxProblems(cfg);
+  if (problems.length) return [{ ok: false, label: "bot-inbox", detail: `OFF: ${problems.join("; ")}` }];
+  const { channel, destination, bots } = cfg.botInbox;
+  return [{
+    ok: true,
+    label: "bot-inbox",
+    detail: `${bots.length} named bot(s) in ${channel}, delivered to ${destination}; needs users:read and the app in that channel (\`rig slack verify\` only warns on a missing users:read, and doesn't check this channel)`,
+  }];
+}
+
+/** One row only when channels are forwarded: where they go, or why forwarding is off. */
+function forwardReadiness(cfg: SlackConnectorConfig): ReadinessItem[] {
+  if (cfg.forwardChannels === undefined) return [];
+  const problems = forwardChannelProblems(cfg);
+  if (problems.length) return [{ ok: false, label: "forward-channels", detail: `OFF: ${problems.join("; ")}` }];
+  const hosts = [...new Set(cfg.forwardChannels.map((f) => f.host))];
+  return [{ ok: true, label: "forward-channels", detail: `${cfg.forwardChannels.length} channel(s) relayed to ${hosts.join(", ")}; each host needs an http entry (rig host list) and the app token here` }];
+}
+
+/** #192: one row only when a channel map is set. Fields this version does not support make the
+ *  row fail loudly: they are ignored, and saving the config refuses them. */
+function channelMapReadiness(cfg: SlackConnectorConfig): ReadinessItem[] {
+  if (!cfg.channelMap?.length) return [];
+  const channels = new Set(cfg.channelMap.map((e) => e.channel)).size;
+  const summary = `${cfg.channelMap.length} entr${cfg.channelMap.length === 1 ? "y" : "ies"} over ${channels} channel(s); \`rig slack verify\` checks membership in each`;
+  const unsupported = unsupportedChannelMapFields(cfg);
+  return [unsupported.length
+    ? { ok: false, label: "channel-map", detail: `${summary}; IGNORED unsupported field(s) ${unsupported.join(", ")} (written by a newer OpenRig?); remove them before saving the config` }
+    : { ok: true, label: "channel-map", detail: summary }];
 }

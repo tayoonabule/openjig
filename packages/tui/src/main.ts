@@ -21,8 +21,10 @@ import { demoSnapshot } from "./demo-data.js";
 import { DaemonClient, launchNodeNotice } from "./daemon-client.js";
 import { hydrateSnapshot } from "./hydrate.js";
 import { createLiveRefresh } from "./live.js";
+import { resolvePendingAddress } from "./pending-address.js";
 import { subscribeActivityEvents } from "./live-events.js";
 import { execFile } from "node:child_process";
+import { helperCwd } from "./helper-cwd.js";
 import { probeCrashCart, type CrashCartRenderOpts } from "./crash-cart/from-emit.js";
 import { resolveCrashCartKey, type CrashCartKeyAction } from "./crash-cart/keys.js";
 import { driveRestoreLifecycle, buildRestoreLifecycleVM } from "./crash-cart/restore-lifecycle.js";
@@ -36,7 +38,9 @@ import { pathToFileURL } from "node:url";
 import type { Action, FleetSnapshot, Screen } from "./types.js";
 import type { SpecReviewCache } from "./hydrate.js";
 import { MOTION_FRAME_MS } from "./visual-layout.js";
+import { launchProcess, runSpecLaunch } from "./specs/launch.js";
 import { runCopySession, processCopyTerminal } from "./print-for-copy.js";
+import { openTerminalInWindow, terminalWindowNotice } from "./terminals/open-window.js";
 
 function argOf(args: string[], flag: string): string | undefined {
   const i = args.indexOf(flag);
@@ -58,7 +62,7 @@ async function run(): Promise<void> {
   let snapshot: FleetSnapshot = demo ? demoSnapshot() : emptySnapshot();
   let timeReadWarning = false;
   const timeSetting = new Promise<unknown>((resolve) => {
-    execFile(cliExecutable, cliArgs(["config", "get", "ui.timezone", "--json"]), { timeout: 5000, maxBuffer: 8192 }, (err, stdout, stderr) => {
+    execFile(cliExecutable, cliArgs(["config", "get", "ui.timezone", "--json"]), { cwd: helperCwd(), timeout: 5000, maxBuffer: 8192 }, (err, stdout, stderr) => {
       timeReadWarning = !!err || stderr.includes("ui.timezone");
       if (err) return resolve(null);
       try { resolve(JSON.parse(stdout).value); } catch { resolve(null); }
@@ -75,6 +79,8 @@ async function run(): Promise<void> {
   const client = demo ? null : new DaemonClient({ baseUrl: argOf(args, "--url"), headers: startupHeaders });
   let startup: StartupController | null = null;
   let nativeAttached = false;
+  let launching = false;
+  let openingTerminal = false;
   let controlSocketPath: string | undefined;
   let shuttingDown = false;
 
@@ -167,6 +173,7 @@ async function run(): Promise<void> {
     if (live) snapshot = { ...live.snapshot(),
       ...(!liveEnabled ? { readErrors: [`Live data not loaded · connection ${startup?.state.connection ?? "probing"} · L Local reading · S Startup`] } : {}),
       launchingCli: process.env["OPENRIG_TUI_CLI_IDENTITY"]?.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 180) };
+    if (resolvePendingAddress(view, liveEnabled && live ? live.load() : null)) refreshFromActivity();
     const opts = { cols, rows, nowMs, completion, controlSocketPath, colorMode: style.mode, commandContext: commandContext(), ...crashCartOpts, ...(startup?.state.open && !view.get().palette ? { startup: startup.state } : {}), restoreScroll: restoreScrollOffset, ...(liveEnabled && live ? { load: live.load(), rowFlashes: live.flashes() } : {}) };
     if (liveEnabled && live?.load().settled) previousPage = { state: { ...view.get() }, snapshot };
     const pageOptions = { ...opts, ...(liveEnabled && !live?.load().settled ? { previousPage } : {}) };
@@ -198,7 +205,7 @@ async function run(): Promise<void> {
   // JSON is the truth even on a hint non-zero exit). Any failure → normal TUI (never a fabricated cockpit).
   const runCrashCartVerb = (): Promise<string> =>
     new Promise((resolve, reject) => {
-      execFile(cliExecutable, cliArgs(["crash-cart", "--json"]), { timeout: 5000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+      execFile(cliExecutable, cliArgs(["crash-cart", "--json"]), { cwd: helperCwd(), timeout: 5000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
         if (stdout && stdout.trim()) resolve(stdout);
         else reject(new Error(stderr.trim() || err?.message || "crash-cart: no output"));
       });
@@ -206,7 +213,7 @@ async function run(): Promise<void> {
   if (client) startup = new StartupController({
     client, home: process.env["OPENRIG_HOME"] ?? "default local instance", probe: runCrashCartVerb,
     startDaemon: () => new Promise<void>((resolve, reject) => {
-      execFile(cliExecutable, cliArgs(daemonStartArgs(client.baseUrl)), { timeout: 30_000 }, (error, stdout, stderr) => {
+      execFile(cliExecutable, cliArgs(daemonStartArgs(client.baseUrl)), { cwd: helperCwd(), timeout: 30_000 }, (error, stdout, stderr) => {
         if (error) reject(new Error(`Daemon start did not confirm completion: ${stderr.trim() || stdout.trim() || error.message}`));
         else resolve();
       });
@@ -300,7 +307,7 @@ async function run(): Promise<void> {
     restoreCancelRequested = false;
     restoreScrollOffset = 0;
     new Promise<void>((resolve, reject) =>
-      execFile("rig", ["daemon", "start"], { timeout: 30_000 }, (err) => (err ? reject(err) : resolve())),
+      execFile("rig", ["daemon", "start"], { cwd: helperCwd(), timeout: 30_000 }, (err) => (err ? reject(err) : resolve())),
     )
       .then(() => pollRestore(daemonClient))
       .catch((e: unknown) => {
@@ -337,7 +344,7 @@ async function run(): Promise<void> {
       startingDaemon = true;
       crashCartOpts = { ...crashCartOpts, starting: client!.baseUrl };
       draw();
-      execFile(cliExecutable, cliArgs(startArgs), { timeout: 30_000 }, (error, stdout, stderr) => {
+      execFile(cliExecutable, cliArgs(startArgs), { cwd: helperCwd(), timeout: 30_000 }, (error, stdout, stderr) => {
         startingDaemon = false;
         if (error) {
           crashCartOpts = { unavailable: `Daemon start did not confirm completion. Retry reads actual state before another attempt. ${stderr.trim() || stdout.trim() || error.message}` };
@@ -399,29 +406,35 @@ async function run(): Promise<void> {
 
   if (socket.path !== socketPath) controlSocketPath = socket.path;
 
-  // Acts are drive-structure daemon WRITES (BR-8/BR-9) — executed here against
-  // the two existing contracts; the view-state is only told the outcome.
+  // Reuse the CLI's desktop opener and the daemon's node-launch contract.
+  // The view-state is only told the outcome.
   async function executeAct(action: Extract<Action, { type: "act" }>): Promise<void> {
     if (!client || startup?.state.connection !== "up") {
       view.dispatch({ type: "notice", message: "Live actions require a confirmed daemon connection. S opens startup; L opens local reading." });
       draw();
       return;
     }
+    if (action.act === "open-terminal" && openingTerminal) return;
     try {
       if (action.act === "open-terminal") {
-        const result = await client.openTerminal(action.view, action.expectedPlan);
-        view.dispatch({
-          type: "terminal-result", view: action.view,
-          message: `${result.absent.length || result.degraded.length ? "Partial Open" : "Opened"}: ${result.opened.length} opened, ${result.absent.length} absent, ${result.degraded.length} degraded · ${action.view}${result.error ? ` · ${result.error}` : ""}${result.degraded.map(m => ` · ${m.seat}: ${m.reason}`).join("")}${(result.notes ?? []).map(n => ` · ${n}`).join("")}`,
-        });
-        if (action.expectedPlan === undefined) view.dispatch({ type: "notice", message: `${result.opened.length} terminals opened; ${result.absent.length} absent; ${result.degraded.length} degraded${(result.notes ?? []).map(n => ` · ${n}`).join("")}` });
-      } else {
+        openingTerminal = true;
+        view.dispatch({ type: "notice", message: `Opening terminals for ${action.view}…` });
+        draw();
+        const result = await openTerminalInWindow(action.view, client.baseUrl, cliEntry, action.expectedPlan,
+          () => view.dispatch({ type: "terminal-preview", view: action.view }));
+        const message = terminalWindowNotice(action.view, result);
+        view.dispatch({ type: "terminal-result", view: action.view, message });
+        view.dispatch({ type: "notice", message });
+      } else if (action.act === "run") {
         const result = await client.launchNode(action.rigId, action.agent);
         view.dispatch({ type: "notice", message: launchNodeNotice(action.agent, result) });
       }
     } catch (err) {
-      if (action.act === "open-terminal") view.dispatch({ type: "terminal-result", view: action.view, message: err instanceof Error ? err.message : String(err) });
-      view.dispatch({ type: "notice", message: err instanceof Error ? err.message : String(err) });
+      const message = err instanceof Error ? err.message : String(err);
+      if (action.act === "open-terminal") view.dispatch({ type: "terminal-result", view: action.view, message });
+      view.dispatch({ type: "notice", message: action.act === "open-terminal" ? `Terminal view not confirmed\n${message}` : message });
+    } finally {
+      if (action.act === "open-terminal") openingTerminal = false;
     }
     draw();
     refreshFromActivity();
@@ -437,6 +450,21 @@ async function run(): Promise<void> {
         notice: (message) => view.dispatch({ type: "notice", message }),
         draw,
       });
+      return;
+    }
+    if (action.type === "act" && action.act === "launch-spec") {
+      const launch = view.get().specLaunch;
+      if (!launch || nativeAttached) return;
+      if (!client) { view.dispatch({ type: "notice", message: "Demo mode: no rig was launched." }); return; }
+      try {
+        const command = launchProcess(launch, client.baseUrl, process.env, cliExecutable, cliArgs([]));
+        view.dispatch({ type: "launch-close" });
+        void runSpecLaunch({ command, terminal: processCopyTerminal(),
+          pauseInput: () => { process.stdin.pause(); }, resumeInput: () => { process.stdin.resume(); },
+          setSuspended: on => { nativeAttached = on; launching = on; }, isShuttingDown: () => shuttingDown,
+          notice: message => view.dispatch({ type: "notice", message }), draw,
+        }).catch(error => view.dispatch({ type: "notice", message: String(error) }));
+      } catch (err) { view.dispatch({ type: "notice", message: (err as Error).message }); }
       return;
     }
     if (action.type === "act") {
@@ -463,7 +491,9 @@ async function run(): Promise<void> {
     process.exit(0);
   }
   process.stdout.on("resize", draw);
-  process.on("SIGINT", () => void shutdown());
+  // In cooked mode Ctrl-C reaches both us and rig up. Let the child stop while
+  // keeping its result and the Enter-to-return prompt available in this TUI.
+  process.on("SIGINT", () => { if (!launching) void shutdown(); });
   process.on("SIGTERM", () => void shutdown());
 
   if (process.stdin.isTTY) process.stdin.setRawMode(true);
@@ -603,10 +633,11 @@ async function run(): Promise<void> {
           perform(parseCommand("select-text", view.get().sections));
           continue;
         }
-        // SCOPES accelerators: m/n ride the REGISTERED commands (one path).
+        // SCOPES accelerators: M/N ride the REGISTERED commands (one path). Upper case, like S and
+        // L, so a typed verb that starts with m or n (mission, narrative, needs) reaches the line.
         if (inputLine === "" && view.get().section === "scopes" && view.get().scopesSelected) {
-          if (ev.ch === "m") { perform(parseCommand("reqs", view.get().sections)); continue; }
-          if (ev.ch === "n") { perform(parseCommand("narrative", view.get().sections)); continue; }
+          if (ev.ch === "M") { perform(parseCommand("reqs", view.get().sections)); continue; }
+          if (ev.ch === "N") { perform(parseCommand("narrative", view.get().sections)); continue; }
         }
         if (ev.ch === "?" && inputLine === "") {
           // The registered palette trigger — through the grammar, never beside it.
@@ -617,7 +648,8 @@ async function run(): Promise<void> {
           void shutdown();
           return;
         }
-        if (ev.ch === "f" && inputLine === "") {
+        // F, not f: feed and find start with f and must stay typeable on an empty line.
+        if (ev.ch === "F" && inputLine === "") {
           view.dispatch({ type: "footer" });
           continue;
         }
@@ -629,6 +661,20 @@ async function run(): Promise<void> {
             performCrashCart(cca);
             continue;
           }
+        }
+        if (inputLine === "" && (ev.ch === "j" || ev.ch === "k")) {
+          if (lastScreen) {
+            const key = ev.ch === "j" ? "down" : "up";
+            const delta = key === "down" ? 1 : -1;
+            const action = resolveKeyAction(
+              { type: "key", key, action: { type: "select", delta } },
+              view.get(),
+              lastScreen,
+              computeExplorerRows(view.get(), snapshot).length,
+            );
+            if (action) perform(action);
+          }
+          continue;
         }
         inputLine += ev.ch;
       } else if (ev.type === "key" && ev.key === "backspace") {

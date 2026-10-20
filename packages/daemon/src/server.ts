@@ -84,6 +84,7 @@ import { jsonBodyErrorHandler, trackJsonBodyParseErrors } from "./middleware/jso
 import { getSelfHostId, getSelfHostIdSource } from "./domain/hosts/fanout-contract.js";
 import { contextPacksRoutes } from "./routes/context-packs.js";
 import { agentImagesRoutes } from "./routes/agent-images.js";
+import { communityHarnessesRoutes } from "./routes/community-harnesses.js";
 import type { SpecReviewService } from "./domain/spec-review-service.js";
 import type { SpecLibraryService } from "./domain/spec-library-service.js";
 import type { ChatRepository } from "./domain/chat-repository.js";
@@ -332,6 +333,7 @@ export interface AppDeps {
   whoamiService?: WhoamiService;
   /** W3 single-seat, read-only runtime-policy observer. */
   permissionDriftObserver?: PermissionDriftReader;
+  currentModelReader?: import("./domain/model-divergence/current-model-reader.js").CurrentModelReader;
   contextUsageStore?: import("./domain/context-usage-store.js").ContextUsageStore;
   /** 0.5.10 S04 — one on-demand, read-only health projection shared by consumers. */
   healthProjection?: import("./domain/health-detectors.js").HealthProjectionService;
@@ -604,6 +606,7 @@ export function createApp(deps: AppDeps): Hono {
     c.set("whoamiService" as never, deps.whoamiService);
     c.set("permissionDriftObserver" as never, permissionDriftObserver);
     c.set("contextUsageStore" as never, deps.contextUsageStore);
+    c.set("currentModelReader" as never, deps.currentModelReader);
     c.set("healthProjection" as never, deps.healthProjection);
     c.set("healthDiagnosis" as never, deps.healthDiagnosis);
     c.set("healthPolicy" as never, deps.healthPolicy);
@@ -777,6 +780,7 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/api/agent-images", agentImagesRoutes({
     specRoots: deps.agentImageSpecRoots ?? (() => []),
   }));
+  app.route("/api/community-harnesses", communityHarnessesRoutes());
   app.route("/api/whoami", whoamiRoutes());
   // Slice-04 OPR.0.5.0.4: registered so the endpoints exist and 503 honestly; the providerService
   // is not set in context until the collection/service seam (C) wires it (until then -> 503).
@@ -834,7 +838,8 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/api/attention", attentionRoutes());
   app.route("/api/health-diagnosis", healthDiagnosisRoutes());
   // S10 — gateway subsystem admin (slack enable/disable with the seeding rule preserved).
-  app.route("/api/gateway", gatewayRoutes());
+  // A shared Slack app's relay carries the token `rig host pair` issued: this daemon's auth bearer.
+  app.route("/api/gateway", gatewayRoutes({ relayBearerToken: deps.missionControlBearerToken ?? null }));
   app.route("/api/rigs/:rigId/env", envRoutes());
   app.route("/api/restore-check", restoreCheckRoutes);
   // Slice 09 (OPR.0.3.2.9) — rig-policy bindings (operator context mode).

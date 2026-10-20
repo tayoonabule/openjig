@@ -1,9 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, mkdtempSync, copyFileSync, chmodSync, statSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execSync, spawnSync } from "node:child_process";
 import { ClaudeCodeAdapter } from "../src/adapters/claude-code-adapter.js";
+import { shellQuote } from "../src/adapters/shell-quote.js";
+import { replaceFile } from "../src/adapters/replace-file.js";
+import type { NodeBinding } from "../src/domain/runtime-adapter.js";
+import type { ProjectionPlan } from "../src/domain/projection-planner.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 
 const VALID_STATUS_LINE = JSON.stringify({
@@ -191,6 +195,7 @@ describe("ClaudeCodeAdapter Context Collector Provisioning", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  /** Provide filesystem operations for collector fixtures. */
   function mockFsOps() {
     return {
       readFile: (p: string) => written[p] ?? (() => { throw new Error("ENOENT"); })(),
@@ -202,6 +207,7 @@ describe("ClaudeCodeAdapter Context Collector Provisioning", () => {
     };
   }
 
+  /** Supply a terminal adapter without starting a real session. */
   function mockTmux(): TmuxAdapter {
     return {
       sendText: vi.fn(async () => ({ ok: true as const })),
@@ -260,14 +266,14 @@ describe("ClaudeCodeAdapter Context Collector Provisioning", () => {
       written[settingsPath] = JSON.stringify({ statusLine: { type: "command", command: "node /old/.openrig/context-collector.cjs /old/ctx /old/prov", padding: 2 } });
       await deliver();
       const statusLine = JSON.parse(written[settingsPath]!).statusLine;
-      expect(statusLine.command).toBe(`node /project/.openrig/context-collector.cjs ${join(tmpDir, "state", "context-usage")} ${join(tmpDir, "state", "provider-usage")}`);
+      expect(statusLine.command).toBe(`${shellQuote(process.execPath)} ${shellQuote("/project/.openrig/context-collector.cjs")} ${shellQuote(join(tmpDir, "state", "context-usage"))} ${shellQuote(join(tmpDir, "state", "provider-usage"))}`);
       expect(statusLine.padding).toBe(2);
     });
 
     it("refreshes the three-token collector command OpenRig wrote before provider usage", async () => {
       written[settingsPath] = JSON.stringify({ statusLine: { type: "command", command: "node /project/.openrig/context-collector.cjs /old/state/context" } });
       await deliver();
-      expect(JSON.parse(written[settingsPath]!).statusLine.command).toBe(`node /project/.openrig/context-collector.cjs ${join(tmpDir, "state", "context-usage")} ${join(tmpDir, "state", "provider-usage")}`);
+      expect(JSON.parse(written[settingsPath]!).statusLine.command).toBe(`${shellQuote(process.execPath)} ${shellQuote("/project/.openrig/context-collector.cjs")} ${shellQuote(join(tmpDir, "state", "context-usage"))} ${shellQuote(join(tmpDir, "state", "provider-usage"))}`);
     });
 
     it("installs the collector into a status line that has no command", async () => {
@@ -295,6 +301,8 @@ describe("ClaudeCodeAdapter Context Collector Provisioning", () => {
       "node /old/.openrig/context-collector.cjs /old/ctx\n~/bin/my-status.sh",
       "node /old/.openrig/context-collector.cjs /old/ctx\r\n~/bin/my-status.sh",
       "node /tools/.openrig/context-collector.cjs.backup",
+      `${shellQuote(process.execPath)} '/old/.openrig/context-collector.cjs' '/old/ctx' '/old/prov' 'extra'`,
+      "'/custom/wrapper' '/old/.openrig/context-collector.cjs' '/old/ctx' '/old/prov'",
     ])("keeps a user command that only contains the collector path: %j", async (command) => {
       const original = JSON.stringify({ statusLine: { type: "command", command, padding: 1 } }, null, 2);
       written[settingsPath] = original;
@@ -308,7 +316,7 @@ describe("ClaudeCodeAdapter Context Collector Provisioning", () => {
       expect(written[settingsPath]).toContain("/project/.openrig/context-collector.cjs");
       expect(JSON.parse(written[settingsPath]!).statusLine).toEqual({
         type: "command",
-        command: `node /project/.openrig/context-collector.cjs ${join(tmpDir, "state", "context-usage")} ${join(tmpDir, "state", "provider-usage")}`,
+        command: `${shellQuote(process.execPath)} ${shellQuote("/project/.openrig/context-collector.cjs")} ${shellQuote(join(tmpDir, "state", "context-usage"))} ${shellQuote(join(tmpDir, "state", "provider-usage"))}`,
       });
     });
   });
@@ -494,7 +502,7 @@ describe("ClaudeCodeAdapter Context Collector Provisioning", () => {
     expect(Object.keys(mcpConfig.mcpServers)).toEqual(["existing"]);
   });
 
-  it("deliverStartup recovers from array-valued settings.local.json for context collector only", async () => {
+  it("deliverStartup leaves an array-valued settings.local.json (and .mcp.json) as they are", async () => {
     written["/project/.claude/settings.local.json"] = "[]";
     written["/project/.mcp.json"] = "[]";
 
@@ -507,9 +515,8 @@ describe("ClaudeCodeAdapter Context Collector Provisioning", () => {
 
     await adapter.deliverStartup([], { cwd: "/project", tmuxSession: "dev-impl@test", nodeId: "n1" } as any);
 
-    const settings = JSON.parse(written["/project/.claude/settings.local.json"]!);
-    expect(settings.statusLine.type).toBe("command");
-    expect(settings.permissions).toBeUndefined();
+    // Valid JSON that isn't an object is the owner's: the status line isn't installed over it.
+    expect(written["/project/.claude/settings.local.json"]).toBe("[]");
     expect(written["/project/.mcp.json"]).toBe("[]");
   });
 
@@ -566,5 +573,149 @@ describe("ClaudeCodeAdapter Context Collector Provisioning", () => {
     expect(written[statePath]).toBeDefined();
     const state = JSON.parse(written[statePath]!);
     expect(state.hasCompletedOnboarding).toBe(true);
+  });
+});
+
+
+describe("provisioned collector command shell paths", () => {
+  let root: string;
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), "openrig-collector-shell-")); });
+  afterEach(() => { rmSync(root, { recursive: true, force: true }); });
+  /** Provision a collector in the supplied private shell-path fixture. */
+  function provision(cwd: string, stateDir: string, command?: string) {
+    const settings = join(cwd, ".claude", "settings.local.json");
+    mkdirSync(join(cwd, ".claude"), { recursive: true });
+    if (command !== undefined) writeFileSync(settings, JSON.stringify({ statusLine: { command, padding: 2 }, permissions: { allow: ["Read"] } }));
+    const adapter = new ClaudeCodeAdapter({
+      tmux: {} as TmuxAdapter, stateDir,
+      collectorAssetPath: join(import.meta.dirname, "../assets/claude-statusline-context.cjs"),
+      fsOps: {
+        readFile: (p) => readFileSync(p, "utf8"), writeFile: (p, text) => writeFileSync(p, text),
+        exists: existsSync, mkdirp: (p) => { mkdirSync(p, { recursive: true }); }, copyFile: copyFileSync,
+      },
+    });
+    adapter.ensureContextCollector({ cwd });
+    return JSON.parse(readFileSync(settings, "utf8"));
+  }
+  it.each(["workspace with spaces", "O'Brien workspace"])("runs the real collector through /bin/sh for %s", (name) => {
+    const state = join(root, "state " + name);
+    const settings = provision(join(root, name), state);
+    const result = spawnSync("/bin/sh", ["-c", settings.statusLine.command], {
+      input: VALID_STATUS_LINE, encoding: "utf8", env: { ...process.env, OPENRIG_OCCUPANT_GENERATION: "fixture-generation" },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    const context = JSON.parse(readFileSync(join(state, "state", "context-usage", "dev-impl@test.json"), "utf8"));
+    const usage = JSON.parse(readFileSync(join(state, "state", "provider-usage", "dev-impl@test.json"), "utf8"));
+    expect(context.context_window.used_percentage).toBe(67);
+    expect(context.occupant_generation).toBe("fixture-generation");
+    expect(usage.rateLimits.five_hour.usedPercent).toBe(42);
+  });
+  it("refreshes an owned quoted command when the state directory changes", () => {
+    const cwd = join(root, "O'Brien project");
+    const original = provision(cwd, join(root, "old state")).statusLine.command;
+    const settings = provision(cwd, join(root, "new state"), original);
+    expect(settings.statusLine.command).not.toBe(original);
+    expect(settings.statusLine.command).toContain("new state");
+    expect(settings.statusLine.padding).toBe(2);
+    expect(settings.permissions).toEqual({ allow: ["Read"] });
+  });
+  it.each(["; echo mine", " | cat", " && echo mine", " extra", "\n echo mine"])("preserves a composed quoted user command: %s", (suffix) => {
+    const cwd = join(root, "quoted project");
+    const original = provision(cwd, join(root, "old state")).statusLine.command + suffix;
+    expect(provision(cwd, join(root, "new state"), original).statusLine.command).toBe(original);
+  });
+});
+
+describe("re-seating the collector from a read-only asset", () => {
+  let root: string;
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), "openrig-collector-readonly-")); });
+  afterEach(() => { rmSync(root, { recursive: true, force: true }); });
+
+  /** Build a collector adapter using private real files and the supplied copy operation. */
+  function adapterFor(asset: string, copyFile: (src: string, dest: string) => void) {
+    return new ClaudeCodeAdapter({
+      tmux: {} as TmuxAdapter, stateDir: join(root, "state"), collectorAssetPath: asset,
+      fsOps: {
+        readFile: (p) => readFileSync(p, "utf8"), writeFile: (p, text) => writeFileSync(p, text),
+        exists: existsSync, mkdirp: (p) => { mkdirSync(p, { recursive: true }); }, copyFile,
+      },
+    });
+  }
+
+  it("plain copyFileSync cannot overwrite the read-only copy it made last time", () => {
+    if (process.getuid?.() === 0) return; // root ignores file modes
+    const asset = join(root, "asset.cjs");
+    writeFileSync(asset, "// v1\n");
+    chmodSync(asset, 0o444);
+    const cwd = join(root, "seat");
+    const adapter = adapterFor(asset, copyFileSync);
+    adapter.ensureContextCollector({ cwd });
+    expect(() => adapter.ensureContextCollector({ cwd })).toThrow(/EACCES/);
+  });
+
+  it.skipIf(process.getuid?.() === 0)("updates a writable collector in a readonly directory", () => {
+    const asset = join(root, "asset.cjs");
+    writeFileSync(asset, "// v1\n"); chmodSync(asset, 0o644);
+    const cwd = join(root, "seat");
+    const parent = join(cwd, ".openrig");
+    const adapter = adapterFor(asset, replaceFile);
+    adapter.ensureContextCollector({ cwd });
+    chmodSync(parent, 0o555);
+    try {
+      writeFileSync(asset, "// v2\n");
+      adapter.ensureContextCollector({ cwd });
+      adapter.ensureContextCollector({ cwd });
+      expect(readFileSync(join(parent, "context-collector.cjs"), "utf8")).toBe("// v2\n");
+      expect(statSync(parent).mode & 0o777).toBe(0o555);
+      expect(readdirSync(parent).filter(f => f.includes(".tmp"))).toEqual([]);
+    } finally { chmodSync(parent, 0o755); }
+  });
+
+  it.skipIf(process.getuid?.() === 0)("updates a writable activity relay in a readonly directory", async () => {
+    const asset = join(root, "relay.cjs");
+    writeFileSync(asset, "// relay v1\n"); chmodSync(asset, 0o755);
+    const stateDir = join(root, "relay-state");
+    const cwd = join(root, "relay-seat");
+    const adapter = new ClaudeCodeAdapter({
+      tmux: {} as TmuxAdapter, stateDir, activityRelayPath: asset,
+      claudeHooksManifestPath: join(import.meta.dirname, "../assets/plugins/openrig-core/hooks/claude.json"),
+      fsOps: { readFile: p => readFileSync(p, "utf8"), writeFile: (p, text) => writeFileSync(p, text),
+        exists: existsSync, mkdirp: p => { mkdirSync(p, { recursive: true }); }, copyFile: replaceFile,
+        statMode: p => statSync(p).mode, chmod: chmodSync },
+    });
+    const plan = { runtime: "claude-code", cwd, entries: [{ category: "runtime_resource", resourceType: "claude_activity_hooks",
+      effectiveId: "activity", classification: "safe_projection", sourceSpec: "shared", sourcePath: asset,
+      resourcePath: "activity", absolutePath: asset }], startup: { files: [], actions: [] }, conflicts: [], noOps: [], diagnostics: [] } as ProjectionPlan;
+    expect((await adapter.project(plan, { cwd } as NodeBinding)).projected).toContain("activity");
+    const parent = join(stateDir, "state/claude-activity-hooks");
+    chmodSync(parent, 0o555);
+    try {
+      writeFileSync(asset, "// relay v2\n");
+      expect((await adapter.project(plan, { cwd } as NodeBinding)).projected).toContain("activity");
+      expect(readFileSync(join(parent, "activity-relay.cjs"), "utf8")).toBe("// relay v2\n");
+      expect(statSync(join(parent, "activity-relay.cjs")).mode & 0o777).toBe(0o755);
+      expect(statSync(parent).mode & 0o777).toBe(0o555);
+      expect(readdirSync(parent)).toEqual(["activity-relay.cjs"]);
+    } finally { chmodSync(parent, 0o755); }
+  });
+
+  it("replaceFile re-seats it on every poll, including after the asset changes", () => {
+    const asset = join(root, "asset.cjs");
+    writeFileSync(asset, "// v1\n");
+    chmodSync(asset, 0o444);
+    const cwd = join(root, "seat");
+    const dest = join(cwd, ".openrig", "context-collector.cjs");
+    const adapter = adapterFor(asset, replaceFile);
+    adapter.ensureContextCollector({ cwd });
+    adapter.ensureContextCollector({ cwd });
+    expect(readFileSync(dest, "utf8")).toBe("// v1\n");
+
+    chmodSync(asset, 0o644);
+    writeFileSync(asset, "// v2\n");
+    chmodSync(asset, 0o444);
+    adapter.ensureContextCollector({ cwd });
+    expect(readFileSync(dest, "utf8")).toBe("// v2\n");
+    expect(statSync(dest).mode & 0o222).toBe(0);
+    expect(readdirSync(join(cwd, ".openrig")).filter((f) => f.includes(".tmp"))).toEqual([]);
   });
 });

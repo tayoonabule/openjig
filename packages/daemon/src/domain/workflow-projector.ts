@@ -43,6 +43,7 @@ import {
   tryResolveRoleByCapability,
   type RoleResolutionContext,
 } from "./workflow-role-context.js";
+import { packetScopeTags } from "./workflow-scope.js";
 import { classifyFailureOccurrence, classifyGateTrip, workflowExceptionTags } from "./workflow-exception.js";
 import { newQitemId, QueueRepositoryError } from "./queue-repository.js";
 import { resolveExceptionRoute } from "./workflow-exception-router.js";
@@ -249,7 +250,7 @@ export class WorkflowProjector {
         { instanceId: instance.instanceId, currentPacketId: input.currentPacketId, frontier: instance.currentFrontier },
       );
     }
-    const specRow = this.specCache.getByNameVersion(instance.workflowName, instance.workflowVersion);
+    const specRow = this.specCache.getForInstance(instance);
     if (!specRow) {
       throw new WorkflowProjectorError(
         "spec_not_cached",
@@ -624,6 +625,7 @@ export class WorkflowProjector {
             `workflow:${spec.id}`,
             `instance:${instance.instanceId}`,
             ...(gateException ? workflowExceptionTags(gateException.identity).filter((t) => !t.startsWith("workflow:") && !t.startsWith("instance:")) : []),
+            ...packetScopeTags(instance, nextStep.id),
           ],
           summary: gateCompile?.summary ?? undefined,
           evidenceRef: gateCompile?.evidenceRef ?? undefined,
@@ -951,7 +953,7 @@ export class WorkflowProjector {
         body: itemBody,
         priority: "urgent",
         tier,
-        tags: workflowExceptionTags(exception.identity),
+        tags: [...workflowExceptionTags(exception.identity), ...packetScopeTags(instance, currentStep.id)],
         summary: exception.reason,
         evidenceRef,
         chainOfRecord: [input.currentPacketId],
@@ -1001,13 +1003,22 @@ export class WorkflowProjector {
 
     const mappedTarget = currentStep.next_hop?.on?.[input.exit];
     const completesPrerequisite = input.exit === "done" || input.exit === "handoff";
-    const trail = this.trailLog.listForInstance(instance.instanceId, 100_000);
+    // Rank by append order, not closed_at, so a clock step-back cannot reorder completions.
+    // A higher rank is a later done or handoff closure.
+    const trail = this.trailLog.listForInstanceInAppendOrder(instance.instanceId);
+    const latestCompletion = new Map<string, number>();
+    trail.forEach((entry, index) => {
+      if (entry.closureReason === "done" || entry.closureReason === "handoff") latestCompletion.set(entry.stepId, index + 1);
+    });
+    if (completesPrerequisite) latestCompletion.set(currentStep.id, trail.length + 1);
+    // A completion older than a prerequisite's latest completion no longer counts, so a step
+    // re-run through a routed exit sends the steps that depend on it round again.
     const completed = new Set(
-      trail
-        .filter((entry) => entry.closureReason === "done" || entry.closureReason === "handoff")
-        .map((entry) => entry.stepId),
+      [...latestCompletion]
+        .filter(([stepId, rank]) => (spec.steps.find((step) => step.id === stepId)?.depends_on ?? [])
+          .every((dependency) => (latestCompletion.get(dependency) ?? 0) < rank))
+        .map(([stepId]) => stepId),
     );
-    if (completesPrerequisite) completed.add(currentStep.id);
 
     const liveBindings = this.instanceStore.listFrontierBindings(instance.instanceId);
     const liveStepIds = new Set(liveBindings.map((binding) => binding.stepId));
@@ -1148,7 +1159,7 @@ export class WorkflowProjector {
           }),
           priority: "routine",
           tier: plan.gate?.tier ?? "mode2",
-          tags: ["workflow", plan.gate ? "gate" : "handoff", `workflow:${spec.id}`, `instance:${instance.instanceId}`, `step:${plan.step.id}`],
+          tags: ["workflow", plan.gate ? "gate" : "handoff", `workflow:${spec.id}`, `instance:${instance.instanceId}`, `step:${plan.step.id}`, ...packetScopeTags(instance, plan.step.id)],
           summary: plan.gate?.summary ?? undefined,
           evidenceRef: plan.gate?.evidenceRef ?? undefined,
           chainOfRecord: [input.currentPacketId],

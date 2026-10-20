@@ -98,10 +98,9 @@ export class StartupController {
       if (this.state.rig && this.state.rigs.some((r) => r.id === this.state.rig!.rigId)) await this.readRig(this.state.rig.rigId);
       else { this.state.page = "rigs"; this.state.selected = 0; }
       this.state.notice = "Daemon connected. Choose what to bring back.";
-      // The served fold is running only for a nonempty rig whose nodes are all
-      // observed running. Missing, stopped, degraded and unverified are not proof.
-      const running = rigs.find(r => r.lifecycleState === "running");
-      if (this.automaticEntry && this.state.open && running) {
+      // Connected users can inspect work regardless of the rigs' lifecycle states.
+      // Setup and recovery remain deliberate choices through Start and return.
+      if (this.automaticEntry && this.state.open) {
         this.automaticEntry = false;
         this.state.open = false;
         this.deps.onWork();
@@ -278,7 +277,7 @@ export function startupLines(s: StartupState): Array<{ text: string; action?: Ac
     if (seat) {
       lines.push({ text: "" }, { text: `${seat.logicalId} · ${seat.runtime} · model ${seat.model ?? "configured default"}` },
         { text: seat.prerequisite ?? (seat.observed.state === "running" && seat.contextPending
-          ? "This fresh conversation is waiting for its configured context. Press c to finish that delivery."
+          ? "This conversation is waiting for its configured context. Press c to finish that delivery."
           : ["running", "attention_required", "unverified"].includes(seat.observed.state) ? seat.observed.detail : seat.reason ?? seat.observed.detail) },
         button(seat.observed.state === "running" ? "Enter  Open live work" : seat.observed.state === "attention_required" ? "Enter  Inspect this existing runtime" : `Enter  ${seat.hasHistory ? "Resume previous conversation" : "Start this new seat"}`, "enter"));
       if (["running", "attention_required"].includes(seat.observed.state)) lines.push(button("o  Open native terminal here · detach to return (default Ctrl-b, d)", "o"));

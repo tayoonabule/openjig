@@ -122,6 +122,44 @@ describe("RigSpec schema (pod-aware)", () => {
     expect(normalized.pods[0]!.members[0]!.effort).toBeUndefined();
   });
 
+  it("advises on an unknown effort for a Pi member only; known levels and model suffixes stay quiet", () => {
+    const withPi = (extra: Record<string, unknown>) => {
+      const rig = structuredClone(VALID_RIG);
+      rig.pods[0]!.members.push({ id: "pi1", agent_ref: "local:agents/pi", profile: "default", runtime: "pi", cwd: ".", ...extra } as never);
+      return RigSpecSchema.validate(rig);
+    };
+    const quiet = withPi({ effort: "high" });
+    expect(quiet.valid).toBe(true);
+    expect((quiet.advisories ?? []).join(" ")).not.toMatch(/effort/);
+    const suffix = withPi({ model: "x/y:low", effort: "high" });
+    expect(suffix.valid).toBe(true);
+    expect((suffix.advisories ?? []).join(" ")).not.toMatch(/effort/);
+    const bad = withPi({ effort: "none" });
+    expect(bad.valid).toBe(true);
+    expect((bad.advisories ?? []).join(" ")).toMatch(/pods\[0\]\.members\[2\]\.effort: "none" isn't a level Pi is known to accept/);
+    expect((bad.advisories ?? []).join(" ")).toContain("the next managed continuation sends it anyway");
+    const flag = withPi({ effort: "--cwd" });
+    expect(flag.valid).toBe(true);
+    expect((flag.advisories ?? []).join(" ")).toMatch(/pods\[0\]\.members\[2\]\.effort: "--cwd" isn't a level Pi is known to accept \([^)]*\); a managed launch leaves it out/);
+    expect((flag.advisories ?? []).join(" ")).not.toContain("sends it anyway");
+    const codex = structuredClone(VALID_RIG);
+    (codex.pods[0]!.members[1] as Record<string, unknown>)["effort"] = "none";
+    expect(RigSpecSchema.validate(codex).advisories ?? []).toEqual([]);
+  });
+
+  it("advises on an unknown effort for a legacy Pi node only", () => {
+    const spec = (runtime: string, effort: string) => ({
+      schema_version: 1, name: "test", version: "1.0",
+      nodes: [{ id: "n", runtime, effort }], edges: [],
+    });
+    expect(LegacyRigSpecSchema.validate(spec("pi", "high")).advisories ?? []).toEqual([]);
+    const bad = LegacyRigSpecSchema.validate(spec("pi", "none"));
+    expect(bad.valid).toBe(true);
+    expect((bad.advisories ?? []).join(" ")).toMatch(/effort: "none" isn't a level Pi is known to accept/);
+    expect((LegacyRigSpecSchema.validate(spec("pi", "high --cwd")).advisories ?? []).join(" ")).toContain("a managed launch leaves it out");
+    expect(LegacyRigSpecSchema.validate(spec("codex", "none")).advisories ?? []).toEqual([]);
+  });
+
   it("rejects codex_config_profile on non-Codex members", () => {
     const rig = structuredClone(VALID_RIG);
     (rig.pods[0]!.members[0] as Record<string, unknown>)["codex_config_profile"] = "sysadmin";
@@ -539,5 +577,54 @@ describe("member mechanic — live ingestion (S20 A7/A8)", () => {
     const result = RigSpecSchema.validate(rig);
     expect(result.valid).toBe(false);
     expect(result.errors.join(" ")).toMatch(/members\[0\].*mechanic.*canonical.*seat@rig/i);
+  });
+});
+
+
+describe("malformed topology stays a validation result", () => {
+  it("rejects an array at the topology root", () => {
+    expect(RigSpecSchema.validate([])).toEqual({ valid: false, errors: ["rig spec must be an object"] });
+  });
+  it("does not coerce a malformed pod id while collecting member addresses", () => {
+    const spec = structuredClone(VALID_RIG);
+    (spec.pods[0] as Record<string, unknown>)["id"] = { toString: null, valueOf: null };
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("pods[0].id: required non-empty string");
+  });
+
+  it.each([null, 42, "wrong", []])("rejects a non-mapping pod: %j", value => {
+    const result = RigSpecSchema.validate({ ...VALID_RIG, pods: [value] });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("pods[0]: must be an object");
+  });
+  it.each([null, 42, "wrong", []])("rejects a non-mapping member: %j", value => {
+    const spec = structuredClone(VALID_RIG);
+    (spec.pods[0]!.members as unknown[]) = [value];
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("pods[0].members[0]: must be an object");
+  });
+  it.each([null, 42, "wrong", []])("rejects a non-mapping local edge: %j", value => {
+    const spec = structuredClone(VALID_RIG);
+    (spec.pods[0]!.edges as unknown[]) = [value];
+    const result = RigSpecSchema.validate(spec);
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("pods[0].edges[0]: must be an object");
+  });
+  it.each([null, 42, "wrong", []])("rejects a non-mapping cross-pod edge: %j", value => {
+    const result = RigSpecSchema.validate({ ...VALID_RIG, edges: [value] });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("edges[0]: must be an object");
+  });
+  it.each([true, 42, [], {}])("reports non-string cross-pod endpoints: %j", value => {
+    const result = RigSpecSchema.validate({ ...VALID_RIG, edges: [{ kind: "escalates_to", from: value, to: "arch.reviewer" }] });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("edges[0].from: required string");
+  });
+  it("still collects later well-formed topology errors after a bad pod", () => {
+    const result = RigSpecSchema.validate({ ...VALID_RIG, pods: [null, VALID_RIG.pods[1]], edges: [{kind:"escalates_to",from:"absent.worker",to:"arch.reviewer"}] });
+    expect(result.errors).toContain("pods[0]: must be an object");
+    expect(result.errors).toContain('edges[0].from: "absent.worker" does not resolve to a pod member');
   });
 });

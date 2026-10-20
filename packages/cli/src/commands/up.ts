@@ -37,6 +37,25 @@ function isPathInsideRoot(candidate: string, root: string): boolean {
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${nodePath.sep}`) && !nodePath.isAbsolute(relative));
 }
 
+// #226 — mirrors cwd-resolution.isFilesystemRoot in the daemon.
+function isFilesystemRoot(cwd: string): boolean {
+  const resolved = nodePath.resolve(cwd);
+  return resolved === nodePath.parse(resolved).root;
+}
+
+/** The mistakes the daemon would refuse in an env: block, caught before anything is sent. */
+function checkEnvAssignment(assignment: string): string | null {
+  const eq = assignment.indexOf("=");
+  if (eq <= 0) return `expects KEY=VALUE, got "${assignment}"`;
+  const name = assignment.slice(0, eq);
+  if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) return `"${name}" is not a valid name; names match ^[A-Z_][A-Z0-9_]*$`;
+  if (name.startsWith("OPENRIG_")) return `"${name}" is reserved; OPENRIG_* names belong to OpenRig`;
+  const value = assignment.slice(eq + 1);
+  if (value === "") return `${name}: value must not be empty`;
+  if (value.includes("\0")) return `${name}: value must not contain a NUL byte`;
+  return null;
+}
+
 // OPR.0.4.4.11 (arch return R11-2) — pre-dispatch detection of a topology
 // source for the --host rejection. Mirrors the daemon's FR-1 detection
 // contract without importing the daemon package: `.rigtopology` extension,
@@ -76,6 +95,12 @@ Examples:
   rig up secrets-manager
   rig up ./rig.yaml
   rig up ./demo.rigbundle --target ~/work
+
+An existing rig's name restores that rig from its automatically selected usable
+snapshot, resuming seats where their harness allows; it refuses while any of its seats is live. A spec
+whose rig name already exists starts a new team in place of the stopped one, which
+is archived, and refuses if the old one may still be running. To bring a stopped
+team back with its conversations, run rig up <rig-name> --existing, not the spec.
 `);
   const getDepsF = () => depsOverride ?? { lifecycleDeps: realDeps(), clientFactory: (url: string) => new DaemonClient(url) };
 
@@ -86,6 +111,7 @@ Examples:
     .option("--plan", "Plan mode — preview without executing")
     .option("--yes", "Auto-approve trusted actions")
     .option("--cwd <path>", "Override launch working directory for all members for this run only")
+    .option("--env <KEY=VALUE>", "Set a launch environment variable on every seat for this run only; repeatable. Not saved: a later restore uses the spec's env: block. Values are visible to local processes, so never pass secrets", (v: string, all: string[]) => [...all, v], [] as string[])
     .option("--target <root>", "Install target for a .rigbundle (default: current directory). A v2 bundle is materialized there and relative member cwds resolve against it; --cwd still overrides launch cwd")
     .option("--preset <name>", "For a GitHub bundle link, choose a declared configuration")
     .option("--seat <member=runtime>", "For a GitHub bundle link, choose a declared seat runtime; repeatable", (v: string, all: string[]) => [...all, v], [] as string[])
@@ -93,7 +119,7 @@ Examples:
     .option("--fresh <seats...>", "Deliberately fresh-prime the named seats (logical ids) instead of resuming their original sessions (operation B; reported as fresh-primed)")
     .option("--json", "JSON output for agents")
     .option("--host <id>", "Run on a remote host declared in ~/.openrig/hosts.yaml")
-    .action(async (source: string, opts: { nonInterruptive?: boolean; plan?: boolean; yes?: boolean; cwd?: string; target?: string; existing?: boolean; fresh?: string[]; json?: boolean; host?: string; preset?: string; seat?: string[] }) => {
+    .action(async (source: string, opts: { nonInterruptive?: boolean; plan?: boolean; yes?: boolean; cwd?: string; env?: string[]; target?: string; existing?: boolean; fresh?: string[]; json?: boolean; host?: string; preset?: string; seat?: string[] }) => {
       // OPR.0.4.6.MH1 FR-2: selected-host routing — explicit --host wins;
       // else the persisted selection feeds the SHIPPED --host path; no
       // selection = today exactly. Topology
@@ -102,6 +128,23 @@ Examples:
       // topology up into the rejected --host form.
       if (!sourceLooksLikeTopology(source)) opts.host = resolveEffectiveHost(opts.host);
       const deps = getDepsF();
+      const envOverride: Record<string, string> = {};
+      for (const assignment of opts.env ?? []) {
+        const problem = checkEnvAssignment(assignment);
+        if (problem) {
+          console.error(`--env ${problem}`);
+          process.exitCode = 1;
+          return;
+        }
+        const eq = assignment.indexOf("=");
+        envOverride[assignment.slice(0, eq)] = assignment.slice(eq + 1);
+      }
+      const envOverrideBody = Object.keys(envOverride).length > 0 ? envOverride : undefined;
+      if (envOverrideBody && sourceLooksLikeTopology(source)) {
+        console.error("--env applies to a new launch from one rig spec or bundle. A topology launches several rigs from their own specs; put env: in each rig's spec instead.");
+        process.exitCode = 1;
+        return;
+      }
 
       // Link preparation verifies the effective endpoint before fetch or local auto-start.
       // Existing path/name dispatch below is unchanged.
@@ -121,6 +164,7 @@ Examples:
               bundlePath: imported.bundlePath, plan: opts.plan ?? false, autoApprove: opts.yes ?? false, nonInterruptive: opts.nonInterruptive,
               targetRoot: opts.target ? nodePath.resolve(opts.target) : process.cwd(),
               cwdOverride: opts.cwd ? nodePath.resolve(opts.cwd) : undefined,
+              envOverride: envOverrideBody,
               cliVersion: getCliVersion(),
             }, { timeoutMs: LONG_RUNNING_UP_TIMEOUT_MS });
           } catch {
@@ -131,12 +175,12 @@ Examples:
           if (opts.json) console.log(JSON.stringify(data));
           else {
             for (const line of bundleIdentityLines(data)) console.log(line);
-            console.log(`Status: ${installed.data.status ?? "unknown"}`);
+            console.log(`Status: ${installed.data.status ?? (installed.status >= 400 ? "not attempted" : "unknown")}`);
             for (const line of startupAttentionSummary(installed.data)) console.log(line);
             if (installed.data.rigId) console.log(`Rig: ${installed.data.rigId}`);
             for (const line of bundleRoutingSummary(installed.data)) console.log(line);
             for (const warning of (installed.data.warnings as string[] | undefined) ?? []) console.warn(warning);
-            if (installed.status >= 400) console.error(bundleInstallError(installed.data));
+            if (installed.status >= 400) console.error(bundleInstallError(installed.data, false));
           }
           if (installed.status >= 400 || ["failed", "partial", "partially_restored", "not_attempted"].includes(String(installed.data.status ?? installed.data.rigResult))) process.exitCode = installed.status === 409 ? 1 : 2;
         } catch (err) { printBundleLinkError(err, opts.json); }
@@ -157,12 +201,19 @@ Examples:
           process.exitCode = 1;
           return;
         }
+        // The remote daemon restores a bare rig name from its own spec, so there is no launch for --env.
+        if (envOverrideBody && !source.includes("/") && !/\.(ya?ml|rigbundle|rigtopology)$/i.test(source)) {
+          console.error("--env applies to a new launch from a rig spec or bundle. A restore keeps the rig's own env: block; to change it, edit env: in the spec and launch again.");
+          process.exitCode = 1;
+          return;
+        }
         const { runRemoteHttpOp } = await import("../remote-host-ops.js");
         const body = {
           sourceRef: source,
           plan: opts.plan,
           autoApprove: opts.yes, nonInterruptive: opts.nonInterruptive,
           cwdOverride: opts.cwd,
+          envOverride: envOverrideBody,
           targetRoot: opts.target,
           existing: opts.existing,
           freshLogicalIds: opts.fresh,
@@ -252,15 +303,15 @@ Examples:
       // rig of that name), refuse with an honest error pointing at
       // `rig unarchive` - never silently restore an archived rig, never
       // silently fall through. Applies to both default and --existing paths.
-      if (isRigName) {
+      const refuseArchivedName = async (name: string): Promise<boolean> => {
         const activeSummaries = await fetchRigSummaries();
-        const activeMatch = activeSummaries.some((r) => r.name === source);
+        const activeMatch = activeSummaries.some((r) => r.name === name);
         if (!activeMatch) {
           try {
             const archRes = await client.get<Array<{ id: string; name: string }>>(
               "/api/rigs/summary?archived=only",
             );
-            const archivedMatches = (archRes.data ?? []).filter((r) => r.name === source);
+            const archivedMatches = (archRes.data ?? []).filter((r) => r.name === name);
             if (archivedMatches.length > 0) {
               // `rig unarchive` resolves by rig ID, not name (it posts to
               // /api/rigs/<rigId>/unarchive), so the remediation MUST name the
@@ -271,30 +322,39 @@ Examples:
               if (opts.json) {
                 console.log(JSON.stringify({
                   error: "rig_archived",
-                  rig: source,
+                  rig: name,
                   archivedRigIds: ids,
                   action: ids.length === 1
                     ? `rig unarchive ${ids[0]}`
-                    : `rig unarchive <rigId> (archived rigs named '${source}': ${ids.join(", ")})`,
+                    : `rig unarchive <rigId> (archived rigs named '${name}': ${ids.join(", ")})`,
                 }));
               } else if (ids.length === 1) {
-                console.error(`Rig "${source}" is archived, so it is hidden from 'rig up' name resolution.`);
+                console.error(`Rig "${name}" is archived, so it is hidden from 'rig up' name resolution.`);
                 console.error(`  Bring it back first: rig unarchive ${ids[0]}`);
-                console.error(`  Then power it on:    rig up ${source}`);
+                console.error(`  Then power it on:    rig up ${name}`);
               } else {
-                console.error(`${ids.length} archived rigs are named "${source}"; they are hidden from 'rig up' name resolution.`);
+                console.error(`${ids.length} archived rigs are named "${name}"; they are hidden from 'rig up' name resolution.`);
                 console.error(`  Unarchive the one you want by id (then 'rig up'):`);
                 for (const id of ids) console.error(`    rig unarchive ${id}`);
               }
               process.exitCode = 1;
-              return;
+              return true;
             }
           } catch {
             // Archived-summary probe failed (e.g. older daemon) - fall through
             // to normal resolution; there are no archive semantics to enforce.
           }
         }
-      }
+        return false;
+      };
+      // A restore brings the rig back from its own spec, so there is no launch to apply --env to.
+      const refuseEnvOnRestore = (): boolean => {
+        if (!envOverrideBody) return false;
+        console.error("--env applies to a new launch from a rig spec or bundle. A restore keeps the rig's own env: block; to change it, edit env: in the spec and launch again.");
+        process.exitCode = 1;
+        return true;
+      };
+      if (isRigName && await refuseArchivedName(source)) return;
       if (isRigName && !opts.existing) {
         // An already-managed STOPPED rig owns its name: `rig up <name>`
         // restores it from its latest good snapshot (the same rig-name route
@@ -309,12 +369,16 @@ Examples:
           // Library match found — check for existing-rig collision
           // Use /api/rigs/summary which mirrors findRigsByName (includes stopped rigs)
           const rigSummaries = await fetchRigSummaries();
-          const rigMatches = rigSummaries.filter((r) => r.name === source);
+          // An alias must not bypass the canonical name's existing/archive checks.
+          const resolvedName = source === "first-project" && entry.name === "starter" && entry.sourceType === "builtin"
+            ? entry.name : source;
+          if (resolvedName !== source && await refuseArchivedName(resolvedName)) return;
+          const rigMatches = rigSummaries.filter((r) => r.name === source || r.name === resolvedName);
           if (rigMatches.length > 0) {
             console.error(`'${source}' is ambiguous — it matches both an existing rig restore target and a library spec.`);
             console.error(`  To launch the library spec: rig up ${entry.sourcePath}`);
             console.error(`  The rig-name match refers to a stopped rig / snapshot-backed restore path.`);
-            console.error(`  To recover the existing rig instead of importing a starter: rig up ${source} --existing`);
+            console.error(`  To recover the existing rig instead of importing a starter: rig up ${rigMatches[0]!.name} --existing`);
             process.exitCode = 1;
             return;
           }
@@ -337,6 +401,7 @@ Examples:
         // "Turning on ..." per the rig's derived lifecycleState. Help text honesty:
         // "Recover" describes what `rig up` does; it does not promise success before
         // tester L4 VM proof completes.
+        if (sourceRef === source && refuseEnvOnRestore()) return;
         if (sourceRef === source && !opts.json) {
           const summaries = await fetchRigSummaries();
           const match = summaries.find((r) => r.name === source);
@@ -346,6 +411,8 @@ Examples:
             console.log(`Turning on rig "${source}"...`);
           }
         }
+      } else if (isRigName && opts.existing && refuseEnvOnRestore()) {
+        return;
       } else if (isRigName && opts.existing && !opts.json) {
         const summaries = await fetchRigSummaries();
         const match = summaries.find((r) => r.name === source);
@@ -399,6 +466,12 @@ Examples:
         }
       }
 
+      // #226 — the launch continues, but a cwd this command chose (not an explicit --cwd) that is the
+      // filesystem root puts every agent's project files there, which is rarely what the person meant.
+      if (defaultLibraryCwdOverride !== undefined && isFilesystemRoot(defaultLibraryCwdOverride)) {
+        console.error(`warning: launching in ${defaultLibraryCwdOverride} because it is your current directory. Agents write their project files (.claude/, .mcp.json and similar) in their working directory, and some may fail if it isn't writable. To launch in your project, run rig up again from it or pass --cwd <project dir>.`);
+      }
+
       // OPR.0.3.4.4 — honest async: a client timeout / connection loss in
       // APPLY mode does NOT mean the operation failed; the daemon may still
       // be processing. Report in-progress/unknown with a verify command,
@@ -423,6 +496,7 @@ Examples:
           plan: opts.plan ?? false,
           autoApprove: opts.yes ?? false, nonInterruptive: opts.nonInterruptive,
           cwdOverride: opts.cwd ? nodePath.resolve(opts.cwd) : defaultLibraryCwdOverride,
+          envOverride: envOverrideBody,
           targetRoot,
           // OPR.0.3.4.2 — operation B opt-in seats (deliberate fresh-prime).
           freshLogicalIds: opts.fresh,
@@ -474,10 +548,6 @@ Examples:
           for (const node of nodes ?? []) {
             console.error(`  ${node.logicalId}${node.sessionName ? ` (${node.sessionName})` : ""}: ${node.reason}`);
           }
-          // #141: the rig is kept on this path, so its warnings (e.g. the archived earlier generation) still apply.
-          for (const w of (res.data["warnings"] as string[]) ?? []) {
-            console.error(`  warning: ${w}`);
-          }
         } else if (code === "cycle_error") {
           console.error("Cycle detected in rig topology. Check edge definitions for circular dependencies.");
         } else if (code === "validation_failed") {
@@ -500,16 +570,19 @@ Examples:
           // nothing-created, alternatives) — render it verbatim, never the
           // generic unknown-error/validate-your-spec fallback. #141's
           // generation_unconfirmed refusal is self-describing the same way.
-          const teaching = String(res.data["error"] ?? ((res.data["errors"] as string[]) ?? [])[0] ?? "A rig with this name is already running.");
+          const teaching = bundleInstallError(res.data, false);
           console.error(teaching);
         } else {
-          const errorText = String(res.data["error"] ?? "unknown error");
+          const errorText = bundleInstallError(res.data, false);
           console.error(`Up failed: ${errorText} (HTTP ${res.status}). Check daemon logs or validate your spec with: rig spec validate <path>`);
           if (/agent_ref resolution failed|No agent\.yaml found/i.test(errorText)) {
             console.error("Hint: local: agent_ref paths resolve relative to the rig spec directory, not your shell cwd.");
             console.error("      Keep the agents/ tree beside the rig YAML, or switch those refs to path:/absolute/path.");
           }
         }
+        // File disposition and generation recovery matter on every failure,
+        // including validation and preflight refusals after materialization.
+        for (const warning of (res.data["warnings"] as string[]) ?? []) console.error(`  warning: ${warning}`);
         const stages = (res.data["stages"] as Array<{ stage: string; status: string }>) ?? [];
         for (const s of stages) {
           console.log(`  ${s.stage}: ${s.status}`);
@@ -609,6 +682,7 @@ Examples:
                   plan: false,
                   autoApprove: opts.yes ?? false, nonInterruptive: opts.nonInterruptive,
                   cwdOverride: opts.cwd ? nodePath.resolve(opts.cwd) : defaultLibraryCwdOverride,
+                  envOverride: envOverrideBody,
                   targetRoot,
                   freshLogicalIds: accepted,
                 }, { timeoutMs: LONG_RUNNING_UP_TIMEOUT_MS });

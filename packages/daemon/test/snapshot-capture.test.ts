@@ -86,34 +86,37 @@ describe("SnapshotCapture", () => {
     expect(capture.captureSnapshot(rig.id, "auto-rehydrate").data.activeOccupantsByNode?.[n1.id]?.kind).toBe("ambiguous");
   });
 
-  it("matches a recorded fresh occupant that a clean down marked exited, but not after a different id or token", () => {
+  it.each(["matching", "older session", "changed token", "changed type", "superseded", "dangling", "conflicting"])("checks a stopped fresh occupant against its pre-down snapshot: %s", (state) => {
     const { rig, n1 } = seedRig();
-    const occupant = sessionRegistry.registerSession(n1.id, "r99-demo1-lead", "fresh");
-    sessionRegistry.updateResumeToken(occupant.id, "claude_id", "native-a", "hook");
-    sessionRegistry.updateStatus(occupant.id, "running");
-    const generation = sessionRegistry.currentOccupantTenure(n1.id)!.generationUuid;
-    db.prepare("INSERT INTO events (rig_id, type, payload) VALUES (?, 'seat.fresh_launched', ?)")
-      .run(rig.id, JSON.stringify({ nodeId: n1.id, sessionId: occupant.id, newGeneration: generation }));
+    const old = sessionRegistry.registerSession(n1.id, "r99-demo1-lead");
+    sessionRegistry.updateStatus(old.id, "running");
+    const oldSnapshot = capture.captureSnapshot(rig.id, "manual");
+    sessionRegistry.updateStatus(old.id, "exited");
+    const successor = sessionRegistry.registerSession(n1.id, "r99-demo1-lead", "fresh");
+    sessionRegistry.updateStatus(successor.id, "running");
+    sessionRegistry.updateResumeToken(successor.id, "claude_id", "native-successor", "hook");
+    const event = { nodeId: n1.id, sessionId: successor.id, newGeneration: sessionRegistry.currentOccupantTenure(n1.id)!.generationUuid };
+    db.prepare("INSERT INTO events (rig_id, type, payload) VALUES (?, 'seat.fresh_launched', ?)").run(rig.id, JSON.stringify(event));
     const snapshot = capture.captureSnapshot(rig.id, "auto-pre-down");
-    sessionRegistry.updateStatus(occupant.id, "exited");
-    const current = rigRepo.getRig(rig.id)!;
-    expect(snapshotMatchesCurrentOccupants(db, current, snapshot)).toBe(true);
-    // Same row, different native identity: still an older occupant.
-    sessionRegistry.updateResumeToken(occupant.id, "claude_id", "native-b", "hook");
-    expect(snapshotMatchesCurrentOccupants(db, current, snapshot)).toBe(false);
+    sessionRegistry.updateStatus(successor.id, state === "superseded" ? "superseded" : "exited");
+
+    if (state === "changed token") sessionRegistry.updateResumeToken(successor.id, "claude_id", "different-native", "hook");
+    if (state === "changed type") db.prepare("UPDATE sessions SET resume_type = 'claude_name' WHERE id = ?").run(successor.id);
+    if (state === "dangling") db.prepare("UPDATE events SET payload = ? WHERE type = 'seat.fresh_launched'").run(JSON.stringify({ ...event, sessionId: "missing" }));
+    if (state === "conflicting") db.prepare("INSERT INTO events (rig_id, type, payload) VALUES (?, 'seat.fresh_launched', ?)").run(rig.id, JSON.stringify({ ...event, sessionId: old.id }));
+
+    expect(snapshotMatchesCurrentOccupants(db, rigRepo.getRig(rig.id)!, state === "older session" ? oldSnapshot : snapshot)).toBe(state === "matching");
   });
 
-  it("legacy path without a fresh relation still ignores exited rows", () => {
+  it("does not let exited history make a legacy detached occupant ambiguous", () => {
     const { rig, n1 } = seedRig();
-    const s = sessionRegistry.registerSession(n1.id, "r99-demo1-lead");
-    sessionRegistry.updateStatus(s.id, "running");
-    const snapshot = capture.captureSnapshot(rig.id, "auto-pre-down");
-    sessionRegistry.updateStatus(s.id, "exited");
-    // Exited row is invisible to legacy inference -> node counts as "none" -> match.
+    const old = sessionRegistry.registerSession(n1.id, "r99-demo1-lead");
+    sessionRegistry.updateStatus(old.id, "exited");
+    const current = sessionRegistry.registerSession(n1.id, "r99-demo1-lead");
+    sessionRegistry.markDetached(current.id);
+    const snapshot = capture.captureSnapshot(rig.id, "auto-rehydrate");
+
     expect(snapshotMatchesCurrentOccupants(db, rigRepo.getRig(rig.id)!, snapshot)).toBe(true);
-    // A new live row with no relation is a different occupant -> mismatch.
-    sessionRegistry.registerSession(n1.id, "r99-demo1-lead");
-    expect(snapshotMatchesCurrentOccupants(db, rigRepo.getRig(rig.id)!, snapshot)).toBe(false);
   });
 
   it("assembles correct SnapshotData (rig + nodes + edges + bindings)", () => {

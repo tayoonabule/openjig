@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
 import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import nodePath from "node:path";
 import { EventEmitter } from "node:events";
 import { Command } from "commander";
 import { formatRemoteUpFailure, upCommand } from "../src/commands/up.js";
@@ -71,6 +74,12 @@ describe("Up CLI", () => {
 
       if (req.url === "/api/up" && req.method === "POST") {
         const parsed = JSON.parse(body);
+        if (String(parsed.sourceRef).includes("reinstall-cause")) {
+          const code = String(parsed.sourceRef).match(/reinstall-cause-([\w]+)\.rigbundle$/)?.[1];
+          res.writeHead(code ? 400 : 500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "failed", code, errors: ["Install target has different content at README.md"], warnings: ["Original files are kept at /fixture/backup"], stages: [] }));
+          return;
+        }
         if (parsed.plan) {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ status: "planned", runId: "run-1", stages: [{ stage: "resolve_spec", status: "ok" }], errors: [], warnings: [] }));
@@ -95,6 +104,20 @@ describe("Up CLI", () => {
     prog.addCommand(upCommand(runningDeps(port)));
     return prog;
   }
+
+  it("local bundle reinstall renders errors[] and file disposition instead of unknown error", async () => {
+    const { logs, exitCode } = await captureLogs(() => makeCmd().parseAsync(["node", "rig", "up", "reinstall-cause.rigbundle"]).then(() => {}));
+    expect(exitCode).toBe(2);
+    expect(logs.join("\n")).toContain("different content at README.md");
+    expect(logs.join("\n")).toContain("Original files are kept at /fixture/backup");
+    expect(logs.join("\n")).not.toContain("unknown error");
+  });
+
+  it.each(["validation_failed", "preflight_failed", "cycle_error", "generation_unconfirmed", "target_conflict"])("round 2: %s prints file disposition once", async code => {
+    const { logs, exitCode } = await captureLogs(() => makeCmd().parseAsync(["node", "rig", "up", `reinstall-cause-${code}.rigbundle`]).then(() => {}));
+    expect(exitCode).toBe(2);
+    expect(logs.join("\n").match(/Original files are kept at \/fixture\/backup/g)).toHaveLength(1);
+  });
 
   it("renders structured remote up failures and attention hints as text", () => {
     const lines = formatRemoteUpFailure("build-host", {
@@ -447,6 +470,42 @@ describe("Up CLI", () => {
     }
   });
 
+  // #226: a launch from '/' continues, and the person is told why their agents would work in '/'.
+  // Only the cwd the CLI defaults warns; an explicit --cwd / is the person's choice.
+  it.each([
+    { args: ["demo"], warns: true },
+    { args: ["demo", "--cwd", "/"], warns: false },
+  ])("up $args from / sends cwdOverride / and warns only when / was defaulted", async ({ args, warns }) => {
+    let lastBody: Record<string, unknown> = {};
+    const origListeners = server.listeners("request");
+    server.removeAllListeners("request");
+    server.on("request", async (req: http.IncomingMessage, res: http.ServerResponse) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const reply = (status: number, data: unknown) => { res.writeHead(status, { "Content-Type": "application/json" }); res.end(JSON.stringify(data)); };
+      if ((req.url ?? "").startsWith("/api/specs/library")) return reply(200, [{
+        id: "builtin:rig:demo", kind: "rig", name: "demo", version: "0.0.0", sourceType: "builtin",
+        sourcePath: "/install/@openrig/cli/daemon/specs/rigs/launch/demo/rig.yaml", relativePath: "rigs/launch/demo/rig.yaml", updatedAt: "2026-04-10T00:00:00Z",
+      }]);
+      if (req.url === "/api/rigs/summary") return reply(200, []);
+      if (req.url === "/api/up") { lastBody = JSON.parse(body); return reply(201, { status: "completed", runId: "r", rigId: "g", stages: [], errors: [] }); }
+      reply(404, { error: "not found" });
+    });
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue("/");
+    try {
+      const { logs, exitCode } = await captureLogs(async () => {
+        await makeCmd().parseAsync(["node", "rig", "up", ...args]);
+      });
+      expect(lastBody.cwdOverride).toBe("/");
+      expect(exitCode).toBeUndefined();
+      expect(logs.some((l) => l.includes("warning:") && l.includes("--cwd <project dir>"))).toBe(warns);
+    } finally {
+      cwd.mockRestore();
+      server.removeAllListeners("request");
+      for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+    }
+  });
+
   it("up --cwd sends absolute cwdOverride", async () => {
     let lastBody: Record<string, unknown> = {};
     const origListeners = server.listeners("request");
@@ -470,6 +529,138 @@ describe("Up CLI", () => {
 
     server.removeAllListeners("request");
     for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+  });
+
+  it("up --env sends each KEY=VALUE as envOverride, splitting at the first equals sign", async () => {
+    let lastBody: Record<string, unknown> = {};
+    const origListeners = server.listeners("request");
+    server.removeAllListeners("request");
+    server.on("request", async (req: http.IncomingMessage, res: http.ServerResponse) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      if (req.url === "/api/up") {
+        lastBody = JSON.parse(body);
+        res.writeHead(201, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "completed", runId: "r", rigId: "g", stages: [], errors: [] }));
+      }
+    });
+
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "up", "/tmp/rig.yaml", "--env", "DEBUG=1", "--env", "URL=http://x/?a=b"]);
+    });
+
+    expect(lastBody.envOverride).toEqual({ DEBUG: "1", URL: "http://x/?a=b" });
+
+    server.removeAllListeners("request");
+    for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+  });
+
+  it("up without --env sends no envOverride", async () => {
+    let lastBody: Record<string, unknown> = {};
+    const origListeners = server.listeners("request");
+    server.removeAllListeners("request");
+    server.on("request", async (req: http.IncomingMessage, res: http.ServerResponse) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      if (req.url === "/api/up") {
+        lastBody = JSON.parse(body);
+        res.writeHead(201, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "completed", runId: "r", rigId: "g", stages: [], errors: [] }));
+      }
+    });
+
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "up", "/tmp/rig.yaml"]);
+    });
+
+    expect(lastBody).not.toHaveProperty("envOverride");
+
+    server.removeAllListeners("request");
+    for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+  });
+
+  it("up --env without an equals sign stops before contacting the daemon", async () => {
+    let called = false;
+    const origListeners = server.listeners("request");
+    server.removeAllListeners("request");
+    server.on("request", (_req: http.IncomingMessage, res: http.ServerResponse) => { called = true; res.writeHead(500); res.end(); });
+    try {
+      const { logs, exitCode } = await captureLogs(async () => {
+        await makeCmd().parseAsync(["node", "rig", "up", "/tmp/rig.yaml", "--env", "NOEQUALS"]);
+      });
+      expect(called).toBe(false);
+      expect(exitCode).toBe(1);
+      expect(logs.join("\n")).toContain("--env expects KEY=VALUE");
+    } finally {
+      server.removeAllListeners("request");
+      for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+    }
+  });
+
+  async function withListener(handler: (url: string) => { status: number; body: unknown }, run: (upCalls: () => number) => Promise<void>) {
+    let upCalls = 0;
+    const origListeners = server.listeners("request");
+    server.removeAllListeners("request");
+    server.on("request", async (req: http.IncomingMessage, res: http.ServerResponse) => {
+      for await (const _chunk of req) { /* drain */ }
+      if (req.url === "/api/up") upCalls++;
+      const { status, body } = handler(req.url ?? "");
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+    });
+    try {
+      await run(() => upCalls);
+    } finally {
+      server.removeAllListeners("request");
+      for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+    }
+  }
+
+  it.each([
+    ["a lowercase name", "lower=x", "not a valid name"],
+    ["a reserved name", "OPENRIG_URL=http://elsewhere", "reserved"],
+    ["an empty value", "EMPTY=", "must not be empty"],
+  ])("up --env with %s stops before contacting the daemon", async (_label, assignment, fragment) => {
+    await withListener(() => ({ status: 500, body: {} }), async (upCalls) => {
+      const { logs, exitCode } = await captureLogs(async () => {
+        await makeCmd().parseAsync(["node", "rig", "up", "/tmp/rig.yaml", "--env", assignment]);
+      });
+      expect(upCalls()).toBe(0);
+      expect(exitCode).toBe(1);
+      expect(logs.join("\n")).toContain(fragment);
+    });
+  });
+
+  it.each([
+    ["a rig name", ["up", "my-rig", "--env", "DEBUG=1"]],
+    ["a rig name with --existing", ["up", "my-rig", "--existing", "--env", "DEBUG=1"]],
+  ])("up --env with %s says a restore takes no --env and does not call /api/up", async (_label, args) => {
+    await withListener((url) => ({ status: 200, body: url.startsWith("/api/rigs/summary") ? [{ id: "r1", name: "my-rig", lifecycleState: "stopped" }] : [] }), async (upCalls) => {
+      const { logs, exitCode } = await captureLogs(async () => {
+        await makeCmd().parseAsync(["node", "rig", ...args]);
+      });
+      expect(upCalls()).toBe(0);
+      expect(exitCode).toBe(1);
+      expect(logs.join("\n")).toContain("A restore keeps the rig's own env: block");
+    });
+  });
+
+  it("up --env with a topology source says a topology takes no --env and does not call /api/up", async () => {
+    const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "up-topology-env-"));
+    try {
+      const manifest = nodePath.join(dir, "factory.rigtopology");
+      fs.writeFileSync(manifest, "rigs:\n  - source: ./a.yaml\n");
+      await withListener(() => ({ status: 200, body: {} }), async (upCalls) => {
+        const { logs, exitCode } = await captureLogs(async () => {
+          await makeCmd().parseAsync(["node", "rig", "up", manifest, "--env", "DEBUG=1"]);
+        });
+        expect(upCalls()).toBe(0);
+        expect(exitCode).toBe(1);
+        expect(logs.join("\n")).toContain("A topology launches several rigs");
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   // OPR.0.3.2.22 Bug 3 — path-form `rig up <spec-inside-install>` without
@@ -1007,6 +1198,56 @@ describe("Up CLI", () => {
     expect(logs.join("\n")).not.toContain("rename or remove");
     expect(startupRequests).toBe(0);
     expect(exitCode).toBe(1);
+  });
+
+  it.each([
+    ["fresh alias", [], [], false, 0, "first-project"],
+    ["existing starter", [{ id: "new-rig", name: "starter" }], [], false, 1, "first-project"],
+    ["existing old name", [{ id: "old-rig", name: "first-project" }], [], false, 1, "first-project"],
+    ["archived starter", [], [{ id: "archived-new", name: "starter" }], false, 1, "first-project"],
+    ["archived old name", [], [{ id: "archived-old", name: "first-project" }], false, 1, "first-project"],
+    ["explicit old restore", [{ id: "old-rig", name: "first-project" }], [], true, 0, "first-project"],
+    ["explicit library ID", [{ id: "new-rig", name: "starter" }], [], false, 0, "starter-spec"],
+  ] as const)("first-project routing: %s", async (_label, active, archived, existing, exit, input) => {
+    const originalListeners = server.listeners("request").slice();
+    server.removeAllListeners("request");
+    const posts: Array<Record<string, unknown>> = [];
+    const requests: string[] = [];
+    server.on("request", async (req, res) => {
+      requests.push(req.url ?? "");
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.url === "/api/rigs/summary") res.end(JSON.stringify(active));
+      else if (req.url === "/api/rigs/summary?archived=only") res.end(JSON.stringify(archived));
+      else if (req.url?.startsWith("/api/specs/library")) res.end(JSON.stringify([{
+        id: "starter-spec", name: "starter", kind: "rig", sourceType: "builtin", sourcePath: "/builtin/starter/rig.yaml",
+      }]));
+      else if (req.url === "/api/up") {
+        posts.push(JSON.parse(body));
+        res.end(JSON.stringify({ status: "planned", runId: "alias-plan", stages: [], errors: [], warnings: [] }));
+      } else res.end("{}");
+    });
+    try {
+      const result = await captureLogs(async () => {
+        await makeCmd().parseAsync(["node", "rig", "up", input, "--plan", "--json", ...(existing ? ["--existing"] : [])]);
+      });
+      expect(result.exitCode ?? 0).toBe(exit);
+      if (exit) {
+        expect(posts).toHaveLength(0);
+        if (archived.length) expect(result.logs.join("\n")).toContain(`rig unarchive ${archived[0]!.id}`);
+        else expect(result.logs.join("\n")).toContain(`rig up ${active[0]!.name} --existing`);
+      } else {
+        expect(posts).toHaveLength(1);
+        expect(posts[0]!.sourceRef).toBe(existing ? "first-project" : "/builtin/starter/rig.yaml");
+        if (existing) expect(requests.some((url) => url.startsWith("/api/specs/library"))).toBe(false);
+        else expect(posts[0]!.cwdOverride).toBe(process.cwd());
+        expect(result.logs.filter((line) => line.startsWith("{")).map((line) => JSON.parse(line))).toHaveLength(1);
+      }
+    } finally {
+      server.removeAllListeners("request");
+      for (const listener of originalListeners) server.on("request", listener as (req: http.IncomingMessage, res: http.ServerResponse) => void);
+    }
   });
 
   it("up resolves a same-name rig and workflow to the rig library entry", async () => {

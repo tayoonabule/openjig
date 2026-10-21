@@ -75,6 +75,26 @@ describe("project-qualified proof scope (#132)", () => {
     expect(fs.existsSync(join(f.legacy.slice, "proof/judgments"))).toBe(false);
   });
 
+  it("normalizes project-root-relative mission paths for inferred and explicit projects", async () => {
+    const f = fixture("work/missions");
+
+    const inferred = await f.get("scope=work/missions/m0", "worker@hull");
+    expect(inferred.status).toBe(200);
+    expect((await inferred.json()).project).toEqual({ id: "alpha", root: join(f.workspace, "alpha") });
+
+    const explicit = await f.get("project=beta&scope=missions/m0");
+    expect(explicit.status).toBe(200);
+    expect((await explicit.json()).project).toEqual({ id: "beta", root: join(f.workspace, "beta") });
+
+    const judged = await f.judge("work/missions/m0/slices/01-t001", {}, f.alpha.slice, "judge@hull");
+    expect(judged.status).toBe(201);
+    expect((await judged.json()).judgment.scope).toBe("work/missions/m0/slices/01-t001");
+
+    const escaping = await f.get("scope=work/missions/../../../beta/missions/m0", "worker@hull");
+    expect(escaping.status).toBe(400);
+    expect((await escaping.json()).error).toBe("path_escape");
+  });
+
   it("show resolves `<project>:<scope>` and `project=` through the catalog, not the selected slices root", async () => {
     const f = fixture();
     const qualified = await f.get(`scope=${encodeURIComponent("alpha:m0/slices/01-t001")}`);

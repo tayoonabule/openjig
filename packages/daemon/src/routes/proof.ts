@@ -99,7 +99,21 @@ export function proofRoutes(): Hono {
     // A judgment carries the root its prepared read resolved: if the catalog now maps the id elsewhere, refuse
     // rather than record against a different project.
     if (typeof expectedRoot === "string" && expectedRoot !== p.root) throw new JudgmentError("project_changed", `Project ${id} now resolves to ${p.root}, not the ${expectedRoot} the prepared read used; read the proof again`, 409);
-    return { root: p.missionsRoot, evidenceRoot: p.root, scope, owner: null, project: { id: p.id, root: p.root } };
+    let projectScope = scope;
+    if (scope && !path.isAbsolute(scope)) {
+      const missionsPrefix = path.relative(p.root, p.missionsRoot);
+      if (missionsPrefix && missionsPrefix !== ".") {
+        const prefix = `${missionsPrefix}${path.sep}`;
+        if (scope.startsWith(prefix) && existsAt(p.root, scope)) {
+          const fromProjectRoot = path.resolve(p.root, scope);
+          const relativeToMissions = path.relative(p.missionsRoot, fromProjectRoot);
+          if (relativeToMissions && relativeToMissions !== "." && !relativeToMissions.startsWith(`..${path.sep}`) && relativeToMissions !== ".." && !path.isAbsolute(relativeToMissions)) {
+            projectScope = relativeToMissions;
+          }
+        }
+      }
+    }
+    return { root: p.missionsRoot, evidenceRoot: p.root, scope: projectScope, owner: null, project: { id: p.id, root: p.root } };
   };
   // Catalog-project reads have no source watcher (it observes the daemon's selected workspace only), so their
   // freshness is reported as unverified rather than borrowing the selected workspace's state.

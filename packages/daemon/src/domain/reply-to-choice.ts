@@ -8,6 +8,9 @@ const REPLY_TO_CHOICE_PREFIX = "slack-reply-to-choice";
  *  a note from anyone else must never steer where the update posts. */
 export const REPLY_TO_CHOICE_ACTOR = "daemon@kernel";
 
+/** How far a reply-to chain is followed back to the item that owns a root when the choice is made. */
+export const REPLY_TO_CHAIN_LIMIT = 32;
+
 /** Fallbacks named by the queue item that blocked threading. */
 export type ReplyToQitemFallbackReason =
   | "root-missing" // the referenced conversation never posted a root
@@ -19,22 +22,25 @@ export type ReplyToRootFallbackReason =
   | "root-closed"
   | "root-other-human" // the root was addressed to a different human
   | "root-other-seat" // the root belongs to another agent seat: a reply there would reach that seat
-  | "root-other-channel"; // the root lives in a channel other than the configured one
+  | "root-other-channel"; // the root lives in a channel other than the one this update posts to
 
 export type ReplyToFallback =
   | { kind: "fallback"; reason: ReplyToQitemFallbackReason; qitemId: string }
   | { kind: "fallback"; reason: ReplyToRootFallbackReason; threadTs: string };
 
-export type ReplyToChoice = { kind: "thread"; threadTs: string } | ReplyToFallback;
+/** `channel` (#192): the channel the choice was made for, recorded only when a channel map is
+ *  configured. Every retry posts there; a record without it resolves the channel as before. */
+export type ReplyToChoice = ({ kind: "thread"; threadTs: string } | ReplyToFallback) & { channel?: string };
 
 const QITEM_REASONS: readonly string[] = ["root-missing", "reference-has-live-gate", "chain-too-long"] satisfies ReplyToQitemFallbackReason[];
 const ROOT_REASONS: readonly string[] = ["root-closed", "root-other-human", "root-other-seat", "root-other-channel"] satisfies ReplyToRootFallbackReason[];
 
 export function formatReplyToChoice(choice: ReplyToChoice): string {
-  if (choice.kind === "thread") return `${REPLY_TO_CHOICE_PREFIX} kind=thread thread_ts=${choice.threadTs}`;
+  const channel = choice.channel ? ` channel=${choice.channel}` : "";
+  if (choice.kind === "thread") return `${REPLY_TO_CHOICE_PREFIX} kind=thread thread_ts=${choice.threadTs}${channel}`;
   return "qitemId" in choice
-    ? `${REPLY_TO_CHOICE_PREFIX} kind=fallback reason=${choice.reason} qitem=${choice.qitemId}`
-    : `${REPLY_TO_CHOICE_PREFIX} kind=fallback reason=${choice.reason} thread_ts=${choice.threadTs}`;
+    ? `${REPLY_TO_CHOICE_PREFIX} kind=fallback reason=${choice.reason} qitem=${choice.qitemId}${channel}`
+    : `${REPLY_TO_CHOICE_PREFIX} kind=fallback reason=${choice.reason} thread_ts=${choice.threadTs}${channel}`;
 }
 
 /** Parse a choice note (null when the note is not one). Callers check the actor. */
@@ -49,12 +55,14 @@ export function parseReplyToChoice(note: string): ReplyToChoice | null {
   const reason = fields.get("reason") ?? "";
   const threadTs = fields.get("thread_ts");
   const qitemId = fields.get("qitem");
-  if (kind === "thread" && threadTs) return { kind: "thread", threadTs };
+  const channel = fields.get("channel");
+  const at = channel ? { channel } : {};
+  if (kind === "thread" && threadTs) return { kind: "thread", threadTs, ...at };
   if (kind === "fallback" && qitemId && QITEM_REASONS.includes(reason)) {
-    return { kind: "fallback", reason: reason as ReplyToQitemFallbackReason, qitemId };
+    return { kind: "fallback", reason: reason as ReplyToQitemFallbackReason, qitemId, ...at };
   }
   if (kind === "fallback" && threadTs && ROOT_REASONS.includes(reason)) {
-    return { kind: "fallback", reason: reason as ReplyToRootFallbackReason, threadTs };
+    return { kind: "fallback", reason: reason as ReplyToRootFallbackReason, threadTs, ...at };
   }
   return null;
 }

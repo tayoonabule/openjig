@@ -6,6 +6,9 @@ import { DEFAULT_TIME_ZONE, displayTime } from "./time.js";
 import { startupLines, type StartupState } from "./startup.js";
 import { configLines } from "./config/config-model.js";
 import { connectionsLines } from "./connections/connections-model.js";
+import { usageLines } from "./usage/usage-model.js";
+import { usageHostsLines } from "./usage/usage-hosts-model.js";
+import { costLines } from "./cost/cost-model.js";
 // Hand-rolled ANSI renderer (Phase-0 substrate decision). Pure function:
 // (state, snapshot) → {lines, hitMap, explorerRows}. BOTH panes emit hit
 // targets — explorer rows AND content-pane surfaces (table rows, view tabs,
@@ -16,6 +19,8 @@ import { computeExplorerRows, findAgent, findSpec, findAgentBySession, agentsRun
 import { missionStatusLines, missionStatusHeadline, authoredCompletion, scopesContentLines } from "./scopes/scopes-model.js";
 import { executionContentLines, executionSliceStripLines } from "./execution/execution-model.js";
 import { navigatorDisplay } from "./navigator.js";
+import { specGraph } from "./specs/graph.js";
+import { launchCommand } from "./specs/launch.js";
 import { renderGraphStyle } from "./topology/render-graph.js";
 import { buildPulseModel } from "./pulse/pulse-model.js";
 import { renderPulseView, pulseLaneTargets } from "./pulse/render-pulse.js";
@@ -165,7 +170,7 @@ function queueFacts(snap: FleetSnapshot, session: string | null | undefined): { 
     rows.push({ role, row });
   }
   const primary = rows[0];
-  if (!primary) return { count: 0, work: "—", now: "—" };
+  if (!primary) return { count: 0, work: queueIncomplete(snap) ? "unknown" : "—", now: queueIncomplete(snap) ? "not in sample" : "—" };
   const slice = primary.row.tags?.find((tag) => tag.startsWith("slice:"))?.slice("slice:".length);
   const work = slice?.match(/^OPR(?:\.\d+){3}\.(\d+)$/)?.[1]
     ? `S${slice.slice(slice.lastIndexOf(".") + 1)}`
@@ -173,6 +178,21 @@ function queueFacts(snap: FleetSnapshot, session: string | null | undefined): { 
   const summary = primary.row.summary?.trim() || primary.row.body.split("\n").find((line) => line.trim())?.trim() || primary.row.qitemId;
   const now = primary.role === "working" ? summary : `${primary.role} · ${summary}`;
   return { count: rows.length, work, now };
+}
+
+function queueIncomplete(snap: FleetSnapshot): boolean {
+  return snap.queueCoverage === "partial" || snap.queueCoverage === "unavailable";
+}
+
+function queueCount(snap: FleetSnapshot, count: number): string | number {
+  return queueIncomplete(snap) ? count ? `${count}+` : "?" : count || "·";
+}
+
+function queueSampleLines(snap: FleetSnapshot, width: number): ContentLine[] {
+  return queueIncomplete(snap) ? wrapDetailLines([
+    { text: snap.queueCoverage === "unavailable" ? "Queue sample incomplete: a list read failed." : "Queue sample may be incomplete: a list reached its cap." },
+    { text: "Counts are lower bounds; unlisted work is unknown." },
+  ], width) : [];
 }
 
 function number(value: number | null | undefined): string {
@@ -213,8 +233,8 @@ function rowsForAgent(snap: FleetSnapshot, session: string, sources: Array<Fleet
   return rows;
 }
 
-function workRows(rows: FleetSnapshot["attention"], width: number): ContentLine[] {
-  if (rows.length === 0) return [fieldLine({ label: "rows", value: "none in the served bounded lists" })];
+function workRows(rows: FleetSnapshot["attention"], width: number, incomplete = false): ContentLine[] {
+  if (rows.length === 0) return [fieldLine({ label: "rows", value: incomplete ? "not in sample; work unknown" : "none in the served bounded lists" })];
   return rows.flatMap((row) => {
     const summary = row.summary?.trim() || row.body.split("\n").find((line) => line.trim())?.trim() || "no summary served";
     return [
@@ -233,12 +253,12 @@ function agentDetailLines(
 ): ContentLine[] {
   const { agent, rig, pod } = found;
   const session = agent.session;
-  const specInLibrary = !!agent.spec && !!findSpec(snap, agent.spec);
+  const specInLibrary = !!agent.spec && !!findSpec(snap, agent.spec, "agent");
   const currentRows = session ? rowsForAgent(snap, session, [snap.attention, snap.blocked, snap.inProgress]) : [];
   const pendingRows = session ? rowsForAgent(snap, session, [snap.pending]) : [];
   const recentRows = session ? rowsForAgent(snap, session, [snap.recentlyFinished]) : [];
   const needs = session ? snap.needs.filter((item) => item.target === session) : [];
-  const visibleAssigned = currentRows.length + pendingRows.length;
+  const visibleAssigned = new Set([...currentRows, ...pendingRows].map(row => row.qitemId)).size;
   const assigned = agent.assignedWorkCount ?? visibleAssigned;
   const pending = agent.pendingWorkCount ?? pendingRows.length;
   const inProgress = agent.inProgressWorkCount ?? currentRows.filter((row) => row.state === "in-progress").length;
@@ -276,7 +296,7 @@ function agentDetailLines(
           fieldLine({ label: "tokens", value: `${number(agent.totalInputTokens)} input · ${number(agent.totalOutputTokens)} output · ${number(agent.contextWindowSize)} window` }),
           runtimeLine,
           ...(agent.attach ? [fieldLine({ label: "attach", value: agent.attach })] : []),
-          fieldLine({ label: "terminal", value: `term ▸ pod ${pod.name}`, link: { type: "act", act: "open-terminal", view: `pod:${rig.name}/${pod.name}` } }),
+          fieldLine({ label: "terminal", value: `Open terminals ▸ pod ${pod.name}`, link: { type: "act", act: "open-terminal", view: `pod:${rig.name}/${pod.name}` } }),
         ],
       },
       {
@@ -299,15 +319,16 @@ function agentDetailLines(
           local: found.host === snap.hosts[0],
         }, contentWidth),
       },
-      { title: `CURRENT WORK · ${currentRows.length}`, lines: workRows(currentRows, contentWidth) },
+      { title: `CURRENT WORK · ${currentRows.length}${queueIncomplete(snap) ? " sampled" : ""}`, lines: workRows(currentRows, contentWidth, queueIncomplete(snap)) },
       {
         title: "QUEUE",
         lines: [
-          ...wrapDetailValue("depth", `${assigned} assigned · ${pending} pending · ${inProgress} in progress · ${blocked} blocked`, contentWidth),
+          ...queueSampleLines(snap, contentWidth),
+          ...wrapDetailValue("depth", `${agent.assignedWorkCount == null && queueIncomplete(snap) ? `${assigned}+` : assigned} assigned · ${agent.pendingWorkCount == null && queueIncomplete(snap) ? `${pending}+` : pending} pending · ${agent.inProgressWorkCount == null && queueIncomplete(snap) ? `${inProgress}+` : inProgress} in progress · ${agent.blockedWorkCount == null && queueIncomplete(snap) ? `${blocked}+` : blocked} blocked`, contentWidth),
           ...(agent.assignedWorkCount == null ? wrapDetailValue("basis", `${visibleAssigned} rows visible in bounded list reads; complete count not served`, contentWidth) : []),
         ],
       },
-      { title: `UP NEXT · ${pending}`, lines: workRows(pendingRows, contentWidth) },
+      { title: `UP NEXT · ${pending}${queueIncomplete(snap) ? " · sampled rows" : ""}`, lines: workRows(pendingRows, contentWidth, queueIncomplete(snap)) },
       { title: `NEEDS YOU · ${needs.length || agent.activity?.needsInput?.count || 0}`, lines: needsRows },
       ...(recentRows.length ? [{ title: "RECENTLY FINISHED · bounded window", lines: workRows(recentRows, contentWidth) }] : []),
       {
@@ -335,6 +356,11 @@ function agentDetailLines(
       },
     ]),
   ];
+}
+
+function pendingTag(state: ViewState): string {
+  const pending = state.pendingDrill;
+  return pending ? `  ▸ resolving ${pending.resource} "${pending.name}"…` : "";
 }
 
 function tabsLine(state: ViewState, suffix: string): ContentLine[] {
@@ -365,7 +391,7 @@ function queueRows(snap: FleetSnapshot): FleetSnapshot["attention"] {
 function recentWorkText(snap: FleetSnapshot, row: RecentTransitionSnap): string {
   const qitem = queueRows(snap).find((candidate) => candidate.qitemId === row.qitemId);
   const work = qitem?.summary?.trim() || qitem?.body.split("\n").find((line) => line.trim())?.trim();
-  return row.summary?.trim() || work || "no work served";
+  return row.summary?.trim() || row.bodyPreview?.trim() || work || "no work served";
 }
 
 function agentDrillForSession(snap: FleetSnapshot, session: string): Action | undefined {
@@ -458,8 +484,8 @@ function timeZoneLines(state: ViewState, width: number): ContentLine[] {
 }
 
 function specTabsLine(state: ViewState): ContentLine {
-  const active = state.viewTab === "topology" || state.viewTab === "yaml" ? state.viewTab : "configuration";
-  const labels = ["topology", "configuration", "yaml"] as const;
+  const active = state.viewTab === "graph" || state.viewTab === "topology" || state.viewTab === "yaml" ? state.viewTab : "configuration";
+  const labels = ["graph", "topology", "configuration", "yaml"] as const;
   const parts = labels.map((tab) => (tab === active ? `[ ${tab.toUpperCase()} ]` : `  ${tab.toUpperCase()}  `));
   const text = parts.join(" ");
   return {
@@ -630,6 +656,7 @@ function instanceContentLines(
   }
 
   lines.push(healthSummaryLine(snap, scope, contentWidth));
+  lines.push(...queueSampleLines(snap, contentWidth));
   lines.push({ text: state.filter ? `/ filter instance rows: ${state.filter} · / replace · esc clear` : "/ filter instance rows…" });
   const columns = instanceAgentColumns(contentWidth);
   lines.push({ text: tableRow(columns, { rig: "RIG", pod: "POD", seat: "SEAT", runtime: "RT", context: "CTX", status: "STATE", queue: "Q", work: "WORK", now: "NOW" }) });
@@ -669,7 +696,7 @@ function instanceContentLines(
           runtime: runtimeShort(agent.runtime),
           context: contextCompact(agent.context, contentWidth < 110),
           status: stateCell.word,
-          queue: queue.count || "·",
+          queue: queueCount(snap, queue.count),
           work: queue.work,
           now: queue.now,
         }),
@@ -678,7 +705,7 @@ function instanceContentLines(
       });
     }
   }
-  lines.push({ text: "" }, { text: host.rigs.some(r => r.inventoryUnavailable) ? `${host.rigs.length} rigs · inventory incomplete · ${seatCount} seats read` : `${host.rigs.length} rigs · ${seatCount} seats · ${workingCount} working · ${attentionCount} need attention · ${openCount} open rows` });
+  lines.push({ text: "" }, { text: host.rigs.some(r => r.inventoryUnavailable) ? `${host.rigs.length} rigs · inventory incomplete · ${seatCount} seats read` : `${host.rigs.length} rigs · ${seatCount} seats · ${workingCount} working · ${attentionCount} need attention · ${openCount}${queueIncomplete(snap) ? "+ sampled" : ""} open rows` });
   lines.push(...recentLines(snap, scope, contentWidth, false, state.timeZone));
   return lines;
 }
@@ -697,6 +724,9 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
   if (state.section === "terminals") return terminalLines(state, snap, contentWidth);
   if (state.section === "config") return configLines(state, snap, contentWidth);
   if (state.section === "connections") return connectionsLines(snap, contentWidth, state.timeZone, state.expanded);
+  if (state.section === "usage") return usageLines(snap, contentWidth);
+  if (state.section === "usage-hosts") return usageHostsLines(snap, contentWidth);
+  if (state.section === "cost") return costLines(snap.cost, contentWidth);
   if (state.healthOpen) return healthDetailLines(snap, state.healthOpen, contentWidth, state.timeZone);
   if (state.section === "system") return [{ text: "System · Instance health" }, { text: "" }, ...healthListLines(snap, { kind: "instance", local: true }, contentWidth)];
   // PULSE is a FULL-WIDTH view handled by an early return in renderScreen
@@ -764,8 +794,8 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
       .filter((a) => !state.filter || a.name.includes(state.filter) || a.pod.includes(state.filter));
     const suffix = `rig ${rig.name}${podFilter ? ` · pod ${podFilter}` : ""}${state.filter ? ` · filter "${state.filter}"` : ""}`;
     lines.push(...tabsLine(state, suffix));
-    // OPR.0.6.0.8: open every live seat of the rig as terminal tiles (Herdr: 4×4 per tab).
-    if (!podFilter) lines.push(fieldLine({ label: "terminal", value: `term ▸ rig ${rig.name}`, link: { type: "act", act: "open-terminal", view: `rig:${rig.name}` } }));
+    // Keep the explicit desktop action above the rig's grid.
+    if (!podFilter) lines.push(fieldLine({ label: "terminal", value: `Open terminals ▸ rig ${rig.name}`, link: { type: "act", act: "open-terminal", view: `rig:${rig.name}` } }));
     const healthScope = { kind: "rig" as const, rigId: rig.id ?? rig.name, rigName: rig.name, local: host === snap.hosts[0] };
     if (state.viewTab === "health") return [...lines, { text: "" }, ...healthListLines(snap, healthScope, contentWidth)];
     if (state.viewTab === "recent") {
@@ -847,6 +877,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
       return lines;
     }
     const agentCols = agentColumns(contentWidth);
+    lines.push(...queueSampleLines(snap, contentWidth));
     const narrowFactory = !agentCols.some(([key]) => key === "model");
     if (narrowFactory) lines.push({ text: "MODEL/NOW/ACTIONS on drill (enter)" });
     lines.push({
@@ -892,7 +923,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
           model: tableModel(a.model),
           context: contextCompact(a.context, narrowFactory),
           status: stateCell.word,
-          queue: queue.count || "·",
+          queue: queueCount(snap, queue.count),
           work: queue.work,
           now: queue.now,
           actions: actionsCell,
@@ -904,16 +935,51 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
     lines.push({ text: "" });
     const working = rows.filter((agent) => ["active", "working", "running"].includes(agent.status)).length;
     const attention = rows.filter((agent) => /attention|needs|blocked|unknown|failed/.test(agent.status)).length;
-    lines.push({ text: `${rows.length} seats · ${working} working · ${attention} need attention · ${rows.reduce((n, agent) => n + queueFacts(snap, agent.session).count, 0)} open rows` });
+    lines.push({ text: `${rows.length} seats · ${working} working · ${attention} need attention · ${rows.reduce((n, agent) => n + queueFacts(snap, agent.session).count, 0)}${queueIncomplete(snap) ? "+ sampled" : ""} open rows` });
     if (!podFilter) lines.push(...recentLines(snap, { kind: "rig", rig: rig.name }, contentWidth, false, state.timeZone));
     return lines;
   }
   if (state.section === "specs") {
     const leaf = state.drill.at(-1);
     if (leaf?.kind === "spec") {
-      const spec = findSpec(snap, leaf.name);
+      const spec = findSpec(snap, leaf.name, leaf.specKind);
       if (!spec) return [{ text: snap.readErrors.find((error) => error.startsWith("specs-library")) ?? (!snap.specsLoaded ? "Specs catalog read pending" : `spec "${leaf.name}" not in the current catalog`) }];
-      if (spec.kind === "rig") lines.push(specTabsLine(state));
+      if (spec.kind === "rig") {
+        lines.push(specTabsLine(state));
+        if (state.specLaunch) {
+          const launch = state.specLaunch;
+          let command: string | undefined;
+          let problem: string | undefined;
+          try { command = launchCommand(launch); } catch (err) { problem = (err as Error).message; }
+          return wrapDetailLines([
+            ...lines, { text: `Launch · ${launch.source}` },
+            { text: `Working folder: ${launch.folder || "not chosen"}` },
+            { text: `Host: ${launch.host || "rig up's current selected host (unchanged)"}` },
+            { text: "Launch also sets OPENRIG_URL to this TUI's daemon." },
+            { text: "Type: launch-folder /absolute/working/folder (spaces are literal)" },
+            { text: "Optional: launch-host <host> or launch-host local" },
+            { text: "Ask your operator agent to choose or adapt the team with you." },
+            { text: "The existing rig up command handles collisions, prompts and partial results." },
+            { text: "Its terminal output stays visible until you press Enter to return." },
+            ...(command ? [{ text: command }, listItem("Launch · run this command", { type: "act", act: "launch-spec" })] : [{ text: problem! }]),
+            listItem("Cancel · Esc", { type: "launch-close" }),
+          ], contentWidth);
+        }
+        lines.push({ text: `rig spec ${spec.name} · authored topology, not live status` });
+        lines.push(listItem("Launch… · choose working folder", { type: "spec-launch" }));
+        if (state.viewTab === "graph") {
+          lines.push(...specSourceLines(spec, snap).filter(line => line.action?.type === "file-open"));
+          if (!spec.graph) return [...lines, { text: spec.sourceUnavailable ? `Source unavailable: ${spec.sourceUnavailable}` : "Spec graph unavailable in the current library read." }];
+          const canvas = renderGraphStyle(state.graphStyle, specGraph(spec.graph), { host: "", rig: spec.name }, contentWidth);
+          const segs = canvas.segLines();
+          // Preview boxes must not drill into nonexistent live seats.
+          lines.push(...canvas.plainLines().map((text, i) => ({ text, segs: segs[i] })));
+          if (!spec.graph.nodes.length) lines.push({ text: "Spec graph is empty." });
+          lines.push({ text: "○ declared seat · runtime as authored · context and live status unknown" });
+          if (spec.graph.nodes.some(n => n.kind === "infrastructure")) lines.push({ text: "Infrastructure entries are listed in the Topology tab." });
+          return lines;
+        }
+      }
       lines.push({ text: `${spec.kind} spec ${spec.name}` });
       lines.push(fieldLine({ label: "purpose", value: spec.description ?? "not declared in the available source" }));
       lines.push(fieldLine({ label: "provenance", value: `${sourceProvenance(spec)} · ${spec.sourceState ?? "source state not served"}` }));
@@ -972,7 +1038,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
                 ...pod.members.map((member) =>
                   listItem(
                     `${alignedRow([[member.id, 12], [member.agentRef, 34], [member.runtime, 12]])}${member.profile ? ` profile ${member.profile}` : ""}`,
-                    { type: "drill", resource: "spec", name: member.agentRef },
+                    { type: "drill", resource: "spec", name: member.agentRef, specKind: "agent" },
                   ),
                 ),
                 ...pod.edges.map((edge) => ({ text: `    ${edge.from} → ${edge.to}  (${edge.kind})` })),
@@ -1044,7 +1110,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
                   : (spec.usedByRigs ?? []).map((rig) => ({
                       label: "declared by",
                       value: `rig ${rig}`,
-                      link: { type: "drill", resource: "spec", name: rig } as Action,
+                      link: { type: "drill", resource: "spec", name: rig, specKind: "rig" } as Action,
                     }))),
                 {
                   label: "seats now",
@@ -1060,14 +1126,14 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
     }
     if (state.filter) lines.push({ text: `/ filter specs: ${state.filter} · / replace · esc clear` });
     const selected = computeExplorerRows(state, snap)[state.selection]?.action;
-    const spec = selected?.type === "drill" && selected.resource === "spec" ? findSpec(snap, selected.name) : null;
+    const spec = selected?.type === "drill" && selected.resource === "spec" ? findSpec(snap, selected.name, selected.specKind) : null;
     if (spec) {
       lines.push({ text: `${spec.name} · ${spec.kind} · ${sourceProvenance(spec)}` });
       lines.push({ text: "" }, { text: spec.description?.trim() || "Purpose not declared in the available source." });
       if (spec.kind === "rig") lines.push(fieldLine({ label: "contents", value: `${spec.pods?.length ?? 0} pods · ${spec.pods?.reduce((n, p) => n + p.members.length, 0) ?? spec.legacyNodes?.length ?? 0} members · ${spec.agentRefs?.join(", ") || "no member references served"}` }));
       else if (spec.kind === "agent") lines.push(fieldLine({ label: "contents", value: `${spec.runtime ?? "runtime not declared"} · ${(spec.skills ?? []).length} skills · ${(spec.startupFiles ?? []).length} startup files` }));
       else lines.push(fieldLine({ label: "contents", value: `${spec.rolesCount ?? "unknown"} roles · ${spec.stepsCount ?? "unknown"} steps` }));
-      lines.push({ text: "" }, listItem("Read details · Enter", { type: "drill", resource: "spec", name: spec.name }), ...specSourceLines(spec, snap));
+      lines.push({ text: "" }, listItem("Read details · Enter", { type: "drill", resource: "spec", name: spec.name, specKind: spec.kind }), ...specSourceLines(spec, snap));
       if (spec.sourceUnavailable) lines.push({ text: `Source unavailable: ${spec.sourceUnavailable}` });
     } else {
       lines.push({ text: "SPEC LIBRARY" }, { text: "Choose a spec at left to preview its purpose, contents and source." },
@@ -1242,7 +1308,7 @@ function keybindHints(state: ViewState): string {
   const nav = arrowsScroll ? "↑↓ scroll" : "↑↓ move";
   const pageScroll = state.contentMaxOffset > 0 && !arrowsScroll ? "⇞⇟ scroll · " : "";
   const filter = state.filter ? "/ replace · esc clear" : "/ filter";
-  return `${nav} · ←→ pane · ⏎ open · ${pageScroll}: command · ${filter} · S startup · v select/copy · f footer · q quit`;
+  return `${nav} · ←→ pane · ⏎ open · ${pageScroll}: command · ${filter} · S startup · v select/copy · F footer · q quit`;
 }
 
 /** The PULSE view renders FULL-WIDTH with NO explorer sidebar (increment 2). A
@@ -1435,7 +1501,7 @@ function renderPulseScreen(state: ViewState, snap: FleetSnapshot, options: Rende
   const loadTag = loading ? `  ${frame} loading` : "";
   lines.push(
     pad(
-      `[${state.instanceId}] ${state.section}${drillPath ? " · " + drillPath : ""}${state.lastError ? "  ✗ " + state.lastError : ""}${state.notice ? "  ▸ " + state.notice : ""}${readWarn}${loadTag}${state.timeZoneWarning ? " · ⚠ timezone; run timezone" : ""}`,
+      `[${state.instanceId}] ${state.section}${drillPath ? " · " + drillPath : ""}${state.lastError ? "  ✗ " + state.lastError : ""}${state.notice ? "  ▸ " + state.notice : ""}${pendingTag(state)}${readWarn}${loadTag}${state.timeZoneWarning ? " · ⚠ timezone; run timezone" : ""}`,
       cols,
     ),
   );
@@ -1791,7 +1857,7 @@ function renderBody(state: ViewState, snap: FleetSnapshot, options: RenderOption
   lines.push(pad(fullReading ? "↑↓ scroll / links · → links · Enter open · Esc Back · refresh · v copy" : keybindHints(state), cols));
   lines.push(
     pad(
-      `[${state.instanceId}] ${state.section}${drillPath ? " · " + drillPath : ""}${state.lastError ? "  ✗ " + state.lastError : ""}${noticeDetail ? "  ▸ action result above" : state.notice ? "  ▸ " + state.notice : ""}${readWarn}${state.timeZoneWarning ? " · ⚠ timezone; run timezone" : ""}`,
+      `[${state.instanceId}] ${state.section}${drillPath ? " · " + drillPath : ""}${state.lastError ? "  ✗ " + state.lastError : ""}${noticeDetail ? "  ▸ action result above" : state.notice ? "  ▸ " + state.notice : ""}${pendingTag(state)}${readWarn}${state.timeZoneWarning ? " · ⚠ timezone; run timezone" : ""}`,
       cols,
     ),
   );

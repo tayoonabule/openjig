@@ -1,8 +1,19 @@
+import { resolve, isAbsolute, basename } from "node:path";
+import { shellQuote } from "../adapters/shell-quote.js";
+import { getOpenRigHome } from "../openrig-compat.js";
+
 // Single source of truth for whether the OpenRig-managed Claude activity-relay hooks can be
 // DELIVERED, and which events to inject. Consumed by BOTH the ClaudeCodeAdapter reconcile (to
 // gate enable) AND rigspec-preflight (to warn) — one validation + one manifest parser, so the
 // two seams cannot drift. The event COMMANDS are constructed by the adapter (absolute, shell-
-// quoted); this module owns only the delivery-possibility + the derived event VOCABULARY.
+// quoted); this module also owns the instance-scoped relay destination.
+
+/** Instance-owned copy: independent of project cleanup and installed package replacement. */
+export const CLAUDE_ACTIVITY_RELAY_RELATIVE_PATH = "state/claude-activity-hooks/activity-relay.cjs";
+
+export function claudeActivityRelayPath(openrigHome = getOpenRigHome()): string {
+  return resolve(openrigHome, CLAUDE_ACTIVITY_RELAY_RELATIVE_PATH);
+}
 
 /** The `type` of the shipped runtime_resource that selects managed Claude activity hooks. */
 export const CLAUDE_ACTIVITY_HOOKS_RESOURCE_TYPE = "claude_activity_hooks";
@@ -76,4 +87,18 @@ export function deriveRelayEvents(fs: ActivityHookFsRead, manifestPath: string |
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** The generated command grammar, not a shell parser. Retain bare-node legacy commands;
+ * a quoted absolute Node token can be refreshed without claiming arbitrary user wrappers. */
+export function parseManagedClaudeNodeCommand(command: string): { executable: string; args: string[] } | null {
+  if (/[\r\n]/.test(command)) return null;
+  const match = /^(node|'(?:[^']|'"'"')*')((?:[ \t]+'(?:[^']|'"'"')*')+)$/.exec(command.trim());
+  if (!match) return null;
+  const tokens = [match[1]!, ...match[2]!.match(/'(?:[^']|'"'"')*'/g)!];
+  const decoded = tokens.map(token => token === "node" ? token : token.slice(1, -1).split(`'"'"'`).join("'"));
+  if (tokens.some((token, i) => !(i === 0 && token === "node") && shellQuote(decoded[i]!) !== token)) return null;
+  const executable = decoded[0]!;
+  if (executable !== "node" && (!isAbsolute(executable) || !/^node(?:\.exe)?$/i.test(basename(executable)))) return null;
+  return { executable, args: decoded.slice(1) };
 }

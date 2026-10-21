@@ -1,3 +1,4 @@
+import { unknownModelObservation, type CurrentModelReader } from "../domain/model-divergence/current-model-reader.js";
 import { inventoryCaptureOptions, type ShadowCapture } from "../domain/shadow-capture.js";
 import { Hono } from "hono";
 import { observeInventoryHandler } from "../domain/request-phase-observer.js";
@@ -168,13 +169,18 @@ nodesRoutes.get("/", observeInventoryHandler, async (c) => {
   // always present, so "not yet known" is a value, never an absence a consumer can misread.
   // selfHostId ONLY — never host.name (display-only; the DP4 conflation healthz already refuses).
   const hostSelfId = getSelfHostId();
-  return c.json(withTerminalAndWork.map((n) => ({ ...n, hostSelfId })));
+  const modelReader = c.get("currentModelReader" as never) as CurrentModelReader | undefined;
+  const observations = modelReader ? await modelReader.observeInventory(withTerminalAndWork) : null;
+  const nodes = withTerminalAndWork.map((n, i) => ({ ...n, hostSelfId,
+    modelObservation: observations?.[i] ?? unknownModelObservation("observer-unavailable"),
+  }));
+  return c.json(nodes);
 });
 
 // GET /api/rigs/:rigId/nodes/:logicalId — node detail
 nodesRoutes.get("/:logicalId", async (c) => {
   const rigId = c.req.param("rigId")!;
-  const logicalId = decodeURIComponent(c.req.param("logicalId")!);
+  const logicalId = c.req.param("logicalId")!;
   const deps = getDeps(c);
   const rig = deps.rigRepo.getRig(rigId);
   if (!rig) return c.json({ error: `Rig "${rigId}" not found. List rigs with: rig ps` }, 404);
@@ -327,12 +333,12 @@ nodesRoutes.post("/launch-subset", async (c) => {
   if (!restoreOrchestrator) {
     return c.json({ ok: false, code: "internal_error", error: "Restore orchestrator not available" }, 500);
   }
-  const body = await c.req.json().catch(() => ({})) as { seats?: string[]; holdReason?: string; snapshotId?: string; plan?: boolean };
+  const body = await c.req.json().catch(() => ({})) as { seats?: string[]; holdReason?: string; snapshotId?: string; plan?: boolean; nonTargetMode?: "unchanged" | "detach_and_hold" };
   if (!Array.isArray(body.seats) || body.seats.length === 0) {
     return c.json({ ok: false, code: "invalid_request", error: "Request body must include a non-empty 'seats' array of logical IDs" }, 400);
   }
   const result = body.plan === true
-    ? restoreOrchestrator.planNodeSubset(rigId, body.seats, { holdReason: body.holdReason, snapshotId: body.snapshotId })
+    ? restoreOrchestrator.planNodeSubset(rigId, body.seats, { holdReason: body.holdReason, snapshotId: body.snapshotId, nonTargetMode: body.nonTargetMode })
     : await restoreOrchestrator.launchNodeSubset(rigId, body.seats, { holdReason: body.holdReason, snapshotId: body.snapshotId, ...(await resumeLaunchOpts(c)) });
   if (!result.ok) {
     return c.json(result, narrowLaunchErrorStatus(result.code));
@@ -360,7 +366,7 @@ nodesRoutes.post("/launch-subset", async (c) => {
 // SessionTransport is missing from context (degraded daemon).
 nodesRoutes.get("/:logicalId/preview", terminalAuthGuard(), async (c) => {
   const rigId = c.req.param("rigId")!;
-  const logicalId = decodeURIComponent(c.req.param("logicalId")!);
+  const logicalId = c.req.param("logicalId")!;
   const deps = getDeps(c);
   const sessionTransport = c.get("sessionTransport" as never) as SessionTransport | undefined;
   const rateLimiter = c.get("previewRateLimiter" as never) as PreviewRateLimiter<{
@@ -424,7 +430,7 @@ nodesRoutes.get("/:logicalId/preview", terminalAuthGuard(), async (c) => {
 // POST /api/rigs/:rigId/nodes/:logicalId/open-cmux
 nodesRoutes.post("/:logicalId/open-cmux", terminalAuthGuard(), async (c) => {
   const rigId = c.req.param("rigId")!;
-  const logicalId = decodeURIComponent(c.req.param("logicalId")!);
+  const logicalId = c.req.param("logicalId")!;
   const nodeCmuxService = c.get("nodeCmuxService" as never) as NodeCmuxService | undefined;
 
   if (!nodeCmuxService) {
@@ -462,7 +468,7 @@ nodesRoutes.post("/:logicalId/focus", async (c) => {
 // DELETE /api/rigs/:rigId/nodes/:logicalId
 nodesRoutes.delete("/:logicalId", async (c) => {
   const rigId = c.req.param("rigId")!;
-  const nodeRef = decodeURIComponent(c.req.param("logicalId")!);
+  const nodeRef = c.req.param("logicalId")!;
   const fallbackDestination = c.req.query("fallback");
   const { rigLifecycleService } = getDeps(c);
   if (!rigLifecycleService) {
@@ -491,7 +497,7 @@ nodesRoutes.delete("/:logicalId", async (c) => {
 // pair (Steering Loop State panel, Slice Story View Topology tab).
 // Behavior identical to the rig+node-keyed route otherwise.
 sessionAdminRoutes.get("/:sessionName/preview", terminalAuthGuard(), async (c) => {
-  const sessionName = decodeURIComponent(c.req.param("sessionName")!);
+  const sessionName = c.req.param("sessionName")!;
   const sessionTransport = c.get("sessionTransport" as never) as SessionTransport | undefined;
   const rateLimiter = c.get("previewRateLimiter" as never) as PreviewRateLimiter<{
     content: string;
@@ -536,7 +542,7 @@ sessionAdminRoutes.get("/:sessionName/preview", terminalAuthGuard(), async (c) =
 // the reconcile_session converge op (sugar over the topology spine). Never
 // launches/kills/replays startup or writes input into the target pane.
 sessionAdminRoutes.post("/:sessionName/reconcile", terminalAuthGuard(), async (c) => {
-  const sessionName = decodeURIComponent(c.req.param("sessionName")!);
+  const sessionName = c.req.param("sessionName")!;
   const claimService = c.get("claimService" as never) as ClaimService | undefined;
   const podInstantiator = c.get("podInstantiator" as never) as PodRigInstantiator | undefined;
   if (!claimService || !podInstantiator) {
@@ -577,9 +583,38 @@ sessionAdminRoutes.post("/:sessionName/reconcile", terminalAuthGuard(), async (c
   return c.json(outcome, 200);
 });
 
+// Deliberately separate from /reconcile: old daemons must return 404, never adopt.
+sessionAdminRoutes.post("/:sessionName/repair-missing-pane", terminalAuthGuard(), async (c) => {
+  const body: unknown = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return c.json({ error: "Supply a JSON object with optional rigId and logicalId." }, 400);
+  }
+  const input = body as Record<string, unknown>;
+  for (const key of ["rigId", "logicalId"]) {
+    if (input[key] !== undefined && (typeof input[key] !== "string" || !(input[key] as string).trim())) {
+      return c.json({ error: `${key} must be a non-empty string.` }, 400);
+    }
+  }
+  const rigId = input.rigId as string | undefined, logicalId = input.logicalId as string | undefined;
+  if (!!rigId !== !!logicalId) return c.json({ error: "rigId and logicalId must be provided together (or both omitted)." }, 400);
+  const claimService = c.get("claimService" as never) as ClaimService | undefined;
+  const instantiator = c.get("podInstantiator" as never) as PodRigInstantiator | undefined;
+  if (!claimService || !instantiator) return c.json({ error: "Missing-pane repair is unavailable on this daemon." }, 503);
+  const result = await convergeOp({ instantiator, claimService }, rigId ?? "", {
+    kind: "reconcile_session", sessionName: c.req.param("sessionName")!, rigId, logicalId, repairMissingPane: true,
+  }, ".");
+  if (result.kind !== "reconcile_session" || !result.supported) return c.json({ error: "Unexpected repair result." }, 500);
+  const outcome = result.outcome;
+  if (outcome.ok) return c.json(outcome, 200);
+  if (outcome.code === "tmux_unavailable") return c.json(outcome, 503);
+  if (outcome.code === "repair_timed_out") return c.json(outcome, 504);
+  if (outcome.code === "reconcile_error") return c.json(outcome, 500);
+  return c.json(outcome, 409);
+});
+
 // POST /api/sessions/:sessionName/clear-attention — OPR.0.3.4.10.
 sessionAdminRoutes.post("/:sessionName/clear-attention", terminalAuthGuard(), async (c) => {
-  const sessionName = decodeURIComponent(c.req.param("sessionName")!);
+  const sessionName = c.req.param("sessionName")!;
   const reconciler = c.get("seatAttentionReconciler" as never) as import("../domain/seat-attention-reconciler.js").SeatAttentionReconciler | undefined;
   if (!reconciler) {
     return c.json({ error: "Seat attention reconciler not configured on this daemon." }, 503);
@@ -601,7 +636,7 @@ sessionAdminRoutes.post("/:sessionName/clear-attention", terminalAuthGuard(), as
 // echoed back, placed in an error message, logged, or written to the audit
 // event — it is credential-class.
 sessionAdminRoutes.post("/:sessionName/resume-token", terminalAuthGuard(), async (c) => {
-  const sessionName = decodeURIComponent(c.req.param("sessionName")!);
+  const sessionName = c.req.param("sessionName")!;
   const { sessionRegistry } = getDeps(c);
   const eventBus = c.get("eventBus" as never) as EventBus | undefined;
 
@@ -657,7 +692,7 @@ sessionAdminRoutes.post("/:sessionName/resume-token", terminalAuthGuard(), async
 
 // POST /api/sessions/:sessionRef/unclaim
 sessionAdminRoutes.post("/:sessionRef/unclaim", terminalAuthGuard(), async (c) => {
-  const sessionRef = decodeURIComponent(c.req.param("sessionRef")!);
+  const sessionRef = c.req.param("sessionRef")!;
   const { rigLifecycleService } = getDeps(c);
   if (!rigLifecycleService) {
     return c.json({ error: "Lifecycle service not available" }, 500);
@@ -665,7 +700,7 @@ sessionAdminRoutes.post("/:sessionRef/unclaim", terminalAuthGuard(), async (c) =
 
   const result = await rigLifecycleService.unclaimSession(sessionRef);
   if (!result.ok) {
-    const status = result.code === "session_ambiguous" ? 409 : 404;
+    const status = result.code === "session_not_found" ? 404 : 409;
     return c.json(result, status);
   }
 
@@ -682,7 +717,7 @@ sessionAdminRoutes.post("/:sessionRef/unclaim", terminalAuthGuard(), async (c) =
 // Round-2 (r2 HIGH-2): raw conversation bytes with no transcript redaction — a TERMINAL-CLASS
 // surface behind the same bearer gate as its neighbors (401/401/200; null-token loopback passes).
 sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), async (c) => {
-  const sessionName = decodeURIComponent(c.req.param("sessionName")!);
+  const sessionName = c.req.param("sessionName")!;
   const store = c.get("contextUsageStore" as never) as ContextUsageStore | undefined;
   if (!store) {
     return c.json({ error: "unsupported_runtime", message: "No context-usage store on this daemon; the seat's generation record cannot be resolved." }, 409);

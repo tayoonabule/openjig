@@ -67,8 +67,8 @@ without a `SPEC.md`.
 **Project-tree context cannot ship.** It describes what *you* are building —
 mission intent, slice specifications, proof contracts. No vendor can author it
 in advance, and shipping a default would install someone else's project as
-your context. The demo project carries a worked example to copy from; real
-projects author their own. (Topology-tree context is the opposite: how a team
+your context. Real projects author their own; `rig scope mission create` and
+`rig scope slice create` start the tree. (Topology-tree context is the opposite: how a team
 of agents runs well is largely general, which is why included rigs ship
 defaults.)
 
@@ -103,7 +103,7 @@ reproduces the drift it was meant to catch. Run it; do not recall it.
 ## Shipped defaults and the curation path
 
 Included rigs ship sensible-default chain files under a `topology/` folder,
-installed under `topology.root` at rig-up. Today only `product-team` ships one,
+installed under `topology.root` at rig-up. Today only `factory` ships one,
 with instance, rig and seat defaults; the installer also supports pod defaults.
 A shipped default is a **starting point** the occupying team appends to — it
 is never overwritten by a later rig-up (existing files win).

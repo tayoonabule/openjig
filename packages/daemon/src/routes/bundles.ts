@@ -1,13 +1,16 @@
 import fs from "node:fs";
+import { SettingsStore } from "../domain/user-settings/settings-store.js";
+import { readSeatEnvOverride } from "../domain/seat-env.js";
 import os from "node:os";
 import nodePath from "node:path";
 import { Hono } from "hono";
+import { bootstrapFailureResponse } from "./bootstrap-failure-response.js";
 import type { EventBus } from "../domain/event-bus.js";
 import type { BootstrapOrchestrator } from "../domain/bootstrap-orchestrator.js";
 import type { BootstrapRepository } from "../domain/bootstrap-repository.js";
 import { LegacyBundleAssembler as BundleAssembler, type AssemblerFsOps } from "../domain/bundle-assembler.js";
 import { PodBundleAssembler, type PodAssemblerFsOps } from "../domain/pod-bundle-assembler.js";
-import { computeIntegrity, writeIntegrity, verifyIntegrity, type IntegrityFsOps } from "../domain/bundle-integrity.js";
+import { computeIntegrity, verifyIntegrity, isHarnessLoginPath, harnessLoginMessage, type IntegrityFsOps } from "../domain/bundle-integrity.js";
 import { pack, unpack, verifyArchiveDigest, collectUnsafeArchiveEntries, unsafeArchiveEntryReason } from "../domain/bundle-archive.js";
 import { resolvePackage } from "../domain/package-resolve-helper.js";
 import {
@@ -18,11 +21,13 @@ import { LegacyRigSpecCodec } from "../domain/rigspec-codec.js";
 import { LegacyRigSpecSchema } from "../domain/rigspec-schema.js";
 import { RigSpecCodec } from "../domain/rigspec-codec.js";
 import { RigSpecSchema } from "../domain/rigspec-schema.js";
-import { parseLegacyBundleManifest as parseBundleManifest, normalizeLegacyBundleManifest as normalizeBundleManifest, serializePodBundleManifest, parsePodBundleManifest, validatePodBundleManifest, validateLegacyBundleManifest, normalizeProvenanceBlock, normalizeBundleSource, normalizeCompatibilityBlock, isRelativeSafePath } from "../domain/bundle-types.js";
+import { parseLegacyBundleManifest as parseBundleManifest, normalizeLegacyBundleManifest as normalizeBundleManifest, serializePodBundleManifest, parsePodBundleManifest, validatePodBundleManifest, validateLegacyBundleManifest, normalizeProvenanceBlock, normalizeBundleSource, normalizeCompatibilityBlock, isRelativeSafePath, normalizeIncludedLoginFiles } from "../domain/bundle-types.js";
 import type { PodBundleManifest, BundleProvenance, BundleCompatibility, BundlePluginReference } from "../domain/bundle-types.js";
 import { detectBundleConflicts, type BundleConflict } from "../domain/bundle-conflict-detector.js";
+import { bundleInstallContext, bundleInstallContextLines } from "../domain/bundle-install-context.js";
 import type { RigRepository } from "../domain/rig-repository.js";
 import { BundleAuditReader, BundleAuditWriter, type BundleAuditFsOps, type BundleAuditRecord } from "../domain/bundle-audit.js";
+import { timeBoundAdvisory } from "../domain/time-bound-advisory.js";
 import { getDefaultOpenRigPath } from "../openrig-compat.js";
 import { routingFailureWarnings, type BundleContentRouting } from "../domain/bundle-content-routing.js";
 import { configurationId, packageDigest } from "../domain/bundle-identity.js";
@@ -117,10 +122,11 @@ async function extractManifestForCompatCheck(bundlePath: string): Promise<Record
 async function extractInstallTimeMetadata(bundlePath: string): Promise<{
   bundleManifest: Record<string, unknown>;
   rigName: string | undefined;
+  warnings?: string[];
 }> {
   const tmpDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "bundle-meta-"));
   try {
-    await unpack(bundlePath, tmpDir);
+    const unpacked = await unpack(bundlePath, tmpDir);
     const manifestPath = nodePath.join(tmpDir, "bundle.yaml");
     if (!fs.existsSync(manifestPath)) throw new Error("Bundle missing bundle.yaml");
     const manifestYaml = fs.readFileSync(manifestPath, "utf-8");
@@ -172,7 +178,7 @@ async function extractInstallTimeMetadata(bundlePath: string): Promise<{
         // rig.yaml malformed — leave rigName undefined; conflict check skips
       }
     }
-    return { bundleManifest, rigName };
+    return { bundleManifest, rigName, ...(unpacked?.warnings ? { warnings: unpacked.warnings } : {}) };
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -810,7 +816,7 @@ bundleRoutes.post("/create", async (c) => {
       const tmpStaging = fs.mkdtempSync(nodePath.join(os.tmpdir(), "pod-bundle-create-"));
       try {
         const assembler = new PodBundleAssembler({ fsOps: podAssemblerFsOps() });
-        const result = assembler.assemble({ rigRoot: effectiveRigRoot, rigSpecPath: nodePath.resolve(specPath), outputDir: tmpStaging, bundleName, bundleVersion, provenance, compatibility });
+        const result = assembler.assemble({ servicesEnabled: new SettingsStore().resolveOne("bundle.services_enabled").value === true, rigRoot: effectiveRigRoot, rigSpecPath: nodePath.resolve(specPath), outputDir: tmpStaging, bundleName, bundleVersion, provenance, compatibility });
 
         // Item 6 / Checkpoint 7.5 (QA-20260601 A2 repair): auto-detect
         // author bundle.yaml at the rig source root; vendor declared
@@ -835,14 +841,16 @@ bundleRoutes.post("/create", async (c) => {
         if (carriedPacks.length > 0) result.manifest.contextPacks = [...(result.manifest.contextPacks ?? []), ...carriedPacks];
         if (projectDir) result.manifest.project = vendorProjectDir(nodePath.resolve(projectDir), tmpStaging);
 
-        const integrity = computeIntegrity(tmpStaging, integrityFsOps());
+        const included = body["includeLoginFiles"] === true ? integrityFsOps().walkFiles(tmpStaging).filter(isHarnessLoginPath).sort() : [];
+        if (included.length) result.manifest.includedLoginFiles = included;
+        const integrity = computeIntegrity(tmpStaging, integrityFsOps(), included);
         result.manifest.integrity = integrity;
         fs.writeFileSync(nodePath.join(tmpStaging, "bundle.yaml"), serializePodBundleManifest(result.manifest), "utf-8");
 
         assertShippableStagingTree(tmpStaging);
         const archiveHash = await pack(tmpStaging, nodePath.resolve(outputPath));
         eventBus.emit({ type: "bundle.created", bundleName, bundleVersion, archiveHash });
-        const warning = [driftWarning, ...(result.warnings ?? []), ...(authorPrimitives.warnings ?? [])].filter(Boolean).join("; ");
+        const warning = [driftWarning, ...(result.warnings ?? []), ...(authorPrimitives.warnings ?? []), ...included.map(file => harnessLoginMessage(file, true))].filter(Boolean).join("; ");
         return c.json({ ...bundleBuildIdentity(result.manifest, archiveHash), bundleName, bundleVersion, archiveHash, schemaVersion: 2, agents: result.manifest.agents.length, ...(warning ? { warning } : {}) }, 201);
       } finally {
         fs.rmSync(tmpStaging, { recursive: true, force: true });
@@ -919,14 +927,17 @@ bundleRoutes.post("/create", async (c) => {
         fs.writeFileSync(nodePath.join(tmpStaging, "bundle.yaml"), serializeLegacyBundleManifest(manifest), "utf-8");
       }
 
-      const integrity = computeIntegrity(tmpStaging, integrityFsOps());
-      writeIntegrity(tmpStaging, integrity, integrityFsOps());
+      const included = body["includeLoginFiles"] === true ? integrityFsOps().walkFiles(tmpStaging).filter(isHarnessLoginPath).sort() : [];
+      if (included.length) manifest.includedLoginFiles = included;
+      const integrity = computeIntegrity(tmpStaging, integrityFsOps(), included);
       manifest.integrity = integrity;
+      const { serializeLegacyBundleManifest } = await import("../domain/bundle-types.js");
+      fs.writeFileSync(nodePath.join(tmpStaging, "bundle.yaml"), serializeLegacyBundleManifest(manifest), "utf-8");
 
       assertShippableStagingTree(tmpStaging);
       const archiveHash = await pack(tmpStaging, nodePath.resolve(outputPath));
       eventBus.emit({ type: "bundle.created", bundleName, bundleVersion, archiveHash });
-      const warning = [driftWarning, ...(legacyAuthorPrimitives.warnings ?? [])].filter(Boolean).join("; ");
+      const warning = [driftWarning, ...(legacyAuthorPrimitives.warnings ?? []), ...included.map(file => harnessLoginMessage(file, true))].filter(Boolean).join("; ");
       return c.json({ ...bundleBuildIdentity(manifest, archiveHash), bundleName, bundleVersion, archiveHash, packages: manifest.packages.length, ...(warning ? { warning } : {}) }, 201);
     } finally {
       fs.rmSync(tmpStaging, { recursive: true, force: true });
@@ -987,7 +998,7 @@ bundleRoutes.post("/inspect", async (c) => {
       const generator = { openrigVersion: getDaemonVersion() };
       const source = identity.source ? { ...identity.source } : null;
       try {
-        return inspectBundleBehaviour(tmpDir, { manifest: rawParsed, ...identity, source, generator, digestValid, filesVerified });
+        return inspectBundleBehaviour(tmpDir, { manifest: rawParsed, ...identity, source, generator, digestValid, filesVerified, servicesEnabled: new SettingsStore().resolveOne("bundle.services_enabled").value === true });
       } catch {
         return {
           schema: "openrig.bundle-behaviour/v1", state: "not_generated",
@@ -1012,6 +1023,7 @@ bundleRoutes.post("/inspect", async (c) => {
       const integritySection = rawParsed["integrity"] as { algorithm?: string; files?: Record<string, string> } | undefined;
       const podManifest = {
         schemaVersion: 2 as const,
+        includedLoginFiles: normalizeIncludedLoginFiles(rawParsed["included_login_files"]),
         name: rawParsed["name"] as string,
         version: rawParsed["version"] as string,
         createdAt: rawParsed["created_at"] as string,
@@ -1066,6 +1078,7 @@ bundleRoutes.post("/inspect", async (c) => {
         createdAt: podManifest.createdAt,
         rigSpec: podManifest.rigSpec,
         packages: [],
+        includedLoginFiles: podManifest.includedLoginFiles,
         integrity: { algorithm: "sha256" as const, files: integritySection.files ?? {} },
       } : undefined;
       const integrityResult = integrityCompat
@@ -1076,7 +1089,13 @@ bundleRoutes.post("/inspect", async (c) => {
       return c.json({ ...identity, manifest: podManifest, digestValid, integrityResult, behaviour }, 200);
     }
 
-    const manifest = normalizeBundleManifest(parseBundleManifest(manifestYaml));
+    let manifest: ReturnType<typeof normalizeBundleManifest>;
+    try {
+      manifest = normalizeBundleManifest(parseBundleManifest(manifestYaml));
+    } catch (err) {
+      // Like v2, malformed v1 manifests are inspect diagnostics, not server failures.
+      return c.json({ error: `Invalid v1 manifest: ${(err as Error).message}`, digestValid }, 200);
+    }
     const integrityResult = manifest.integrity
       ? verifyIntegrity(tmpDir, manifest, integrityFsOps())
       : { passed: false, mismatches: [], missing: [], extra: [], errors: ["no integrity section"] };
@@ -1106,7 +1125,9 @@ bundleRoutes.get("/history", async (c) => {
     rig: typeof rig === "string" && rig.length > 0 ? rig : undefined,
     since: typeof since === "string" && since.length > 0 ? since : undefined,
   });
-  return c.json({ records, total: records.length }, 200);
+  // since is compared as text against installedAt; say so when it doesn't read as a date or time.
+  const advisory = timeBoundAdvisory("since", since, "installedAt");
+  return c.json({ records, total: records.length, ...(advisory ? { advisories: [advisory] } : {}) }, 200);
 });
 
 // POST /api/bundles/install — reuses full bootstrap lifecycle
@@ -1119,6 +1140,7 @@ bundleRoutes.post("/install", async (c) => {
   const nonInterruptive = typeof body["nonInterruptive"] === "boolean" ? body["nonInterruptive"] : undefined;
   const targetRoot = typeof body["targetRoot"] === "string" ? body["targetRoot"] : undefined;
   const cwdOverride = typeof body["cwdOverride"] === "string" ? body["cwdOverride"] : undefined;
+  const envOverride = readSeatEnvOverride(body["envOverride"]);
   // Item 2 / slice-05 Checkpoint 3.3: install-time compatibility check inputs
   const skipVersionCheck = body["skipVersionCheck"] === true;
   const clientCliVersion = typeof body["cliVersion"] === "string" ? body["cliVersion"] : undefined;
@@ -1135,29 +1157,25 @@ bundleRoutes.post("/install", async (c) => {
   }
 
   try {
-  // Item 2 / slice-05 Checkpoint 3.3: install-time compatibility check
-  // Runs AFTER the lock + BEFORE bootstrap delegation. Mismatch returns a
-  // 3-part error and exits the lifecycle (lock releases via the outer
-  // finally). Operator override via --skip-version-check (request body
-  // skipVersionCheck=true).
   // Item 2 + Item 3 / slice-05: single safe extract pass yields both the
   // bundle manifest (for compat check) and the rig name (for conflict check).
-  // Caller can skip the compat check via skipVersionCheck; the conflict check
-  // also runs from this same extract pass unless --force bypasses it.
-  let installMeta: { bundleManifest: Record<string, unknown>; rigName: string | undefined } | null = null;
-  if (!skipVersionCheck || !force) {
-    try {
-      installMeta = await extractInstallTimeMetadata(bundlePath);
-    } catch (err) {
-      return c.json({
-        error: "Bundle install pre-check could not run (extraction failed)",
-        detail: (err as Error).message,
-        resolutions: [
-          "confirm the bundle path is correct and the archive is readable",
-          "pass --skip-version-check and --force to bypass both pre-checks (NOT recommended unless intentional)",
-        ],
-      }, 400);
-    }
+  // This pass also runs the manifest SAFETY validation — the first place
+  // rig_spec/project fields are validated on the install path; the bundle
+  // source resolver validates them again later — so it runs unconditionally:
+  // --skip-version-check and --force override the Item-2 compat check and
+  // the Item-3 conflict check, not the safety validation.
+  let installMeta: { bundleManifest: Record<string, unknown>; rigName: string | undefined; warnings?: string[] };
+  try {
+    installMeta = await extractInstallTimeMetadata(bundlePath);
+  } catch (err) {
+    return c.json({
+      error: "Bundle install pre-check could not run (extraction failed)",
+      detail: (err as Error).message,
+      resolutions: [
+        "confirm the bundle path is correct and the archive is readable",
+        "--skip-version-check and --force skip the compatibility and conflict checks; the manifest safety check always runs",
+      ],
+    }, 400);
   }
 
   if (!skipVersionCheck && installMeta) {
@@ -1183,7 +1201,12 @@ bundleRoutes.post("/install", async (c) => {
   // The check fails CLOSED on extraction failure (handled above) and
   // fail-OPEN on missing rig name in the bundle (no rig name to compare).
   if (!force && installMeta && rigRepo) {
-    const runningRigs = rigRepo.listRigs().map((r) => ({ rigId: r.id, name: r.name }));
+    const context = bundleInstallContext(rigRepo.db, installMeta.rigName ?? "", {
+      name: String(installMeta.bundleManifest.name ?? installMeta.rigName ?? ""),
+      version: typeof installMeta.bundleManifest.version === "string" ? installMeta.bundleManifest.version : null,
+      source: bundlePath,
+    });
+    const runningRigs = context.existing.filter(rig => rig.state === "running");
     const report = detectBundleConflicts({
       bundleRigName: installMeta.rigName ?? "",
       runningRigs,
@@ -1191,11 +1214,11 @@ bundleRoutes.post("/install", async (c) => {
     if (report.hasConflicts) {
       return c.json({
         error: "Bundle install conflict check failed",
+        status: "not_attempted",
+        detail: bundleInstallContextLines(context).slice(0, context.existing.length + 1).join("\n"),
+        bundleInstall: context,
         conflicts: report.conflicts,
-        resolutions: [
-          "stop the conflicting running rig and re-attempt install",
-          "use --force to bypass for an operator-explicit override (NOT recommended for routine use; conflicts may produce partial install state)",
-        ],
+        resolutions: context.resolutions,
       }, 400);
     }
   }
@@ -1208,20 +1231,12 @@ bundleRoutes.post("/install", async (c) => {
       });
       if (result.status === "planned") {
         eventBus.emit({ type: "bootstrap.planned", runId: result.runId, sourceRef: bundlePath, stages: result.stages.length });
-        return c.json(result, 200);
+        return c.json({ ...result, ...(installMeta.warnings ? { warnings: [...installMeta.warnings.filter(w => !result.warnings?.includes(w)), ...(result.warnings ?? [])] } : {}) }, 200);
       }
       // Plan failed — structured mapping (same as bootstrap plan route)
       eventBus.emit({ type: "bootstrap.failed", runId: result.runId, sourceRef: bundlePath, error: result.errors[0] ?? "plan failed" });
-      const failedStage = result.stages.find((s: { status: string; detail?: unknown }) => s.status === "failed" || s.status === "blocked");
-      let httpStatus: number = 500;
-      if (failedStage) {
-        if (failedStage.status === "blocked") httpStatus = 409;
-        else if (failedStage.stage === "resolve_spec") {
-          const detail = failedStage.detail as { code?: string } | undefined;
-          if (detail?.code === "file_not_found" || detail?.code === "parse_error" || detail?.code === "validation_failed" || detail?.code === "bundle_error") httpStatus = 400;
-        }
-      }
-      return c.json(result, httpStatus as 400 | 409 | 500);
+      const failure = bootstrapFailureResponse(result, "plan");
+      return c.json(failure.body, failure.status);
     } catch (err) {
       return c.json({ error: (err as Error).message }, 500);
     }
@@ -1235,7 +1250,7 @@ bundleRoutes.post("/install", async (c) => {
   try {
     const result = await bootstrapOrchestrator.bootstrap({
       mode: "apply", sourceRef: bundlePath, sourceKind: "rig_bundle",
-      autoApprove, nonInterruptive, targetRoot, cwdOverride, runId: run.id,
+      autoApprove, nonInterruptive, targetRoot, cwdOverride, envOverride, runId: run.id,
     });
 
     if (result.status === "completed" || result.status === "partial") {
@@ -1249,7 +1264,8 @@ bundleRoutes.post("/install", async (c) => {
       const routing: BundleContentRouting | undefined = bundleRouting
         ?? (result.status === "completed" ? await bootstrapOrchestrator.routeBundleContents(bundlePath) : undefined);
       // The hook already put its failures in warnings; the legacy fallback adds its own here.
-      const warnings = bundleRouting ? (result.warnings ?? []) : [...(result.warnings ?? []), ...routingFailureWarnings(routing)];
+      const warnings = [...(result.warnings ?? []), ...(bundleRouting ? [] : routingFailureWarnings(routing))];
+      warnings.unshift(...(installMeta.warnings ?? []).filter(w => !warnings.includes(w)));
       const responseBody = routing ? { ...bootstrapResult, ...routing, warnings } : { ...bootstrapResult, warnings };
       if (result.status === "completed") {
         eventBus.emit({ type: "bootstrap.completed", runId: result.runId, rigId: result.rigId!, sourceRef: bundlePath });
@@ -1274,8 +1290,8 @@ bundleRoutes.post("/install", async (c) => {
       bundleManifest: installMeta?.bundleManifest,
       routingFailures: result.bundleRouting?.routingFailures,
     });
-    const hasBlocked = result.stages.some((s: { status: string }) => s.status === "blocked");
-    return c.json(result, hasBlocked ? 409 : 500);
+    const failure = bootstrapFailureResponse(result, "apply");
+    return c.json(failure.body, failure.status);
   } catch (err) {
     bootstrapRepo.updateRunStatus(run.id, "failed");
     eventBus.emit({ type: "bootstrap.failed", runId: run.id, sourceRef: bundlePath, error: (err as Error).message });

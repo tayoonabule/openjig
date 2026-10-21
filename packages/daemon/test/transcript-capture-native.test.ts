@@ -33,7 +33,10 @@ it.skipIf(!nativeAvailable)("preserves the exact native trailing buffer and reco
     expect(captures).toBeLessThan(10);
     await run("send-keys", "-t", "seat", "-l", "new output γδ"); await run("send-keys", "-t", "seat", "Enter");
     const deadline = Date.now() + 9000;
-    while (Date.now() < deadline && !readFileSync(file, "utf8").includes("new output γδ")) await wait(50);
+    // The line lands twice: the tty echoes it as typed, then cat prints it after Enter. Wait for
+    // both, or a capture taken between them leaves the transcript one line behind the pane.
+    const landed = () => readFileSync(file, "utf8").split("new output γδ").length - 1 >= 2;
+    while (Date.now() < deadline && !landed()) await wait(50);
     const expected = await run("capture-pane", "-p", "-t", "seat", "-S", "-1000");
     expect(readFileSync(file, "utf8")).toBe(expected);
     expect(expected).toContain("new output γδ");
@@ -98,10 +101,25 @@ it.skipIf(!nativeAvailable)("keeps real idle transcript health fresh across a va
     await run("send-keys", "-t", "seat", "-l", "idle seed αβ"); await run("send-keys", "-t", "seat", "Enter");
     await wait(100);
     startTranscriptRotation(adapter, "seat", file, { lines: 1000, pollIntervalMs: 2000 }, () => ({ lines: 1000, pollIntervalMs: 2000 }));
-    await wait(200);
+    // The first capture runs two real tmux execs and a write before the transcript exists (until then health reads
+    // capture_missing). Wait for that condition, not a fixed time: a loaded runner can take well over 200 ms.
+    const firstBy = Date.now() + 10_000;
+    let first = store.getIngestHealth("rig", "seat");
+    while (first.reason !== "capture_fresh" && Date.now() < firstBy) {
+      await wait(50);
+      first = store.getIngestHealth("rig", "seat");
+    }
+    expect(first, "the first capture landed within 10 s").toMatchObject({ state: "live", reason: "capture_fresh" });
     const until = Date.now() + 25_000;
+    let lastWrite = 0;
     while (Date.now() < until) {
-      expect(store.getIngestHealth("rig", "seat")).toMatchObject({ state: "live", reason: "capture_fresh" });
+      // Once the ticks stop, skipped ticks keep ingest live while the capture time stays the last capture.
+      expect(store.getIngestHealth("rig", "seat").state).toBe("live");
+      // A line every 3s keeps the seat capturing, so the slow fifth capture happens.
+      if (!slowCompleted && Date.now() - lastWrite > 3000) {
+        lastWrite = Date.now();
+        await run("send-keys", "-t", "seat", "-l", "tick"); await run("send-keys", "-t", "seat", "Enter");
+      }
       await wait(100);
     }
     expect(slowCompleted).toBe(true);
@@ -111,4 +129,4 @@ it.skipIf(!nativeAvailable)("keeps real idle transcript health fresh across a va
     await run("kill-server").catch(() => {});
     rmSync(root, { recursive: true, force: true });
   }
-}, 35_000);
+}, 45_000);

@@ -75,6 +75,7 @@ test("generates a valid, daemon-parseable pack per skill; SKILL.md is the instru
       description: "Write the test first.",
       files: {
         "anti-patterns.md": "# anti-patterns\n",
+        "notes..md": "# Literal filename dots\n",
         "helper.sh": "#!/bin/sh\necho no\n",
         "example.ts": "export const x = 1;\n",
         "feedback.md": "internal\n",       // mirror EXCLUDE
@@ -101,6 +102,8 @@ test("generates a valid, daemon-parseable pack per skill; SKILL.md is the instru
     const paths = m2.files.map((f) => f.path);
     assert.ok(paths.includes("SKILL.md"));
     assert.ok(paths.includes("anti-patterns.md"));
+    assert.ok(paths.includes("notes..md"));
+    assert.equal(readFileSync(join(out, "skills/process/tdd/notes..md"), "utf8"), "# Literal filename dots\n");
     assert.ok(paths.includes("helper.sh"), "helper.sh must be packed (mirror ship set)");
     assert.ok(paths.includes("example.ts"), "example.ts must be packed (mirror ship set)");
     assert.ok(existsSync(join(out, "skills/process/tdd/helper.sh")), "helper.sh must be copied");
@@ -116,20 +119,25 @@ test("MALFORMED PROJECTION FAILS THE BUILD — a '..' content path is rejected a
   const { source, out, base } = scratch();
   try {
     skill(source, "core/ok", { name: "ok", description: "fine", files: {} });
-    // a content file whose name forges a traversal segment: the daemon parser
-    // rejects the resulting files[].path, and the generator must fail the build.
-    skill(source, "core/bad", { name: "bad", description: "trap", files: { "notes..md": "x" } });
+    // A whole '..' segment in a declared static-pack path is traversal.
+    // Literal dots within a filename are valid (covered by the generation test).
+    const staticSource = join(base, "static");
+    const packDir = join(staticSource, "bad");
+    mkdirSync(packDir, { recursive: true });
+    writeFileSync(join(packDir, "manifest.yaml"),
+      'name: bad\nversion: "0"\ntaxonomy: world\nfiles:\n  - path: "../escape.md"\n    role: reference\n');
     let failed = false;
     try {
-      run(source, out);
+      runWithStatic(source, staticSource, out);
     } catch (err) {
       failed = true;
       assert.equal(err.status, 1, "exit code must be 1 (build failure)");
       assert.match(String(err.stderr), /FAILING THE BUILD/);
+      assert.match(String(err.stderr), /no '\.\.' segments/);
     }
     assert.ok(failed, "generator must exit non-zero on a malformed projection");
     // and it must NOT have written a partial/invalid library
-    assert.ok(!existsSync(join(out, "skills/core/bad")), "no invalid pack should be written");
+    assert.ok(!existsSync(join(out, "bad")), "no invalid pack should be written");
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
@@ -595,8 +603,8 @@ test("HELP ADDRESSES: every guide address taught in help.md resolves through the
     runProduction(out);
     const helpSource = readFileSync(join(REPO, "docs/reference/help.md"), "utf8");
     const refDir = join(out, "reference");
-    assert.deepEqual(readdirSync(refDir).sort(), ["getting-started.md", "instance-layout.md", "manifest.yaml", "rig-spec.md"]);
-    for (const f of ["getting-started.md", "instance-layout.md", "rig-spec.md"]) {
+    assert.deepEqual(readdirSync(refDir).sort(), ["getting-started.md", "instance-layout.md", "manifest.yaml", "rig-spec.md", "whats-new.md"]);
+    for (const f of ["getting-started.md", "instance-layout.md", "rig-spec.md", "whats-new.md"]) {
       assert.ok(!lstatSync(join(refDir, f)).isSymbolicLink(), `${f} ships as a real file`);
       assert.equal(readFileSync(join(refDir, f), "utf8"), readFileSync(join(REPO, "docs/reference", f), "utf8"));
     }
@@ -605,8 +613,10 @@ test("HELP ADDRESSES: every guide address taught in help.md resolves through the
     assert.deepEqual(addresses.sort(), [
       "reference/getting-started.md#have-your-agent-configure-permissions",
       "reference/getting-started.md#incomplete-setup-and-restart",
+      "reference/getting-started.md#open-the-kernel-conversations",
       "reference/instance-layout.md",
       "reference/rig-spec.md",
+      "reference/whats-new.md",
     ]);
     assert.deepEqual(await unresolvedAddresses(app, addresses), []);
     const section = await (await app.request(
@@ -621,7 +631,7 @@ test("HELP ADDRESSES: every guide address taught in help.md resolves through the
     const preview = await (await app.request(`/api/context-packs/library/by-ref/preview?ref=help`)).json();
     assert.deepEqual(preview.files.map((f) => f.path ?? f), ["help.md"]);
     assert.ok(preview.bundleText.includes("# Help your user get unstuck"));
-    for (const manual of ["# Getting started: one useful change", "# OpenRig Instance Layout", "# RigSpec Reference"]) {
+    for (const manual of ["# Getting started: one useful change", "# OpenRig Instance Layout", "# RigSpec Reference", "# What changed in OpenRig"]) {
       assert.ok(!preview.bundleText.includes(manual), `a help read must not include '${manual}'`);
     }
   } finally {

@@ -2,11 +2,16 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { createFullTestDb } from "./helpers/test-app.js";
+import { getNodeInventory } from "../src/domain/node-inventory.js";
+import { SeatIdentityStore } from "../src/domain/seat-identity-store.js";
 import {
   RestoreCheckService,
   type RestoreCheckDeps,
   type NodeInventoryEntry,
 } from "../src/domain/restore-check-service.js";
+
+const RELAY_PATH = "/custom-instance/state/claude-activity-hooks/activity-relay.cjs";
 
 const VALID_HOST_INFRA_DECLARATION = JSON.stringify({
   schemaVersion: 1,
@@ -89,6 +94,7 @@ function mockDeps(overrides?: Partial<RestoreCheckDeps & {
   getStartupContext: (nodeId: string) => unknown;
 }>): RestoreCheckDeps {
   return {
+    stateDir: "/custom-instance",
     listRigs: () => [{ rigId: "rig-1", name: "test-rig" }],
     getNodeInventory: () => [
       {
@@ -117,12 +123,62 @@ function mockDeps(overrides?: Partial<RestoreCheckDeps & {
     readFile: () => VALID_HOST_INFRA_DECLARATION,
     getStartupContext: () => startupContextProbe(),
     probeQueueStore: () => ({ available: true, evidence: "SQLite queue store is available" }),
+    getDesiredClaudeActivityHooks: () => ({ status: "known", selected: false }),
     getClaudeActivityHookEvents: () => ["SessionStart", "UserPromptSubmit"],
     ...overrides,
   };
 }
 
 describe("RestoreCheckService", () => {
+  it.each(["ready", "failed", "attention_required"])("identity projection advice preserves the stored %s outcome", stored => {
+    const db = createFullTestDb();
+    try {
+      db.prepare("INSERT INTO rigs (id, name) VALUES ('rig-1', 'test-rig')").run();
+      db.prepare("INSERT INTO nodes (id, rig_id, logical_id, runtime) VALUES ('node-1','rig-1','dev.impl','claude-code')").run();
+      db.prepare("INSERT INTO sessions (id, node_id, session_name, status, startup_status, created_at) VALUES ('session-1','node-1','dev-impl@test-rig','running',?,'2026-07-01 00:00:00')").run(stored);
+      db.prepare("INSERT INTO bindings (id, node_id, attachment_type, tmux_session, tmux_pane) VALUES ('binding-1','node-1','tmux','dev-impl@test-rig','%1')").run();
+      new SeatIdentityStore(db).upsert({
+        nodeId: "node-1", verdict: "mismatch", evidenceSource: "pane_process", reason: "process_identity_ambiguous",
+        evidence: { registeredPane: "%1", observedPid: 123, observedCommand: "node", matchedLayer: null },
+        sessionName: "dev-impl@test-rig", observedAt: "2026-07-02T12:00:00.000Z",
+      });
+      const service = new RestoreCheckService(mockDeps({ getNodeInventory: rigId => getNodeInventory(db, rigId) }));
+      const result = service.check({ noQueue: true, noHooks: true }) as any;
+      const check = result.checks.find((entry: { check: string }) => entry.check === "seat.dev-impl@test-rig.readiness");
+      expect(check.status).toBe("red");
+      expect(check.remediationSafe).toBe(false);
+      if (stored === "ready") {
+        expect(check.evidence).toContain("verdict=mismatch reason=process_identity_ambiguous");
+        expect(check.remediation).toContain("Verify the current pane identity");
+        expect(check.remediation).toContain("rig seat clear-attention");
+        expect(check.remediation).not.toMatch(/relaunch/i);
+      } else {
+        expect(check.remediation).toContain("Restore or relaunch");
+      }
+    } finally { db.close(); }
+  });
+
+  it("missing-session identity advice offers recovery and conditional pane rebinding", () => {
+    const node = claudeNode({
+      storedStartupStatus: "ready", startupStatus: "attention_required",
+      identityVerdict: {
+        nodeId: "node-1", verdict: "pane_missing", evidenceSource: "tmux_session", reason: "session_missing",
+        evidence: { registeredPane: "%1", observedPid: null, observedCommand: null, matchedLayer: null },
+        sessionName: "dev-impl@test-rig", observedAt: "2026-07-02T12:00:00.000Z",
+      },
+    });
+    const result = new RestoreCheckService(mockDeps({ getNodeInventory: () => [node] }))
+      .check({ noQueue: true, noHooks: true }) as any;
+    const check = result.checks.find((entry: { check: string }) => entry.check === "seat.dev-impl@test-rig.readiness");
+    expect(check.status).toBe("red");
+    expect(check.remediationSafe).toBe(false);
+    expect(check.evidence).toContain("verdict=pane_missing reason=session_missing");
+    expect(check.remediation).toContain("restore or relaunch");
+    expect(check.remediation).toContain("another pane of its session");
+    expect(check.remediation).toContain("rig seat clear-attention");
+    expect(check.remediation).toContain("rerun rig restore-check");
+  });
+
   let previousOpenRigHome: string | undefined;
   let testOpenRigHome: string | null;
 
@@ -891,13 +947,13 @@ describe("RestoreCheckService", () => {
     expect(hookChecks).toHaveLength(0);
   });
 
-  it.each([undefined, "*", "startup|resume", "startup, resume", "^(startup|resume)$"])("checks usable selected activity-hook matcher %s", (matcher) => {
+  it.each([undefined, "*", "startup|resume", "startup, resume", "^(startup|resume)$"].flatMap(matcher => ["node", "'/runtime/node'"].map(executable => ({ matcher, executable }))))("checks usable selected activity-hook matcher $matcher / $executable", ({ matcher, executable }) => {
     const cwd = path.join(os.tmpdir(), "restore-check-activity-seat");
     const settingsPath = path.join(cwd, ".claude", "settings.local.json");
-    const relayPath = path.join(cwd, ".openrig", "hooks", "scripts", "activity-relay.cjs");
+    const relayPath = RELAY_PATH;
     const events = ["SessionStart", "UserPromptSubmit"];
     const settings = JSON.stringify({ hooks: Object.fromEntries(events.map((event) => [event, [{ matcher, hooks: [
-      { type: "command", command: `node '${relayPath}'` },
+      { type: "command", command: `${executable} '${relayPath}'` },
     ] }]])) });
     const service = new RestoreCheckService(mockDeps({
       getNodeInventory: () => [claudeNode({ cwd })],
@@ -919,7 +975,7 @@ describe("RestoreCheckService", () => {
   it.each(["disabled", "compact-only", "prompt-handler", "invalid-matcher", "substring-matcher"])("keeps %s selected activity hooks as a caveat", (kind) => {
     const cwd = path.join(os.tmpdir(), "restore-check-activity-seat-unusable");
     const settingsPath = path.join(cwd, ".claude", "settings.local.json");
-    const relayPath = path.join(cwd, ".openrig", "hooks", "scripts", "activity-relay.cjs");
+    const relayPath = RELAY_PATH;
     const service = new RestoreCheckService(mockDeps({
       getNodeInventory: () => [claudeNode({ cwd })],
       getStartupContext: () => startupContextProbe({ projectionEntries: [{
@@ -946,7 +1002,7 @@ describe("RestoreCheckService", () => {
   it("does not accept a similarly named command as the projected Claude activity hook", () => {
     const cwd = path.join(os.tmpdir(), "restore-check-activity-seat-lookalike");
     const settingsPath = path.join(cwd, ".claude", "settings.local.json");
-    const relayPath = path.join(cwd, ".openrig", "hooks", "scripts", "activity-relay.cjs");
+    const relayPath = RELAY_PATH;
     const service = new RestoreCheckService(mockDeps({
       getNodeInventory: () => [claudeNode({ cwd })],
       getStartupContext: () => startupContextProbe({ projectionEntries: [{
@@ -968,7 +1024,7 @@ describe("RestoreCheckService", () => {
   it("warns when a selected Claude activity hook event is not projected", () => {
     const cwd = path.join(os.tmpdir(), "restore-check-activity-seat-partial");
     const settingsPath = path.join(cwd, ".claude", "settings.local.json");
-    const relayPath = path.join(cwd, ".openrig", "hooks", "scripts", "activity-relay.cjs");
+    const relayPath = RELAY_PATH;
     const service = new RestoreCheckService(mockDeps({
       getNodeInventory: () => [claudeNode({ cwd })],
       getStartupContext: () => startupContextProbe({ projectionEntries: [{
@@ -987,10 +1043,136 @@ describe("RestoreCheckService", () => {
     expect(hook?.evidence).toContain("UserPromptSubmit");
   });
 
+  it("does not count stale project-local commands as delivered instance hooks", () => {
+    const cwd = "/project";
+    const settingsPath = path.join(cwd, ".claude", "settings.local.json");
+    const legacy = path.join(cwd, ".openrig", "hooks", "scripts", "activity-relay.cjs");
+    const service = new RestoreCheckService(mockDeps({
+      getNodeInventory: () => [claudeNode({ cwd })],
+      getStartupContext: () => startupContextProbe({ projectionEntries: [{
+        absolutePath: "/source/openrig-core", category: "runtime_resource", resourceType: "claude_activity_hooks",
+      }] }),
+      getClaudeActivityHookEvents: () => ["Stop"],
+      exists: () => true,
+      readFile: candidate => candidate === settingsPath
+        ? JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: `node '${legacy}'` }] }] } })
+        : VALID_HOST_INFRA_DECLARATION,
+    }));
+    const hook = service.check({}).checks.find(entry => entry.check === "seat.dev-impl@test-rig.hooks");
+    expect(hook?.status).toBe("yellow");
+    expect(hook?.evidence).toContain("missing relay entries for: Stop");
+  });
+
   it("treats deliberately unselected Claude activity hooks as not applicable", () => {
     const hook = new RestoreCheckService(mockDeps()).check({}).checks.find((entry) => entry.check === "seat.dev-impl@test-rig.hooks");
     expect(hook?.status).toBe("green");
     expect(hook?.evidence).toContain("not selected");
+  });
+
+  it.each(["selected", "unknown", "throws"])("keeps absent saved channels with %s desired metadata nonblocking", (kind) => {
+    const desired = () => {
+      if (kind === "throws") throw new Error("unreadable source");
+      return kind === "selected" ? { status: "known" as const, selected: true }
+        : { status: "unknown" as const, evidence: "unreadable source" };
+    };
+    const service = new RestoreCheckService(mockDeps({ getDesiredClaudeActivityHooks: desired }));
+    for (const opts of [{}, { compact: true, includeReady: true }]) {
+      const result = service.check(opts);
+      expect(result.verdict).toBe("restorable_with_caveats");
+      expect(result.readiness.status).toBe("ready_with_caveats");
+      expect(result.rigs[0]?.classCounts.ready_with_caveats).toBe(1);
+      const hook = result.checks.find(c => c.check.endsWith(".hooks"));
+      expect(hook).toMatchObject({ status: "yellow", remediation: "" });
+      expect(hook?.evidence).toContain(kind === "selected" ? "stale selection" : "unknown");
+      expect(result.repairPacket?.some(step => step.rationale === hook?.evidence) ?? false).toBe(false);
+      expect(result.recovery.actions).toEqual([]);
+    }
+  });
+
+  it("does not add desired-profile resolution to omitted ready detail or composed no-hooks polls", () => {
+    let reads = 0;
+    const service = new RestoreCheckService(mockDeps({ getDesiredClaudeActivityHooks: () => {
+      reads++; return { status: "known", selected: true };
+    } }));
+    expect(service.check({ compact: true }).checks.some(c => c.check.endsWith(".hooks"))).toBe(false);
+    service.check({ noHooks: true, recoveryOnly: true });
+    expect(reads).toBe(0);
+    service.check({ compact: true, includeReady: true });
+    expect(reads).toBe(1);
+  });
+
+  it("preserves independent red and unknown causes alongside a stale selection", () => {
+    const overrides = { getDesiredClaudeActivityHooks: () => ({ status: "known" as const, selected: true }) };
+    expect(new RestoreCheckService(mockDeps({ ...overrides, probeQueueStore: () => ({ available: false, evidence: "broken" }),
+      getNodeInventory: () => [claudeNode({ sessionStatus: "exited" })],
+    })).check({}).verdict).toBe("not_restorable");
+    expect(new RestoreCheckService(mockDeps({ ...overrides, getRestoreInputs: () => { throw new Error("unreadable snapshot"); },
+    })).check({}).verdict).toBe("unknown");
+  });
+
+  it.each(["available", "missing-manifest", "malformed-manifest", "unreadable-relay", "disabled", "malformed-settings", "missing-event"])("inspects saved core plugin %s without treating selection as delivery", (kind) => {
+    const dir = "/custom-instance/plugins/openrig-core", cwd = "/fixture-project";
+    const settingsPath = path.join(cwd, ".claude/settings.local.json");
+    const files = new Map([
+      [path.join(dir, ".claude-plugin/plugin.json"), JSON.stringify({ name: "openrig-core", hooks: "./hooks/claude.json" })],
+      [path.join(dir, "hooks/claude.json"), JSON.stringify({ hooks: { Stop: [{ hooks: [{ command: "node activity-relay.cjs" }] }] } })],
+      [path.join(dir, "hooks/scripts/activity-relay.cjs"), "// fixture relay"],
+      [settingsPath, JSON.stringify({ disableAllHooks: kind === "disabled" })],
+    ]);
+    if (kind === "missing-manifest") files.delete(path.join(dir, ".claude-plugin/plugin.json"));
+    if (kind === "malformed-manifest") files.set(path.join(dir, ".claude-plugin/plugin.json"), "{");
+    if (kind === "malformed-settings") files.set(settingsPath, "{");
+    const service = new RestoreCheckService(mockDeps({
+      getNodeInventory: () => [claudeNode({ cwd })],
+      getStartupContext: () => startupContextProbe({ projectionEntries: [{ category: "plugin", absolutePath: dir }] }),
+      getClaudeActivityHookEvents: () => kind === "missing-event" ? ["Stop", "SessionStart"] : ["Stop"],
+      exists: f => files.has(f) || f.endsWith("host-infra.json"),
+      readFile: f => {
+        if (kind === "unreadable-relay" && f.endsWith("activity-relay.cjs")) throw new Error("unreadable");
+        if (files.has(f)) return files.get(f)!;
+        if (f.endsWith("host-infra.json")) return VALID_HOST_INFRA_DECLARATION;
+        throw new Error("missing");
+      },
+    }));
+    const hook = service.check({}).checks.find(c => c.check.endsWith(".hooks"));
+    expect(hook?.status).toBe(kind === "available" ? "green" : "yellow");
+    expect(hook?.evidence).toContain("Saved openrig-core plugin channel is selected");
+    expect(hook?.remediation).toBe("");
+  });
+
+  it("keeps projected activity-resource evidence when a selected core plugin is broken", () => {
+    const cwd = "/fixture-project";
+    const settingsPath = path.join(cwd, ".claude", "settings.local.json");
+    const pluginDir = "/custom-instance/plugins/openrig-core";
+    const events = ["SessionStart", "UserPromptSubmit"];
+    const settings = JSON.stringify({ hooks: Object.fromEntries(events.map(event => [event, [{ hooks: [
+      { type: "command", command: `node '${RELAY_PATH}'` },
+    ] }]])) });
+    const service = new RestoreCheckService(mockDeps({
+      getNodeInventory: () => [claudeNode({ cwd })],
+      getStartupContext: () => startupContextProbe({ projectionEntries: [
+        { absolutePath: "/source/activity-hooks", category: "runtime_resource", resourceType: "claude_activity_hooks" },
+        { absolutePath: pluginDir, category: "plugin" },
+      ] }),
+      getClaudeActivityHookEvents: () => events,
+      exists: () => true,
+      readFile: candidate => {
+        if (candidate === settingsPath) return settings;
+        if (candidate === path.join(pluginDir, ".claude-plugin", "plugin.json")) return "{";
+        return VALID_HOST_INFRA_DECLARATION;
+      },
+    }));
+
+    const result = service.check({});
+    const hook = result.checks.find(entry => entry.check === "seat.dev-impl@test-rig.hooks");
+    expect(hook).toMatchObject({ status: "yellow", remediation: "" });
+    expect(hook?.evidence).toContain(`activity hooks are projected in ${settingsPath}`);
+    expect(hook?.evidence).toContain(`relay present at ${RELAY_PATH}`);
+    expect(hook?.evidence).toContain("hook execution is not verified");
+    expect(hook?.evidence).toContain("Saved openrig-core plugin channel is selected but its assets could not be trusted");
+    expect(result.verdict).toBe("restorable_with_caveats");
+    expect(result.readiness.status).toBe("ready_with_caveats");
+    expect(result.repairPacket?.some(step => step.rationale === hook?.evidence) ?? false).toBe(false);
   });
 
   it("Codex and infrastructure hook checks are green not-applicable without hook repair steps", () => {

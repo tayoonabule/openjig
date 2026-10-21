@@ -1,4 +1,4 @@
-import { nonInterruptiveArg } from "./non-interruptive.js";
+import { operationalLaunchArg } from "./kernel-authority.js";
 import nodePath from "node:path";
 import fs from "node:fs";
 import { createHash } from "node:crypto";
@@ -18,32 +18,66 @@ import type {
 import type { CodexProfileProbeResult } from "../domain/codex-profile-preflight.js";
 import { resolveConcreteHint } from "../domain/runtime-adapter.js";
 import type { ProjectionPlan, ProjectionEntry } from "../domain/projection-planner.js";
-import { observeCodexSandbox } from "../domain/permission-drift.js";
+import { observeCodexSandbox, type AppliedLaunchObservation } from "../domain/permission-drift.js";
 import {
   defaultResolveHomeDirByPid,
+  CodexThreadIdResolver,
+  lstartToMinTs,
   readCodexThreadIdFromCandidateHomes,
   type ResolveHomeDirByPid,
 } from "../domain/codex-thread-id.js";
-import { assessNativeResumeProbe, buildCodexResumeCore, type NativeResumeProbeResult } from "../domain/native-resume-probe.js";
+import { assessNativeResumeProbe, buildCodexResumeCore, hasCodexUpdateHeader, type NativeResumeProbeResult } from "../domain/native-resume-probe.js";
 import { unknownDaemonSupportMessage, type CodexDaemonSupportDetector } from "../domain/codex-daemon-support.js";
-import { codexNetworkDefaultArg, type CodexNetworkDefaultReader } from "../domain/codex-network-default.js";
+import { CODEX_NETWORK_DEFAULT_OVERRIDE, codexNetworkDefaultArg, type CodexNetworkDefaultReader } from "../domain/codex-network-default.js";
 import { resolveCodexGitAddDirs, type CodexGitAddDirResolver } from "../domain/codex-git-add-dirs.js";
 import { mergeManagedBlock } from "../domain/managed-blocks.js";
 import { excludeNewGeneratedFiles } from "../domain/generated-file-hygiene.js";
-import { parseSessionName } from "../domain/session-name.js";
+import { codexQueueStateRoot, codexTeamWorkspaceArg, type PrepareCodexTeamWorkspace } from "../domain/codex-team-workspace.js";
 import { shellQuote } from "./shell-quote.js";
 import { runSyncSite } from "../domain/sync-site-wrap.js";
+import { resolveReadinessTimeoutMs } from "../domain/readiness-timeout.js";
+import type { SettingsStore } from "../domain/user-settings/settings-store.js";
 
-import { listNativeProcesses, observeCodexPaneProcess, type NativeProcessRow } from "../domain/native-process-lineage.js";
+import { listNativeProcesses, observeCodexPaneProcess, observeCodexForkProcess, verifyPaneIdleShell, type NativeProcessRow } from "../domain/native-process-lineage.js";
 
 // Shared by all probes of ONE launch, never reset by a delayed screen or an
 // ambiguous transport result. A separately requested launch gets a new attempt.
 interface UpdatePromptAttempt {
   handled: boolean;
   failure?: Extract<HarnessLaunchResult, { ok: false }>;
+  /** Reporting only: the latest screen the helper itself captured and classified, in capture order, so a report can
+   *  name it rather than an older capture. `beforeInput` marks a screen the helper then sent (or tried to send) its key
+   *  to, with no later capture. Never read by a polling or recovery decision. */
+  observed?: { probe: NativeResumeProbeResult; paneContent: string; beforeInput?: true };
+  /** Reporting only: whether the helper sent the update prompt's skip key on this launch, and how that send came out. */
+  skipKey?: "sent" | "failed";
 }
 
 type CodexProcess = NativeProcessRow;
+
+/** What a running Codex was launched with that a launch would otherwise decide by probing (the network
+ *  reader, the --no-daemon support probe) or by preparing directories (add-dirs). A relaunch that must keep the
+ *  running Codex's effective settings takes these from its argv instead. */
+export interface RunningCodexLaunch {
+  networkOverride: boolean;
+  daemonOptOut: boolean;
+  addDirs: string[];
+}
+
+interface PreparedCodexLaunch {
+  ok: true;
+  model: string | undefined;
+  modelArg: string;
+  effort: string | undefined;
+  effortArg: string;
+  profile: string | undefined;
+  appliedLaunch: AppliedLaunchObservation;
+  postureArg: string;
+  queueStateDirArg: string;
+  daemonOptOut: boolean;
+  daemonArg: string;
+  networkArg: string;
+}
 
 export interface CodexAdapterFsOps {
   readFile(path: string): string;
@@ -68,7 +102,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   private seatLaunchEnvironment?: SeatLaunchEnvironment;
   private fs: CodexAdapterFsOps;
   private listProcesses: () => CodexProcess[] | Promise<CodexProcess[]>;
-  private readThreadIdByPid: (pid: number) => Promise<string | undefined> | string | undefined;
+  private readThreadIdByPid: (pid: number, identity?: string) => Promise<string | undefined> | string | undefined;
+  private readinessSettings?: Pick<SettingsStore, "resolveOne">;
   private sleep: (ms: number) => Promise<void>;
   private resolveHomeDirByPid: ResolveHomeDirByPid;
   private codexHome?: string;
@@ -89,6 +124,9 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   // Issue #121: git metadata dirs for the fresh-launch `--add-dir`s (a linked worktree's `.git` is a file).
   // Default = the real resolver; tests may inject a controlled one.
   private resolveGitAddDirs: CodexGitAddDirResolver;
+  private prepareTeamWorkspace?: PrepareCodexTeamWorkspace;
+  private resolveManagedConfigSettings?: () => Promise<{ enabled: boolean; codexVersion?: string }>;
+  private resolveHooksEnabled?: () => Promise<boolean>;
   // OPR.0.4.1.10 FR-B — absolute path to the daemon's own shipped activity-relay.cjs,
   // resolved by startup from import.meta.dirname. Used by ensureCodexActivityHooks
   // (FR-A) to write config-layer [hooks] command entries that are cwd-independent and
@@ -100,7 +138,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     seatLaunchEnvironment?: SeatLaunchEnvironment;
     fsOps: CodexAdapterFsOps;
     listProcesses?: () => CodexProcess[] | Promise<CodexProcess[]>;
-    readThreadIdByPid?: (pid: number) => Promise<string | undefined> | string | undefined;
+    readThreadIdByPid?: (pid: number, identity?: string) => Promise<string | undefined> | string | undefined;
+    readinessSettings?: Pick<SettingsStore, "resolveOne">;
     resolveHomeDirByPid?: ResolveHomeDirByPid;
     sleep?: (ms: number) => Promise<void>;
     activityRelayPath?: string;
@@ -112,8 +151,16 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     detectDaemonSupport?: CodexDaemonSupportDetector;
     readNetworkDefault?: CodexNetworkDefaultReader;
     resolveGitAddDirs?: CodexGitAddDirResolver;
+    prepareTeamWorkspace?: PrepareCodexTeamWorkspace;
+    /** Resolves the hooks setting and Codex version that ensureManagedConfig applies. Absent: no managed config write. */
+    resolveManagedConfigSettings?: () => Promise<{ enabled: boolean; codexVersion?: string }>;
+    /** Whether runtime.codex.hooks_enabled is on, without resolving the Codex version. Absent: nothing is stripped. */
+    resolveHooksEnabled?: () => Promise<boolean>;
   }) {
     this.tmux = deps.tmux;
+    this.resolveManagedConfigSettings = deps.resolveManagedConfigSettings;
+    this.resolveHooksEnabled = deps.resolveHooksEnabled;
+    this.prepareTeamWorkspace = deps.prepareTeamWorkspace;
     this.seatLaunchEnvironment = deps.seatLaunchEnvironment;
     this.fs = deps.fsOps;
     this.codexHome = deps.codexHome;
@@ -123,11 +170,52 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     this.resolveGitAddDirs = deps.resolveGitAddDirs ?? resolveCodexGitAddDirs;
     this.activityRelayPath = deps.activityRelayPath;
     this.listProcesses = deps.listProcesses ?? defaultListProcesses;
-    this.readThreadIdByPid = deps.readThreadIdByPid ?? ((pid) => this.readThreadIdFromLogs(pid));
     this.resolveHomeDirByPid = deps.resolveHomeDirByPid ?? defaultResolveHomeDirByPid;
+    const threadIdResolver = new CodexThreadIdResolver({
+      defaultHome: this.fs.homedir ?? os.homedir(), codexHome: this.codexHome,
+      resolveHomeDirByPid: this.resolveHomeDirByPid,
+    });
+    this.readThreadIdByPid = deps.readThreadIdByPid ?? ((pid, identity) => identity === undefined
+      ? this.readThreadIdFromLogs(pid) : threadIdResolver.resolveForkChild(pid, identity));
+    this.readinessSettings = deps.readinessSettings;
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.verifyProfilePreflight = deps.verifyProfilePreflight
       ?? ((profile, cwd) => defaultProfilePreflight(profile, this.codexHome ? { cwd, codexHome: this.codexHome, launchPath: this.launchPath } : undefined));
+  }
+
+  /**
+   * Bring the Codex config.toml to the state OpenRig-managed seats need: feature flag,
+   * activity hooks and their trust, or the stripped block when hooks are disabled. Runs when
+   * a daemon has Codex seats (boot) or is about to launch one, never for a daemon without
+   * them: a rig with no Codex seat leaves the user's config alone. A failure warns and does
+   * not block the launch.
+   */
+  async ensureManagedConfig(): Promise<void> {
+    if (!this.resolveManagedConfigSettings) return;
+    try {
+      const { enabled, codexVersion } = await this.resolveManagedConfigSettings();
+      this.ensureCodexFeatureFlag(enabled, { codexVersion });
+      if (enabled) this.ensureCodexActivityHooks();
+      else this.removeCodexActivityHooks();
+    } catch (err) {
+      console.error(`[openrig] runtime setup warning: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Boot step for a daemon without Codex seats: when runtime.codex.hooks_enabled is false,
+   * strip OpenRig's managed hooks block, as every boot did before. Removal writes only when
+   * the block is present, so a config without it stays byte-identical, and with hooks enabled
+   * nothing is touched. Without this an operator with no Codex seat has no OpenRig way to
+   * remove a stale block. A failure warns.
+   */
+  async stripManagedHooksIfDisabled(): Promise<void> {
+    if (!this.resolveHooksEnabled) return;
+    try {
+      if (!(await this.resolveHooksEnabled())) this.removeCodexActivityHooks();
+    } catch (err) {
+      console.error(`[openrig] runtime setup warning: ${(err as Error).message}`);
+    }
   }
 
   /**
@@ -349,40 +437,9 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     }
 
     const updatePrompt: UpdatePromptAttempt = { handled: false };
-    const model = binding.model?.trim();
-    const modelArg = model ? ` -m ${shellQuote(model)}` : "";
-    const effort = binding.effort?.trim();
-    const effortArg = effort ? ` -c ${shellQuote(`model_reasoning_effort="${effort}"`)}` : "";
-    const profile = binding.codexConfigProfile?.trim();
-    const profileArg = profile ? ` -p ${shellQuote(profile)}` : "";
-    const posture = codexPostureArg(profileArg, process.env, binding.launchPosture);
-    const appliedLaunch = observeCodexSandbox(posture);
-    const postureArg = posture + nonInterruptiveArg(this.runtime, binding);
-
-    // OPR.0.3.4.7 — profile-LOAD probe before launch/resume. A legacy
-    // [profiles.<name>] table or invalid TOML must fail BEFORE the opaque
-    // `codex -p <profile> resume` failure. An absent .config.toml passes
-    // (Codex default-layers it; advisor Option B).
-    if (profile) {
-      const probeResult = await this.verifyProfilePreflight(profile, binding.cwd);
-      if (!probeResult.ok) {
-        return {
-          ok: false,
-          error: `${probeResult.error}${probeResult.migrationHint ? `\n  Fix: ${probeResult.migrationHint}` : ""}`,
-        };
-      }
-    }
-    const queueStateDirArg = this.buildQueueStateAddDirArg(opts.name);
-    // #69: one daemon-support decision for this launch, for the Codex the seat pane runs
-    // (its cwd, the launch PATH), applied to fresh, fork and resume.
-    const daemonSupport = this.detectDaemonSupport ? await this.detectDaemonSupport(binding.cwd) : undefined;
-    if (daemonSupport?.kind === "unknown") {
-      return { ok: false, error: unknownDaemonSupportMessage(daemonSupport.detail) };
-    }
-    const daemonOptOut = daemonSupport?.kind === "supported";
-    const daemonArg = daemonOptOut ? " --no-daemon" : "";
-    // #275: on the plain floor, network access unless Codex reports an opt-out or policy.
-    const networkArg = await codexNetworkDefaultArg(this.readNetworkDefault, appliedLaunch, binding.cwd, opts.name);
+    const prepared = await this.prepareLaunch(binding, opts.name);
+    if (!prepared.ok) return prepared;
+    const { modelArg, effortArg, appliedLaunch, postureArg, queueStateDirArg, daemonArg, networkArg } = prepared;
 
     // Fork branch: `codex fork <parent_thread_id>`. Captures the NEW thread id
     // post-fork. Parent thread id is NOT persisted onto the new seat record
@@ -403,20 +460,30 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       // -s workspace-write floor flag.
       // 0.5.2-07 A2-3: the FORK path threads the SPEC model too (fork-instantiate reverted it before).
       const cmd = `codex${daemonArg}${postureArg}${networkArg}${modelArg}${effortArg} fork${queueStateDirArg} ${shellQuote(parentId)}`;
-      const textResult = await this.tmux.sendShellCommand(binding.tmuxSession, this.seatLaunchEnvironment
-        ? await this.seatLaunchEnvironment.command(binding.tmuxSession, cmd, { codexCwd: binding.cwd, nodeId: binding.nodeId, generation: binding.launchGeneration, runtime: this.runtime })
-        : this.launchCommand(cmd));
+      const textResult = await this.tmux.sendShellCommand(binding.tmuxSession, await this.seatCommand(binding, cmd));
       if (!textResult.ok) {
         return { ok: false, error: `Failed to send launch command: ${textResult.message}` };
       }
       await this.dismissSkippableCodexUpdatePrompt(binding.tmuxSession, updatePrompt, 8);
       if (updatePrompt.failure) return updatePrompt.failure;
-      const threadId = await this.captureFreshThreadId(binding, updatePrompt);
+      // A handover keeps its own capture and checks (#1216). Any other fork saves an id and sends its
+      // role only for the child `rig seat continue` would also verify: a foreground chain forking this
+      // parent, whose own start-time-gated record supplies the id.
+      const threadId = opts.forkSource.pendingIdAllowed
+        ? await this.captureFreshThreadId(binding, updatePrompt)
+        : await this.captureVerifiedForkId(binding, updatePrompt, parentId,
+          resolveReadinessTimeoutMs(undefined, this.readinessSettings));
       if (updatePrompt.failure) return updatePrompt.failure;
       if (!threadId) {
+        // For a handover a missed capture is pending metadata, not a failed launch: the fork returns
+        // without a token and the handover's readiness checks still decide success. Any other fork
+        // keeps its unsent context pending for `rig seat continue`, which verifies the child first.
+        if (opts.forkSource.pendingIdAllowed) return { ok: true, appliedLaunch };
         return {
           ok: false,
           error: "codex fork: could not capture new post-fork thread id",
+          recovery: "attention_required",
+          forkIdentityPending: true,
         };
       }
       return { ok: true, resumeToken: threadId, resumeType: "codex_id", appliedLaunch };
@@ -432,12 +499,10 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     const cmd = opts.resumeToken
       // 0.5.2-07 A2-3: the pod-aware RESUME path threads the SPEC model too (reverted before — the
       // grounding map assumed codex parity with the claude adapter, but only fresh emitted -m).
-      ? buildCodexResumeCore(opts.resumeToken, profile, false, queueStateDirArg.trim() || undefined, binding.launchPosture, model, `${postureArg}${networkArg}`, daemonOptOut, effort)
+      ? this.resumeCore(prepared, opts.resumeToken, binding)
       : `codex${daemonArg}${postureArg}${networkArg} -C ${shellQuote(binding.cwd)}${gitDirArg}${queueStateDirArg}${modelArg}${effortArg}`;
 
-    const textResult = await this.tmux.sendShellCommand(binding.tmuxSession, this.seatLaunchEnvironment
-        ? await this.seatLaunchEnvironment.command(binding.tmuxSession, cmd, { codexCwd: binding.cwd, nodeId: binding.nodeId, generation: binding.launchGeneration, runtime: this.runtime })
-        : this.launchCommand(cmd));
+    const textResult = await this.tmux.sendShellCommand(binding.tmuxSession, await this.seatCommand(binding, cmd));
     if (!textResult.ok) {
       return { ok: false, error: `Failed to send launch command: ${textResult.message}` };
     }
@@ -460,15 +525,107 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     return { ok: true, appliedLaunch };
   }
 
-  private buildQueueStateAddDirArg(sessionName: string): string {
-    const identity = parseCanonicalSessionName(sessionName);
-    if (!identity) return "";
+  /** The command launchHarness would type to resume `resumeToken`, wrapped in the seat launch environment,
+   *  for a caller that runs it itself (a respawned direct-native pane). Nothing is sent to the pane. */
+  async buildResumeCommand(
+    binding: NodeBinding,
+    opts: { name: string; resumeToken: string; running?: RunningCodexLaunch },
+  ): Promise<{ ok: true; command: string; core: string; appliedLaunch: AppliedLaunchObservation } | { ok: false; error: string }> {
+    if (!binding.tmuxSession) return { ok: false, error: "No tmux session bound — cannot build a Codex resume command" };
+    const prepared = await this.prepareLaunch(binding, opts.name, opts.running);
+    if (!prepared.ok) return prepared;
+    const core = this.resumeCore(prepared, opts.resumeToken, binding);
+    return { ok: true, command: await this.seatCommand(binding, core), core, appliedLaunch: prepared.appliedLaunch };
+  }
 
+  /** Type a command buildResumeCommand built into the pane's shell, then verify the resume as launchHarness
+   *  does. Nothing is prepared again, so the command runs exactly as it was built and checked. */
+  async sendResumeCommand(tmuxSession: string, command: string, resumeToken: string): Promise<HarnessLaunchResult> {
+    const textResult = await this.tmux.sendShellCommand(tmuxSession, command);
+    if (!textResult.ok) return { ok: false, error: `Failed to send launch command: ${textResult.message}` };
+    return this.verifyResumeInPane(tmuxSession, resumeToken);
+  }
+
+  /** launchHarness's resume verification for a resume the caller started itself: dismiss a skippable update
+   *  prompt, then require a proven resumed conversation (never process-alive alone). */
+  async verifyResumeInPane(tmuxSession: string, resumeToken: string): Promise<HarnessLaunchResult> {
+    const updatePrompt: UpdatePromptAttempt = { handled: false };
+    await this.dismissSkippableCodexUpdatePrompt(tmuxSession, updatePrompt);
+    if (updatePrompt.failure) return updatePrompt.failure;
+    return this.verifyResumeLaunch(tmuxSession, updatePrompt, { resumeToken });
+  }
+
+  /** Launch flags shared by fresh, fork and resume, decided once per launch. With `running`, the probed and
+   *  prepared parts come from the running Codex instead, and no Codex process is started to decide them. */
+  private async prepareLaunch(binding: NodeBinding, name: string, running?: RunningCodexLaunch): Promise<PreparedCodexLaunch | { ok: false; error: string }> {
+    await this.ensureManagedConfig();
+    const model = binding.model?.trim();
+    const modelArg = model ? ` -m ${shellQuote(model)}` : "";
+    const effort = binding.effort?.trim();
+    const effortArg = effort ? ` -c ${shellQuote(`model_reasoning_effort="${effort}"`)}` : "";
+    const profile = binding.codexConfigProfile?.trim();
+    const profileArg = profile ? ` -p ${shellQuote(profile)}` : "";
+    const posture = codexPostureArg(profileArg, process.env, binding.launchPosture);
+    const appliedLaunch = observeCodexSandbox(posture);
+    const postureArg = posture + operationalLaunchArg(this.runtime, binding);
+
+    if (running) {
+      // The running Codex already loaded its profile; drift in -p is the caller's to compare.
+      return { ok: true, model, modelArg, effort, effortArg, profile, appliedLaunch, postureArg,
+        queueStateDirArg: running.addDirs.map((dir) => ` --add-dir ${shellQuote(dir)}`).join(""),
+        daemonOptOut: running.daemonOptOut, daemonArg: running.daemonOptOut ? " --no-daemon" : "",
+        networkArg: running.networkOverride ? ` -c ${shellQuote(CODEX_NETWORK_DEFAULT_OVERRIDE)}` : "" };
+    }
+
+    // OPR.0.3.4.7 — profile-LOAD probe before launch/resume. A legacy
+    // [profiles.<name>] table or invalid TOML must fail BEFORE the opaque
+    // `codex -p <profile> resume` failure. An absent .config.toml passes
+    // (Codex default-layers it; advisor Option B).
+    if (profile) {
+      const probeResult = await this.verifyProfilePreflight(profile, binding.cwd);
+      if (!probeResult.ok) {
+        return {
+          ok: false,
+          error: `${probeResult.error}${probeResult.migrationHint ? `\n  Fix: ${probeResult.migrationHint}` : ""}`,
+        };
+      }
+    }
+    const teamWorkspaceArg = binding.teamPermissionDefault && !profile
+      && appliedLaunch.state === "observed" && appliedLaunch.value === "workspace-write"
+      ? codexTeamWorkspaceArg(this.prepareTeamWorkspace, name) : "";
+    const queueStateDirArg = teamWorkspaceArg || this.buildQueueStateAddDirArg(name);
+    // #69: one daemon-support decision for this launch, for the Codex the seat pane runs
+    // (its cwd, the launch PATH), applied to fresh, fork and resume.
+    const daemonSupport = this.detectDaemonSupport ? await this.detectDaemonSupport(binding.cwd) : undefined;
+    if (daemonSupport?.kind === "unknown") {
+      return { ok: false, error: unknownDaemonSupportMessage(daemonSupport.detail) };
+    }
+    const daemonOptOut = daemonSupport?.kind === "supported";
+    const daemonArg = daemonOptOut ? " --no-daemon" : "";
+    // #275: on the plain floor, network access unless Codex reports an opt-out or policy.
+    const networkArg = await codexNetworkDefaultArg(this.readNetworkDefault, appliedLaunch, binding.cwd, name);
+
+    // The launch facts keep the probed daemon choice, so a printed recovery command can repeat it; no probe, no fact.
+    const launchFacts = daemonSupport ? { ...appliedLaunch, daemonOptOut } : appliedLaunch;
+    return { ok: true, model, modelArg, effort, effortArg, profile, appliedLaunch: launchFacts, postureArg, queueStateDirArg, daemonOptOut, daemonArg, networkArg };
+  }
+
+  private resumeCore(prepared: PreparedCodexLaunch, resumeToken: string, binding: NodeBinding): string {
+    const { profile, queueStateDirArg, model, postureArg, networkArg, daemonOptOut, effort } = prepared;
+    return buildCodexResumeCore(resumeToken, profile, false, queueStateDirArg.trim() || undefined, binding.launchPosture, model, `${postureArg}${networkArg}`, daemonOptOut, effort);
+  }
+
+  private async seatCommand(binding: NodeBinding, cmd: string): Promise<string> {
+    return this.seatLaunchEnvironment
+      ? await this.seatLaunchEnvironment.command(binding.tmuxSession!, cmd, { codexCwd: binding.cwd, nodeId: binding.nodeId, generation: binding.launchGeneration, runtime: this.runtime })
+      : this.launchCommand(cmd);
+  }
+
+  private buildQueueStateAddDirArg(sessionName: string): string {
     const sharedDocsRoot = process.env.OPENRIG_SHARED_DOCS_ROOT?.trim()
-      // OPR.0.3.2.14 — subpath scrubbed (internal-team layout → generic placeholder).
       || nodePath.join(this.fs.homedir ?? os.homedir(), ".openrig", "shared-docs");
-    const queueStateRoot = nodePath.join(sharedDocsRoot, "rigs", identity.rig, "state", identity.pod);
-    return ` --add-dir ${shellQuote(queueStateRoot)}`;
+    const root = codexQueueStateRoot(sessionName, sharedDocsRoot);
+    return root ? ` --add-dir ${shellQuote(root)}` : "";
   }
 
   private async captureProbeScreen(target: string): Promise<string> {
@@ -495,8 +652,37 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       paneContent,
     });
 
+    if (probe.code === "returned_to_shell") {
+      const isIdleShell = await verifyPaneIdleShell({
+        target: binding.tmuxSession,
+        tmux: this.tmux,
+        listProcesses: this.listProcesses,
+      });
+      if (!isIdleShell) {
+        return {
+          ready: false,
+          reason: "The pane shows a shell that is not a proven idle shell; a launch script may still be starting Codex.",
+          code: "awaiting_runtime",
+        };
+      }
+    }
+
     if (probe.status === "resumed") return { ready: true };
     return { ready: false, reason: probe.detail, code: probe.code };
+  }
+
+  async captureForkIdentity(binding: NodeBinding, parentToken: string): Promise<{ resumeToken: string; resumeType: string } | null> {
+    const target = binding.tmuxPane ?? binding.tmuxSession;
+    if (!target || !this.tmux.getPanePid) return null;
+    const input = { target, tmux: this.tmux, listProcesses: this.listProcesses, parentToken };
+    const before = await observeCodexForkProcess(input);
+    if (!before || lstartToMinTs(before.process.startedAt) === undefined) return null;
+    // Gate PID logs by process start time, then re-observe the whole foreground
+    // chain. Neither a reused PID nor a replacement pane proves this child.
+    const child = (await this.readThreadIdByPid(before.process.pid, before.process.startedAt))?.trim();
+    if (!child || child === parentToken) return null;
+    const after = await observeCodexForkProcess(input);
+    return after?.fingerprint === before.fingerprint ? { resumeToken: child, resumeType: "codex_id" } : null;
   }
 
   private async dismissSkippableCodexUpdatePrompt(
@@ -506,6 +692,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       const paneCommand = await this.tmux.getPaneCommand(tmuxSession);
       const paneContent = await this.captureProbeScreen(tmuxSession);
       const probe = assessNativeResumeProbe({ runtime: "codex", paneCommand, paneContent });
+      updatePrompt.observed = { probe, paneContent };
 
       if (probe.code === "update_gate") {
         if (updatePrompt.handled || !isSkippableCodexUpdatePrompt(paneContent)) return false;
@@ -519,8 +706,9 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           return false;
         }
         const currentScreen = await this.tmux.capturePaneScreen?.(tmuxSession);
-        if (!currentScreen || !isSkippableCodexUpdatePrompt(currentScreen)
-          || assessNativeResumeProbe({ runtime: "codex", paneCommand: currentCommand, paneContent: currentScreen }).code !== "update_gate") {
+        const currentProbe = currentScreen ? assessNativeResumeProbe({ runtime: "codex", paneCommand: currentCommand, paneContent: currentScreen }) : null;
+        if (currentScreen && currentProbe) updatePrompt.observed = { probe: currentProbe, paneContent: currentScreen };
+        if (!currentScreen || !isSkippableCodexUpdatePrompt(currentScreen) || currentProbe?.code !== "update_gate") {
           updatePrompt.handled = true;
           return false;
         }
@@ -530,11 +718,15 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         // screen. Consume the attempt before sending, even if delivery fails.
         updatePrompt.handled = true;
         const result = await this.tmux.sendKeys(tmuxSession, ["3"]);
+        updatePrompt.skipKey = result.ok ? "sent" : "failed";
+        // The screen just recorded preceded this input; a later capture on this launch replaces it.
+        if (updatePrompt.observed) updatePrompt.observed.beforeInput = true;
         if (!result.ok) {
           updatePrompt.failure = {
+            gate: "update_gate", gateChoice: true, verifierInput: "update_skip_key_failed", screenBeforeInput: true,
             ok: false, recovery: "attention_required",
-            error: `Could not skip the Codex update prompt: ${result.message}. Inspect the session before retrying.`,
-            evidence: paneContent.split("\n").slice(-12).join("\n"),
+            error: `Could not send the update prompt's skip key (3): ${result.message}; its effect is unknown. Inspect the session before retrying.`,
+            evidence: (currentScreen ?? paneContent).split("\n").slice(-12).join("\n"),
           };
           return false;
         }
@@ -796,6 +988,39 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     return undefined;
   }
 
+  /** `work`'s result, or null once `deadline` (epoch ms) passes first. The late result is ignored. */
+  private async withinDeadline<T>(work: Promise<T>, deadline: number): Promise<T | null> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), Math.max(0, deadline - Date.now())); });
+    try {
+      return await Promise.race([work, expired]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** A fork's own id at launch, from a verified child only (see {@link captureForkIdentity}). Polls for up
+   *  to `timeoutMs`, because a fork's record can appear well after the process starts. */
+  private async captureVerifiedForkId(binding: NodeBinding, updatePrompt: UpdatePromptAttempt, parentId: string,
+    timeoutMs: number): Promise<string | undefined> {
+    const deadline = Date.now() + timeoutMs;
+    const attempts = Math.max(1, Math.ceil(timeoutMs / 250));
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (attempt > 0 && Date.now() >= deadline) break;
+      // Each attempt may wait on a home probe; bound it by the time left, so a stuck probe ends in attention on time.
+      const identity = await this.withinDeadline(this.captureForkIdentity(binding, parentId), deadline);
+      if (identity) return identity.resumeToken;
+      if (binding.tmuxSession) {
+        await this.dismissSkippableCodexUpdatePrompt(binding.tmuxSession, updatePrompt, 1);
+        if (updatePrompt.failure) return undefined;
+      }
+      const remaining = Math.min(250, deadline - Date.now());
+      if (remaining <= 0) break;
+      await this.sleep(remaining);
+    }
+    return undefined;
+  }
+
   private async verifyResumeLaunch(tmuxSession: string, updatePrompt: UpdatePromptAttempt, opts?: { resumeToken?: string }): Promise<HarnessLaunchResult> {
     const quickAttempts = 6;
     const extendedAttempts = 24;
@@ -814,6 +1039,17 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     // within the quick window. Only the awaiting_runtime boot case extends.
     let lastUnresolved: NativeResumeProbeResult | null = null;
     let lastPaneContent = "";
+    // Reporting only: the newest screen observed, in capture order (the loop's own capture, then the update helper's
+    // later ones in the same iteration), so the result names what was seen last. A resumed or booting screen replaces an
+    // older gate. The loop's decisions keep using lastUnresolved.
+    let report: { probe: NativeResumeProbeResult; paneContent: string; beforeInput?: true } | null = null;
+    // Reporting only: what this verification typed into the pane (only the update helper ever types here).
+    const verifierInput = (): "none" | "update_skip_key_sent" | "update_skip_key_failed" =>
+      updatePrompt.skipKey === "sent" ? "update_skip_key_sent" : updatePrompt.skipKey === "failed" ? "update_skip_key_failed" : "none";
+    const gateFields = (p: NativeResumeProbeResult, pane: string) => ({
+      ...(p.code ? { gate: p.code } : {}),
+      ...(p.code === "update_gate" ? { gateChoice: isSkippableCodexUpdatePrompt(pane) } : {}),
+    });
     let sawRealGate = false;
 
     const totalAttempts = quickAttempts + extendedAttempts;
@@ -839,6 +1075,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           ok: false,
           error: "Codex resume failed: no saved session found for the requested session",
           recovery: "retry_fresh",
+          missingConversation: true,
         };
       }
 
@@ -859,6 +1096,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           ok: false,
           error: probe.detail,
           recovery: "attention_required",
+          ...gateFields(probe, paneContent),
+          verifierInput: verifierInput(),
           evidence: paneContent.split("\n").slice(-12).join("\n"),
         };
       }
@@ -871,8 +1110,13 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         };
       }
 
+      report = { probe, paneContent }; // resumed returned above, so this screen is unresolved
       if (probe.code === "update_gate") {
+        updatePrompt.observed = undefined;
         const dismissed = await this.dismissSkippableCodexUpdatePrompt(tmuxSession, updatePrompt, 1);
+        // The helper's own captures came after this one: report its newest, whatever it showed.
+        const helperSaw = helperObservation(updatePrompt);
+        if (helperSaw) report = helperSaw;
         if (updatePrompt.failure) return updatePrompt.failure;
         if (dismissed) {
           lastUnresolved = null;
@@ -894,12 +1138,23 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       if (attempt < totalAttempts - 1) await this.sleep(sleepMs);
     }
 
+    // Report the newest screen observed; a resumed or booting one names no gate. The loop's own decisions above used
+    // lastUnresolved. The text follows the newest screen too, so an older gate's text never stands for a newer screen.
+    const shown = report && report.probe.status !== "resumed" && report.probe.code !== "awaiting_runtime" ? report : null;
+    const newestText = shown ? shown.probe.detail
+      : report?.probe.status === "resumed" ? "Codex resume could not be confirmed: the last screen observed looked ready, but the resume check ended before proving a restored conversation."
+        : report ? report.probe.detail
+          : lastUnresolved?.detail;
     return {
       ok: false,
-      error: lastUnresolved?.detail
+      error: newestText
         ?? "Codex resume could not be confirmed: the process is alive but a restored conversation was never proven.",
       recovery: "attention_required",
-      evidence: lastPaneContent.split("\n").slice(-12).join("\n"),
+      // The gate on that screen, if any. A boot still in progress names no gate.
+      ...(shown ? gateFields(shown.probe, shown.paneContent) : {}),
+      ...(shown?.beforeInput ? { screenBeforeInput: true as const } : {}),
+      verifierInput: verifierInput(),
+      evidence: (report?.paneContent ?? lastPaneContent).split("\n").slice(-12).join("\n"),
     };
   }
 
@@ -1109,30 +1364,6 @@ export function upsertCodexHookTrust(content: string, key: string, hash: string)
   return `${lines.join("\n").replace(/\n*$/, "\n")}`;
 }
 
-function parseCanonicalSessionName(sessionName: string): { pod: string; member: string; rig: string } | null {
-  // OPR.0.4.6.MH1 FR-8: the member/rig split rides the shared parse
-  // contract. A multi-@ name now parses with a greedy rig ("rig@x"),
-  // which isSafeQueueSegment rejects ("@" is unsafe) — the same null this
-  // site returned via its old single-@ check.
-  const trimmed = sessionName.trim();
-  const parsed = parseSessionName(trimmed);
-  if (parsed.kind !== "canonical") return null;
-
-  const rig = parsed.rig;
-  const separatorIndex = parsed.member.indexOf("-");
-  if (separatorIndex <= 0 || separatorIndex === parsed.member.length - 1) return null;
-
-  const pod = parsed.member.slice(0, separatorIndex);
-  const member = parsed.member.slice(separatorIndex + 1);
-  if (!isSafeQueueSegment(pod) || !isSafeQueueSegment(member) || !isSafeQueueSegment(rig)) return null;
-
-  return { pod, member, rig };
-}
-
-function isSafeQueueSegment(segment: string): boolean {
-  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(segment);
-}
-
 export function isCodex013xOrLater(version: string): boolean {
   const match = /^(\d+)\.(\d+)/.exec(version);
   if (!match) return false;
@@ -1226,7 +1457,7 @@ function upsertCodexActivityHooks(content: string, relayPath: string): string {
     "m"
   );
   if (pattern.test(next)) {
-    return next.replace(pattern, block);
+    return next.replace(pattern, () => block); // literal: a string would expand `$` patterns in the path
   }
   const prefix = next.replace(/\n*$/, "");
   return prefix.length > 0 ? `${prefix}\n\n${block}` : block;
@@ -1474,7 +1705,7 @@ function upsertManagedCodexConfigFragment(content: string, id: string, fragment:
   const block = `${start}\n${kept}\n${end}\n`;
 
   if (pattern.test(content)) {
-    return content.replace(pattern, block);
+    return content.replace(pattern, () => block); // literal: a string would expand `$` patterns in the fragment
   }
 
   const prefix = content.replace(/\n*$/, "");
@@ -1559,7 +1790,12 @@ function commandLooksLikeCodex(command: string): boolean {
   });
 }
 
+/** The update helper's latest capture, read through a function so flow narrowing doesn't hide the helper's write. */
+function helperObservation(attempt: UpdatePromptAttempt): UpdatePromptAttempt["observed"] {
+  return attempt.observed;
+}
+
 function isSkippableCodexUpdatePrompt(paneContent: string): boolean {
-  return paneContent.includes("Update available!")
+  return hasCodexUpdateHeader(paneContent)
     && /^\s*[›>]?\s*3\. Skip until next version\s*$/m.test(paneContent);
 }

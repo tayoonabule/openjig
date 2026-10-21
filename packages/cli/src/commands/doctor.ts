@@ -17,6 +17,7 @@ import { buildTmuxControlFailure, probeTmuxControl } from "../tmux-health.js";
 import { parse as parseYaml } from "yaml";
 import { compareSpecToLive, topologyFromRigSpec, topologyFromLiveLogicalIds } from "@openrig/daemon/spec-conformance";
 import { classifyNodeVersion } from "../node-support.js";
+import { checkProviderReadiness } from "../provider-auth.js";
 
 interface DoctorCheck {
   name: string;
@@ -34,6 +35,8 @@ export interface DoctorDeps {
   checkPort: (port: number, host: string) => Promise<boolean>;
   configStore: Pick<ConfigStore, "resolve">;
   platform?: NodeJS.Platform;
+  /** Same CODEX_HOME and credential environment used by setup. */
+  env?: NodeJS.ProcessEnv;
   mkdirp?: (path: string) => void;
   checkWritable?: (path: string) => void;
   fetch?: (url: string) => Promise<{ ok: boolean; json?: () => Promise<unknown> }>;
@@ -51,6 +54,7 @@ export interface DoctorDeps {
 }
 
 const DEFAULT_PORT = 7433;
+const CMUX_SOCKET_CONTROL_FIX = 'In cmux Settings > Automation, select "Automation mode" for Socket Control Mode, or set automation.socketControlMode to "automation" in ~/.config/cmux/cmux.json (older versions use ~/.config/cmux/settings.json; current cmux reads that legacy file only for keys absent from cmux.json). cmux reloads saved settings automatically; rerun `rig doctor` to re-probe without restarting the daemon.';
 
 function defaultCheckPort(port: number, host: string): Promise<boolean> {
   return new Promise((resolve) => {
@@ -63,8 +67,8 @@ function defaultCheckPort(port: number, host: string): Promise<boolean> {
   });
 }
 
-export function runDoctorChecks(deps: DoctorDeps): { checks: DoctorCheck[]; portCheck: Promise<DoctorCheck>; asyncChecks: Promise<DoctorCheck>[] } {
-  const checks: DoctorCheck[] = [];
+export function runDoctorChecks(deps: DoctorDeps, providerChecks: DoctorCheck[] = checkProviderReadiness(deps)): { checks: DoctorCheck[]; portCheck: Promise<DoctorCheck>; asyncChecks: Promise<DoctorCheck>[] } {
+  const checks: DoctorCheck[] = [...providerChecks];
   const platform = deps.platform ?? process.platform;
 
   // 1. Daemon dist
@@ -170,9 +174,9 @@ export function runDoctorChecks(deps: DoctorDeps): { checks: DoctorCheck[]; port
       const modeHint = socketMode?.error
         ? ` Likely cause on macOS: ${CMUX_SETTINGS_DISCLOSURE_PATH} is unreadable (${socketMode.error}).`
         : socketMode && !isCmuxSocketControlCompatible(socketMode.mode) && socketMode.source === "default"
-        ? ` Likely cause on macOS: cmux is still using its default automation.socketControlMode '${socketMode.mode}'.`
+        ? ` ${CMUX_SETTINGS_DISCLOSURE_PATH} doesn't set automation.socketControlMode, so this check assumes cmux's default '${socketMode.mode}' (it doesn't read ~/.config/cmux/cmux.json). ${CMUX_SOCKET_CONTROL_FIX}`
         : socketMode && !isCmuxSocketControlCompatible(socketMode.mode)
-        ? ` Likely cause on macOS: automation.socketControlMode is '${socketMode.mode}' in ${CMUX_SETTINGS_DISCLOSURE_PATH}.`
+        ? ` Likely cause on macOS: automation.socketControlMode is '${socketMode.mode}' in ${CMUX_SETTINGS_DISCLOSURE_PATH}. ${CMUX_SOCKET_CONTROL_FIX}`
         : "";
       checks.push({
         name: "cmux_shell",
@@ -349,20 +353,20 @@ function buildCmuxDaemonWarning(deps: DoctorDeps, platform: NodeJS.Platform): Do
       status: "warn",
       message: "Shell cmux works, but the daemon cannot control cmux.",
       reason: `${CMUX_SETTINGS_DISCLOSURE_PATH} is unreadable: ${socketMode.error}`,
-      fix: `Repair ${CMUX_SETTINGS_DISCLOSURE_PATH} or remove it so cmux can regenerate the template, then rerun \`rig setup\` or \`rig doctor\`.`,
+      fix: `Repair JSON in ${CMUX_SETTINGS_DISCLOSURE_PATH}; on current cmux, also check ~/.config/cmux/cmux.json (the primary settings file). Save and rerun \`rig doctor\`; cmux reloads saved settings automatically and this check re-probes without a daemon restart.`,
     };
   }
 
   if (platform === "darwin" && socketMode && !isCmuxSocketControlCompatible(socketMode.mode)) {
     const reason = socketMode.source === "default"
-      ? `cmux is still using its default automation.socketControlMode '${socketMode.mode}', so the daemon cannot attach as an external cmux client yet.`
+      ? `${CMUX_SETTINGS_DISCLOSURE_PATH} doesn't set automation.socketControlMode, so this check assumes cmux's default '${socketMode.mode}' (it doesn't read ~/.config/cmux/cmux.json).`
       : `automation.socketControlMode is '${socketMode.mode}' in ${CMUX_SETTINGS_DISCLOSURE_PATH}, so the daemon cannot attach as an external cmux client yet.`;
     return {
       name: "cmux_daemon",
       status: "warn",
       message: "Shell cmux works, but the daemon cannot control cmux.",
       reason,
-      fix: `Run \`rig setup\` to set automation.socketControlMode to "automation" in ${CMUX_SETTINGS_DISCLOSURE_PATH}, then restart the daemon with \`rig daemon start\`.`,
+      fix: CMUX_SOCKET_CONTROL_FIX,
     };
   }
 
@@ -370,8 +374,8 @@ function buildCmuxDaemonWarning(deps: DoctorDeps, platform: NodeJS.Platform): Do
     name: "cmux_daemon",
     status: "warn",
     message: "Shell cmux works, but the daemon cannot control cmux.",
-    reason: "The daemon inherited a terminal/session environment that broke cmux adapter initialization.",
-    fix: "Restart the daemon with `rig daemon start` after setup. If it still fails, inspect the daemon log with `rig daemon logs`.",
+    reason: "The cmux control probe failed in the daemon, although it succeeded in this shell.",
+    fix: "Check that cmux is running and allows this user to control it, then rerun `rig doctor` to re-probe. If it still fails, inspect the daemon log with `rig daemon logs`.",
   };
 }
 
@@ -386,7 +390,9 @@ function readTmuxMouseMode(deps: DoctorDeps): "on" | "off" | null {
 }
 
 export function doctorCommand(depsOverride?: DoctorDeps): Command {
-  const cmd = new Command("doctor").description("Verify OpenRig install health");
+  const cmd = new Command("doctor")
+    .description("Check installation, provider authentication, writable paths, port/daemon and conditional cmux control")
+    .addHelpText("after", "\nWith --spec, compares declared and live topology. This is not an end-to-end readiness check.\nReports Claude and Codex authentication using setup's checks, including configured Codex credential variables. No agent task or provider request is tested.\nInspect your team with rig ps --nodes --rig <rig> and rig capture <seat> --lines 30.");
 
   cmd
     .option("--json", "JSON output for agents")
@@ -423,7 +429,12 @@ export function doctorCommand(depsOverride?: DoctorDeps): Command {
         },
       };
 
-      const { checks, asyncChecks } = runDoctorChecks(deps);
+      // Only the newly added provider probes inherit setup's timeout.
+      const providerChecks = checkProviderReadiness(depsOverride ?? {
+        ...deps,
+        exec: (c: string) => execSync(c, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"], timeout: 30_000 }),
+      });
+      const { checks, asyncChecks } = runDoctorChecks(deps, providerChecks);
       const resolvedAsync = await Promise.all(asyncChecks);
       const allChecks = [...checks, ...resolvedAsync];
       const healthy = allChecks.every((c) => c.status !== "fail");
@@ -442,7 +453,11 @@ export function doctorCommand(depsOverride?: DoctorDeps): Command {
       }
 
       console.log("");
-      console.log(healthy ? "System checks look good." : "Some checks failed.");
+      console.log(healthy ? "No failures in the checks above. Review any WARN or SKIP rows." : "Some checks failed. Review the FAIL rows and their fixes above.");
+      console.log("Authentication checks report local provider facts; no agent task or provider request was tested.");
+      console.log("Only the harnesses selected for your project need a login; an unused harness does not.");
+      console.log("A credential variable being set does not prove the provider accepts it or that managed seats receive it.");
+      console.log("Inspect your team with `rig ps --nodes --rig <rig>` and `rig capture <seat> --lines 30`.");
       if (!healthy) process.exitCode = 1;
     });
 

@@ -9,6 +9,8 @@ import { describe, it, expect, vi } from "vitest";
 import type { TmuxAdapter, TmuxResult } from "../src/adapters/tmux.js";
 import { PiRuntimeAdapter, type PiAdapterFsOps } from "../src/adapters/pi-runtime-adapter.js";
 import { PiResumeAdapter } from "../src/adapters/pi-resume.js";
+import { OmpResumeAdapter } from "../src/adapters/omp-resume.js";
+import { OmpRuntimeAdapter } from "../src/adapters/omp-runtime-adapter.js";
 import {
   piSeatPaths, buildPiRunnerCommand, buildPiChildArgs, buildPiChildEnv,
   providerFromModel, parsePiRunnerState, buildPendingRunnerState, PI_RUNNER_READY_MARKER,
@@ -165,7 +167,7 @@ describe("buildPiChildEnv — deny-by-default allowlist (BR-3)", () => {
     PATH: "/usr/bin", HOME: "/home/seat", TERM: "xterm",
     AWS_SECRET_ACCESS_KEY: "leak-me", OPENRIG_ACTIVITY_HOOK_TOKEN: "secret",
     GITHUB_TOKEN: "leak-me-too", ZAI_API_KEY: "zai-key", KIMI_API_KEY: "kimi-key",
-    OPENROUTER_API_KEY: "or-key",
+    OPENROUTER_API_KEY: "or-key", MINIMAX_API_KEY: "minimax-key",
   };
 
   it("preserves managed identity and instance/context provenance, not ambient OpenRig settings", () => {
@@ -186,6 +188,7 @@ describe("buildPiChildEnv — deny-by-default allowlist (BR-3)", () => {
     expect(env.OPENROUTER_API_KEY).toBe("or-key");
     for (const name of ["OPENRIG_UNREVIEWED_SETTING", "OPENRIG_TERMINAL_BEARER_TOKEN",
       "OPENRIG_ACTIVITY_HOOK_TOKEN", "OPENAI_API_KEY", "ZAI_API_KEY", "KIMI_API_KEY",
+      "MINIMAX_API_KEY",
       "BASH_ENV", "ENV", "NODE_OPTIONS", "TMUX", "TMUX_PANE", "RIGGED_SESSION_NAME"]) {
       expect(env).not.toHaveProperty(name);
     }
@@ -216,10 +219,18 @@ describe("buildPiChildEnv — deny-by-default allowlist (BR-3)", () => {
     expect(env.ZAI_API_KEY).toBe("zai-key");
     expect(env).not.toHaveProperty("KIMI_API_KEY");
     expect(env).not.toHaveProperty("OPENROUTER_API_KEY");
+    expect(env).not.toHaveProperty("MINIMAX_API_KEY");
 
     const kimi = buildPiChildEnv(source, { agentDir: "/a", sessionsDir: "/s", model: "kimi-coding/k2p7" });
     expect(kimi.KIMI_API_KEY).toBe("kimi-key");
     expect(kimi).not.toHaveProperty("ZAI_API_KEY");
+    expect(kimi).not.toHaveProperty("MINIMAX_API_KEY");
+
+    const minimax = buildPiChildEnv(source, { agentDir: "/a", sessionsDir: "/s", model: "minimax/MiniMax-M3" });
+    expect(minimax.MINIMAX_API_KEY).toBe("minimax-key");
+    expect(minimax).not.toHaveProperty("ZAI_API_KEY");
+    expect(minimax).not.toHaveProperty("KIMI_API_KEY");
+    expect(minimax).not.toHaveProperty("OPENROUTER_API_KEY");
   });
 
   it("openrouter passes only OPENROUTER_API_KEY", () => {
@@ -227,6 +238,14 @@ describe("buildPiChildEnv — deny-by-default allowlist (BR-3)", () => {
     expect(env.OPENROUTER_API_KEY).toBe("or-key");
     expect(env).not.toHaveProperty("ZAI_API_KEY");
     expect(env).not.toHaveProperty("KIMI_API_KEY");
+  });
+
+  it("minimax passes only MINIMAX_API_KEY", () => {
+    const env = buildPiChildEnv(source, { agentDir: "/a", sessionsDir: "/s", model: "minimax/MiniMax-M3" });
+    expect(env.MINIMAX_API_KEY).toBe("minimax-key");
+    expect(env).not.toHaveProperty("ZAI_API_KEY");
+    expect(env).not.toHaveProperty("KIMI_API_KEY");
+    expect(env).not.toHaveProperty("OPENROUTER_API_KEY");
   });
 
   it("unknown/custom providers get no ambient key passthrough (models.json is their path)", () => {
@@ -258,6 +277,55 @@ describe("PiRuntimeAdapter.launchHarness", () => {
     // Seat isolation dirs were created.
     expect(fs.dirs.has(piSeatPaths(STATE_ROOT, SESSION).agentDir)).toBe(true);
     expect(fs.dirs.has(piSeatPaths(STATE_ROOT, SESSION).sessionsDir)).toBe(true);
+  });
+
+  it("passes the seat's effort as --thinking for Pi; no effort => no flag; OMP never", async () => {
+    const run = async (Adapter: typeof PiRuntimeAdapter, effort?: string) => {
+      const fs = memFs();
+      const sendShellCommand = vi.fn(async (_t: string, text: string) => {
+        fs.files[piSeatPaths(STATE_ROOT, SESSION).runnerStatePath] = readyState(SESSION_FILE, launchIdFrom(text));
+        return { ok: true as const };
+      });
+      const adapter = new Adapter({ tmux: mockTmux({ sendShellCommand }), fsOps: fs, stateRoot: STATE_ROOT, runnerEntryPath: RUNNER, sleep: async () => {} });
+      expect((await adapter.launchHarness({ ...(binding as object), effort } as never, { name: SESSION })).ok).toBe(true);
+      return sendShellCommand.mock.calls[0]![1] as string;
+    };
+    expect(await run(PiRuntimeAdapter, "high")).toContain("--model 'zai/glm-5.2' --thinking 'high'");
+    expect(await run(PiRuntimeAdapter)).not.toContain("--thinking");
+    expect(await run(OmpRuntimeAdapter as never, "high")).not.toContain("--thinking");
+  });
+
+  it("OPR.0.7.0.2: --usage-facts only while usage.pi_cost_facts is on, read at each launch; off by default", async () => {
+    let enabled = false;
+    const commands: string[] = [];
+    for (const deps of [{}, { usageFactsEnabled: () => enabled }, { usageFactsEnabled: () => enabled }]) {
+      const fs = memFs();
+      const sendShellCommand = vi.fn(async (_t: string, text: string) => {
+        fs.files[piSeatPaths(STATE_ROOT, SESSION).runnerStatePath] = readyState(SESSION_FILE, launchIdFrom(text));
+        commands.push(text);
+        return { ok: true as const };
+      });
+      const adapter = new PiRuntimeAdapter({ tmux: mockTmux({ sendShellCommand }), fsOps: fs, stateRoot: STATE_ROOT, runnerEntryPath: RUNNER, sleep: async () => {}, ...deps });
+      expect((await adapter.launchHarness(binding, { name: SESSION })).ok).toBe(true);
+      enabled = commands.length >= 2; // switched on before the third launch, which reads it again
+    }
+    expect(commands.map((c) => c.includes("--usage-facts"))).toEqual([false, false, true]);
+  });
+
+  it("OPR.0.7.0.2 K4: --openrouter-charge only with usage facts on too, read at each launch; off by default", async () => {
+    const settings = [{ facts: false, charge: true }, { facts: true, charge: false }, { facts: true, charge: true }];
+    const commands: string[] = [];
+    for (const deps of [{}, ...settings.map((x) => ({ usageFactsEnabled: () => x.facts, openRouterChargeEnabled: () => x.charge }))]) {
+      const fs = memFs();
+      const sendShellCommand = vi.fn(async (_t: string, text: string) => {
+        fs.files[piSeatPaths(STATE_ROOT, SESSION).runnerStatePath] = readyState(SESSION_FILE, launchIdFrom(text));
+        commands.push(text);
+        return { ok: true as const };
+      });
+      const adapter = new PiRuntimeAdapter({ tmux: mockTmux({ sendShellCommand }), fsOps: fs, stateRoot: STATE_ROOT, runnerEntryPath: RUNNER, sleep: async () => {}, ...deps });
+      expect((await adapter.launchHarness(binding, { name: SESSION })).ok).toBe(true);
+    }
+    expect(commands.map((c) => c.includes("--openrouter-charge"))).toEqual([false, false, false, true]);
   });
 
   it("explicit approve posture is honored end-to-end", async () => {
@@ -444,6 +512,25 @@ describe("PiResumeAdapter", () => {
     const a = resumeAdapter(fs, mockTmux({ sendShellCommand }));
     const result = await a.resume(SESSION, "pi_session_file", SESSION_FILE, "/work");
     expect(result).toEqual({ ok: true, appliedLaunch: PI_FLOOR_EFFECT });
+  });
+
+  it("resume passes effort as --thinking for Pi; none without; OMP never", async () => {
+    const run = async (make: (fs: ReturnType<typeof memFs>, tmux: TmuxAdapter) => PiResumeAdapter, type: string, effort?: string | null) => {
+      const fs = memFs({ [SESSION_FILE]: "jsonl" });
+      const sendShellCommand = vi.fn(async (_t: string, text: string) => {
+        fs.files[piSeatPaths(STATE_ROOT, SESSION).runnerStatePath] = readyState(SESSION_FILE, launchIdFrom(text));
+        return { ok: true as const };
+      });
+      const result = await make(fs, mockTmux({ sendShellCommand })).resume(SESSION, type, SESSION_FILE, "/work", "zai/glm", undefined, effort);
+      expect(result.ok).toBe(true);
+      return sendShellCommand.mock.calls[0]![1] as string;
+    };
+    const omp = (fs: ReturnType<typeof memFs>, tmux: TmuxAdapter) =>
+      new OmpResumeAdapter(tmux, fs, { stateRoot: STATE_ROOT, runnerEntryPath: RUNNER }, { pollMs: 1, maxWaitMs: 5, sleep: async () => {} });
+    expect(await run(resumeAdapter, "pi_session_file", "high")).toContain("--model 'zai/glm' --thinking 'high' --session");
+    expect(await run(resumeAdapter, "pi_session_file")).not.toContain("--thinking");
+    expect(await run(resumeAdapter, "pi_session_file", null)).not.toContain("--thinking");
+    expect(await run(omp, "omp_session_file", "high")).not.toContain("--thinking");
   });
 
   it("fails honestly when the runner reports a DIFFERENT session file than requested", async () => {

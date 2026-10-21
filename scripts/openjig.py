@@ -16,6 +16,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 
 DAEMON = os.environ.get("OPENRIG_URL", "http://127.0.0.1:7433").rstrip("/")
@@ -84,10 +85,24 @@ def projects():
 
 
 def herdr_workspace(rig):
-    """The rig's workspace, keyed by its tab label (the sidebar shows just the rig name)."""
+    """The rig's workspace: the daemon's managed space (named after the rig), else an older
+    `rig terminal open` space keyed by its tab label."""
+    spaces = herdr_json(["workspace", "list"]).get("workspaces") or []
+    named = next((w for w in spaces if w.get("label") == rig), None)
+    if named:
+        return named
     key = f"openrig:rig:{rig}#"
-    rows = (herdr_json(["tab", "list"]).get("tabs") or []) + (herdr_json(["workspace", "list"]).get("workspaces") or [])
+    rows = (herdr_json(["tab", "list"]).get("tabs") or []) + spaces
     return next((r for r in rows if (r.get("label") or "").startswith(key)), None)
+
+
+def managed_views_on():
+    """The daemon keeps one Herdr space per running rig itself (lead tab plus a tab per pod)."""
+    try:
+        with urllib.request.urlopen(DAEMON + "/api/terminal/managed-views", timeout=3) as resp:
+            return bool(json.load(resp).get("enabled"))
+    except Exception:
+        return False
 
 
 def rig_by_name(name):
@@ -122,8 +137,8 @@ def reset_scroll_mode():
 def focus_talk_pane(workspace):
     """Put the cursor in the seat you talk to: the kernel's operator.agent, else the rig's first agent."""
     panes = herdr_json(["pane", "list", "--workspace", workspace]).get("panes") or []
-    agents = [p for p in panes if p.get("label") not in ("mission control", "operator.human")]
-    pick = next((p for p in agents if p.get("label") == "operator.agent"), agents[0] if agents else None)
+    agents = [p for p in panes if p.get("label") not in ("mission control", "operator.human", "operator-human")]
+    pick = next((p for p in agents if p.get("label") in ("operator.agent", "operator-agent")), agents[0] if agents else None)
     if pick:
         subprocess.run(["herdr", "agent", "focus", pick["pane_id"]], capture_output=True)
 
@@ -238,8 +253,13 @@ def show_in_herdr(rig=None):
     """Give each running rig a Herdr workspace with mission control, jump to `rig`, attach Herdr."""
     reset_scroll_mode()
     ensure_kernel()
+    managed = managed_views_on()
     for r in rigs():
         if r.get("status") != "running":
+            continue
+        if managed:
+            # The daemon owns these spaces. Opening or splitting into them here is what made a
+            # second space per rig and stalled the daemon's view ("human pane, retained").
             continue
         w = herdr_workspace(r["name"])
         if not w or missing_tiles(r["name"], w["workspace_id"]):
@@ -252,6 +272,9 @@ def show_in_herdr(rig=None):
             add_mission_control(w["workspace_id"])
     # With no rig named, land on the kernel: its operator.human tile is mission control.
     target = herdr_workspace(rig or "kernel")
+    for _ in range(10 if managed and not target else 0):  # a just-started rig: the daemon adds its space within seconds
+        time.sleep(1)
+        target = herdr_workspace(rig or "kernel")
     if target:
         subprocess.run(["herdr", "workspace", "focus", target["workspace_id"]], capture_output=True)
         focus_talk_pane(target["workspace_id"])

@@ -87,6 +87,11 @@ export const HERDR_PANES_UNCONFIRMED_NOTE = "herdr's pane list couldn't confirm 
 
 const normalLabel = (label: string): string => label.trim().replace(/\s+/g, " ");
 
+/** Sidebar name for a view: the rig name for `rig:<name>`, the view id otherwise. */
+export function readableWorkspaceLabel(viewId: string): string {
+  return viewId.startsWith("rig:") ? viewId.slice("rig:".length) : viewId;
+}
+
 /** A listed label matches a composed one exactly, or as a prefix (a truncated label, with or without a trailing ellipsis). */
 function labelMatches(listed: string, composed: string): boolean {
   const shown = normalLabel(listed).replace(/(…|\.\.\.)$/, "").trimEnd();
@@ -212,8 +217,8 @@ function herdrPaneCommand(pane: ComposedPane): string {
 }
 
 /**
- * Build the EQUAL auto-grid layout tree for one page of panes. PURE. The grid
- * shape matches the UI TerminalLauncher `suggestLayout` exactly —
+ * Build an equal grid for one page. Explicit columns are capped to its pane
+ * count, as in cmux; otherwise use the UI TerminalLauncher `suggestLayout` —
  * cols = ceil(sqrt(N)), rows = ceil(N/cols): N=2 → 2×1, N=5 → 3×2, N=7 → 3×3
  * (cols×rows). An incomplete rectangle is padded with inert blank panes so
  * every cell is the same size; blanks are layout filler only — they are never
@@ -223,8 +228,8 @@ function herdrPaneCommand(pane: ComposedPane): string {
  * hint. Rows are built as equal `right` strips,
  * then combined with equal `down` strips.
  */
-export function buildGridRoot(panes: ComposedPane[]): { root: HerdrLayoutNode; blanks: number; columns: number; rows: number } {
-  const cols = autoGridCols(panes.length);
+export function buildGridRoot(panes: ComposedPane[], columns?: number): { root: HerdrLayoutNode; blanks: number; columns: number; rows: number } {
+  const cols = Math.min(columns ?? autoGridCols(panes.length), panes.length || 1);
   const rows = Math.ceil(panes.length / cols);
   const blanks = rows * cols - panes.length;
   const leaves: HerdrLayoutNode[] = panes.map((pane) => ({
@@ -259,14 +264,14 @@ export interface HerdrLayoutPlan {
   pages: HerdrPagePlan[];
 }
 
-/** Sidebar name for a view: the rig name for `rig:<name>`, the view id otherwise. */
-export function readableWorkspaceLabel(viewId: string): string {
-  return viewId.startsWith("rig:") ? viewId.slice("rig:".length) : viewId;
+/** A named view's tab: its panes' names in reading order, such as "dashboard · operator". */
+export function namedTabLabel(page: ComposedPane[]): string {
+  return page.map((pane) => pane.label).join(" · ");
 }
 
 /**
  * Build the herdr socket plan for a composed view. PURE — no I/O. Each page
- * gets a fresh tab labeled `${tabPrefix}:${view.id}#${launchToken}/<pageIndex>`;
+ * gets a fresh tab labeled `${tabPrefix}:${view.id}#<plan>#${launchToken}/<pageIndex>`;
  * two calls with different `launchToken`s produce DIFFERENT labels, which is
  * exactly the fresh-tab-on-relaunch (not-replace) invariant.
  */
@@ -275,14 +280,16 @@ export function planHerdrLayout(
   launchToken: string,
   tabPrefix: string = "openrig",
 ): HerdrLayoutPlan {
-  const base = `${tabPrefix}:${view.id}#${launchToken}`;
-  // The workspace is named for people: the rig name for a rig view, else the view id.
-  // Tab labels keep the launch token, so every open is still a fresh, distinct space.
-  const workspaceLabel = view.id.startsWith("rig:") ? view.id.slice("rig:".length) : view.id;
+  // Older callers without a preview fingerprint still get fresh, non-reusable tabs.
+  const base = `${tabPrefix}:${view.id}${view.planId ? `#${view.planId.slice(0, 16)}` : ""}#${launchToken}`;
+  // The workspace is named for people: a named view's own label, the rig name for a rig view, else the view id.
+  // Tab labels keep the launch token, so every open is still a fresh, distinct space. A named view's
+  // tabs carry their panes' names instead; the CLI confirms reuse by live attachments, not labels.
+  const workspaceLabel = view.spaceLabel ?? (view.id.startsWith("rig:") ? view.id.slice("rig:".length) : view.id);
   const pages: HerdrPagePlan[] = view.pages.map((page, pageIndex) => {
-    const grid = buildGridRoot(page);
+    const grid = buildGridRoot(page, view.columns);
     return {
-      tabLabel: view.pages.length > 1 ? `${base}/${pageIndex + 1}` : base,
+      tabLabel: view.spaceLabel ? namedTabLabel(page) : view.pages.length > 1 ? `${base}/${pageIndex + 1}` : base,
       root: grid.root,
       blanks: grid.blanks,
     };
@@ -317,6 +324,7 @@ export function extractWorkspaceId(result: HerdrResult): string | null {
 
 export interface HerdrAdapterDeps {
   transportFactory: HerdrTransportFactory;
+  launch?: ProviderStatus["launch"];
   /**
    * Mint a fresh launch token per `openView` so a relaunch creates a new tab
    * (BR-5). Injectable for deterministic tests. Default: a per-instance
@@ -327,6 +335,12 @@ export interface HerdrAdapterDeps {
   tabPrefix?: string;
   /** Optional best-effort external agent reporter for panes created by this adapter. */
   agentBridge?: Pick<HerdrAgentBridge, "registerLayout">;
+  /**
+   * The daemon's managed views, when on. They own each rig's space (named after the rig,
+   * a lead tab plus one tab per pod), so a rig view reconciles and focuses that space
+   * instead of building a second one beside it.
+   */
+  managedRigSpaces?: () => { reconcile(): Promise<void> } | undefined;
 }
 
 /** Herdr lays out 4×4 per tab (OPR.0.6.0.8); cmux keeps the composer default. */
@@ -374,6 +388,7 @@ export class HerdrAdapter implements TerminalProvider {
       const probe = await this.transport.probe();
       return {
         provider: this.name,
+        ...(this.deps.launch ? { launch: this.deps.launch } : {}),
         available: probe.alive,
         ...(probe.version ? { version: probe.version } : {}),
         // The socket answering ping IS the capability surface: layout.apply is
@@ -383,7 +398,7 @@ export class HerdrAdapter implements TerminalProvider {
       };
     } catch {
       // An unreachable socket (herdr not running) = honestly unavailable.
-      return { provider: this.name, available: false, capabilities: {} };
+      return { provider: this.name, available: false, capabilities: {}, ...(this.deps.launch ? { launch: this.deps.launch } : {}) };
     }
   }
 
@@ -419,6 +434,9 @@ export class HerdrAdapter implements TerminalProvider {
         code: "herdr_unavailable",
       };
     }
+
+    const managed = view.id.startsWith("rig:") ? this.deps.managedRigSpaces?.() : undefined;
+    if (managed) return this.openManagedRig(view, managed, { absent, degraded });
 
     const launchToken = this.newLaunchToken();
     const plan = planHerdrLayout(view, launchToken, this.tabPrefix);
@@ -683,5 +701,43 @@ export class HerdrAdapter implements TerminalProvider {
       degraded,
       pages,
     };
+  }
+
+  /**
+   * A rig view when managed views are on: bring the rig's one space up to date, focus it
+   * and report which seats have a tile. Never creates a workspace or adds a tab, because
+   * a second space (or a foreign tab) is exactly what stalls the managed views.
+   */
+  private async openManagedRig(
+    view: ComposedView,
+    managed: { reconcile(): Promise<void> },
+    carry: { absent: AbsentSeat[]; degraded: DegradedSeat[] },
+  ): Promise<OpenViewResult> {
+    const { absent, degraded } = carry;
+    const label = readableWorkspaceLabel(view.id);
+    const fail = (error: string): OpenViewResult => {
+      for (const pane of view.opened) degraded.push({ seat: pane.seat, host: HERDR_SURFACE_HOST, reason: error });
+      return { provider: this.name, ok: view.opened.length === 0, opened: [], absent, degraded, pages: 0, ...(view.opened.length ? { error, code: "herdr_workspace_failed" } : {}) };
+    };
+    await managed.reconcile().catch(() => undefined);
+    let workspaceId: string | undefined;
+    let tiled: Set<string>;
+    try {
+      const rows = ((await this.transport.request("workspace.list", {}))["workspaces"] as Array<{ workspace_id?: string; label?: string }> | undefined) ?? [];
+      workspaceId = rows.find((w) => w.label === label && w.workspace_id)?.workspace_id;
+      if (!workspaceId) return fail(`the daemon has not opened a Herdr space for ${label} yet; see GET /api/terminal/managed-views`);
+      await this.transport.request("workspace.focus", { workspace_id: workspaceId }).catch(() => undefined);
+      const panes = ((await this.transport.request("pane.list", { workspace_id: workspaceId }))["panes"] as Array<{ label?: string }> | undefined) ?? [];
+      tiled = new Set(panes.map((p) => p.label).filter((l): l is string => typeof l === "string"));
+    } catch (err) {
+      return fail(`herdr did not answer: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    // Managed tiles are labelled with the seat's session name before `@`.
+    const opened: string[] = [];
+    for (const pane of view.opened) {
+      if (tiled.has(pane.seat.split("@")[0]!) || tiled.has(pane.label)) opened.push(pane.seat);
+      else degraded.push({ seat: pane.seat, host: HERDR_SURFACE_HOST, reason: "no tile yet; the daemon adds it to the rig's space within about 10s" });
+    }
+    return { provider: this.name, ok: opened.length > 0 || view.opened.length === 0, opened, absent, degraded, pages: 0, notes: [`Focused the rig's managed space "${label}".`] };
   }
 }

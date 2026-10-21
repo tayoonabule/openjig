@@ -11,10 +11,35 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { spawnSync } = require("node:child_process");
+const { recordRefocusResult } = require("./refocus-health.cjs");
 
 const DEFAULT_THRESHOLD = 2_600_000;
 const FALSE_VALUES = new Set(["0", "false", "off", "no"]);
-const CONTENT_LOOKUP_TIMEOUT_MS = 2_000;
+// The issue report after a failed attempt gets this long once the attempt's lookups are done.
+const REPORT_MS = 1_500;
+// The hook's time budget. Both registrations allow this hook 60 s (hooks/claude.json, hooks/codex.json). With no budget
+// selected, every lookup keeps its fixed 2 s cap exactly as before. OPENRIG_REFOCUS_BUDGET_MS selects a longer one, up
+// to 52 s: each lookup's cap then scales with it and every lookup is also clipped to what's left of it, so a slow lookup
+// leaves an honest gap and the hook still ends well inside the outer bound.
+const DEFAULT_BUDGET_MS = 4_500;
+const MAX_BUDGET_MS = 52_000;
+const BUDGET_MS = (() => {
+  const value = Number(process.env.OPENRIG_REFOCUS_BUDGET_MS);
+  return Number.isFinite(value) && value > DEFAULT_BUDGET_MS ? Math.min(value, MAX_BUDGET_MS) : DEFAULT_BUDGET_MS;
+})();
+const SELECTED_BUDGET = BUDGET_MS !== DEFAULT_BUDGET_MS;
+const LOOKUP_CAP_MS = Math.round(2_000 * BUDGET_MS / DEFAULT_BUDGET_MS);
+const CONTENT_LOOKUP_TIMEOUT_MS = LOOKUP_CAP_MS;
+// With a selected budget, a lookup with less than this left is skipped and reported as a gap rather than started.
+const MIN_LOOKUP_MS = 250;
+const budgetLeftMs = () => Math.floor(BUDGET_MS - process.uptime() * 1_000);
+const contentReserveMs = () => (process.env.OPENRIG_REFOCUS_CONTENT_REF ? CONTENT_LOOKUP_TIMEOUT_MS : 0);
+// A lookup's timeout: its fixed cap by default; with a selected budget, its cap or what's left of the budget after the
+// later lookups' reserve, whichever is less.
+const lookupTimeout = (reserve = 0) => SELECTED_BUDGET ? Math.min(LOOKUP_CAP_MS, budgetLeftMs() - reserve) : LOOKUP_CAP_MS;
+// Normal managed restore advances on ~30 s polls with a 10 s idle wait.
+// A lost daemon stage must not suppress this occupant's refocus indefinitely.
+const MANAGED_RESTORE_HOLD_MS = 10 * 60_000;
 
 function runtime() {
   const index = process.argv.indexOf("--runtime");
@@ -42,10 +67,12 @@ const readStdin = () => new Promise((resolve) => {
 function readConfiguredContent(home) {
   const contentRef = process.env.OPENRIG_REFOCUS_CONTENT_REF || "";
   if (contentRef) {
+    const timeout = lookupTimeout();
+    if (timeout <= MIN_LOOKUP_MS) return { content: null, contentRef, failure: "no time left in the refocus budget" };
     const result = spawnSync("rig", ["context", "get", contentRef], {
       encoding: "utf8",
       env: process.env,
-      timeout: CONTENT_LOOKUP_TIMEOUT_MS,
+      timeout,
       maxBuffer: 16 * 1024 * 1024,
     });
     if (!result.error && result.status === 0 && result.stdout.trim()) {
@@ -98,10 +125,33 @@ function readConfiguredContent(home) {
 // current work, its basis travels to the trace script, which alone decides how to render it;
 // a failed or unreadable answer is passed as UNKNOWN. Never guess a work node here: a guess
 // would silently re-point the whole trace.
-function readQueueWhoami(timeout = 2_000) {
-  const result = spawnSync("rig", ["queue", "whoami", "--json"], {
+// OPR.0.7.0.12 — the work packet: the trace receives the daemon's labelled work candidates and
+// carries duties and notes as text. OPENRIG_REFOCUS_WORK_PACKET=1 turns it on and =0 off; unset, each
+// runtime's default below applies. A runtime defaults on only once a native run has shown the packet
+// reaching the agent and leading to the right next action; neither has yet. With it off, every path
+// below is unchanged.
+const WORK_PACKET_DEFAULT = { claude: false, codex: false };
+function workPacketEnabled() {
+  return enabled(process.env.OPENRIG_REFOCUS_WORK_PACKET, WORK_PACKET_DEFAULT[runtime()] === true);
+}
+
+function readQueueWhoami(timeout = lookupTimeout()) {
+  if (timeout <= MIN_LOOKUP_MS) return { unknown: "no time left in the refocus budget" };
+  const args = ["queue", "whoami", "--json", ...(workPacketEnabled() ? ["--work-candidates"] : [])];
+  let result = spawnSync("rig", args, {
     encoding: "utf8", env: process.env, timeout, maxBuffer: 16 * 1024 * 1024,
   });
+  // A rig CLI older than this hook rejects the flag. Ask again without it, inside what is left of
+  // the budget, so the role and the strict answer still arrive (just without candidates).
+  if (args.includes("--work-candidates") && !result.error && result.status !== 0
+    && /unknown option/i.test(`${result.stderr || ""}${result.stdout || ""}`)) {
+    const remaining = remainingLookupBudget();
+    if (remaining > 250) {
+      result = spawnSync("rig", ["queue", "whoami", "--json"], {
+        encoding: "utf8", env: process.env, timeout: remaining, maxBuffer: 16 * 1024 * 1024,
+      });
+    }
+  }
   if (result.error) return { unknown: `queue whoami failed: ${result.error.message}` };
   if (result.status !== 0 || !result.stdout || !result.stdout.trim()) {
     return { unknown: `queue whoami exited ${result.status ?? "without a status"} with no answer` };
@@ -124,7 +174,7 @@ function deriveWorkStart(lookup) {
 // retrying here would spend the same budget twice and cannot make absence trustworthy.
 function remainingLookupBudget() {
   const contentReserve = process.env.OPENRIG_REFOCUS_CONTENT_REF ? CONTENT_LOOKUP_TIMEOUT_MS : 0;
-  return Math.floor(Math.min(2_000, 4_500 - 2_000 - contentReserve - process.uptime() * 1_000));
+  return Math.floor(Math.min(LOOKUP_CAP_MS, BUDGET_MS - LOOKUP_CAP_MS - contentReserve - process.uptime() * 1_000));
 }
 
 function renderRole(result) {
@@ -152,10 +202,9 @@ function renderRole(result) {
 // read; a failed, malformed or skipped read sets nothing, so the script's own lookup runs
 // exactly as before. Only the two root fields are consumed and nothing from the config is logged.
 //
-// Both harnesses kill this hook at 5 s (hooks/claude.json, hooks/codex.json). The read gets only
-// what is left of a 4.5 s budget, counted from process start, after reserving python's 2 s and,
-// when a content ref is configured, the content lookup that runs after python; with 250 ms or
-// less left it is skipped, so the read never pushes a fire main would deliver past the kill.
+// The read gets only what is left of the hook's budget (4.5 s by default), counted from process
+// start, after reserving python's cap and, when a content ref is configured, the content lookup
+// that runs after python; with 250 ms or less left it is skipped.
 function traceEnv(trees) {
   const env = { ...process.env };
   const missing = [
@@ -188,6 +237,7 @@ function renderTrace() {
     script,
     "--trees", trees,
     "--depth", process.env.OPENRIG_REFOCUS_DEPTH || "light",
+    "--check",
   ];
   if (process.env.OPENRIG_REFOCUS_TOPOLOGY_NODE) {
     args.push("--topology-start", process.env.OPENRIG_REFOCUS_TOPOLOGY_NODE);
@@ -203,28 +253,91 @@ function renderTrace() {
     }
     role = renderRole(whoami);
   }
-  if (work.start) args.push("--work-start", work.start);
+  const packet = workPacketEnabled();
+  let evidence = null;
+  if (packet) {
+    args.push("--packet");
+    if (trees !== "topology") {
+      if (!whoami) {
+        const timeout = remainingLookupBudget();
+        whoami = timeout > 250 ? readQueueWhoami(timeout) : { unknown: "no budget left" };
+      }
+      const candidates = whoami.answer?.workCandidates;
+      if (candidates && typeof candidates === "object") evidence = JSON.stringify(candidates);
+    }
+  }
+  // An explicit start always wins. Otherwise the candidates replace the strict answer: the
+  // strict node ignores mission-only rows, so it could hide a second mission in flight.
+  const explicitStart = Boolean(process.env.OPENRIG_REFOCUS_WORK_NODE);
+  if (work.start && (explicitStart || !evidence)) args.push("--work-start", work.start);
+  else if (evidence) args.push("--work-candidates", "-");
   else if (work.basis) args.push("--work-basis", work.basis);
   else if (work.unknown) args.push("--work-unknown", work.unknown);
-  const result = spawnSync(process.env.PYTHON || "python3", args, {
-    encoding: "utf8",
-    env: traceEnv(trees),
-    timeout: 2_000,
-    maxBuffer: 16 * 1024 * 1024,
-  });
+  // With an explicit start, the evidence supplies only held and next work.
+  if (explicitStart && evidence) args.push("--work-candidates", "-");
+  const env = traceEnv(trees);
+  const timeout = lookupTimeout(contentReserveMs());
+  const result = timeout <= MIN_LOOKUP_MS
+    ? { error: new Error("no time left in the refocus budget"), status: null, stdout: "", stderr: "" }
+    : spawnSync(process.env.PYTHON || "python3", args, {
+      encoding: "utf8",
+      ...(evidence ? { input: evidence } : {}),
+      env,
+      timeout,
+      maxBuffer: 16 * 1024 * 1024,
+    });
   const reason = result.error?.message || result.stderr?.trim() || `trace exited ${result.status ?? "without a status"}`;
-  const trace = !result.error && result.status === 0 && result.stdout.trim()
-    ? result.stdout.trim() : `TRACE GAP — ${String(reason).replace(/\s+/g, " ").trim()}`;
-  return [trace, role].filter(Boolean).join("\n\n");
+  const failed = Boolean(result.error) || result.status !== 0 || !result.stdout?.trim();
+  const trace = [
+    ...(failed ? [`TRACE GAP — ${String(reason).replace(/\s+/g, " ").trim()}`] : []),
+    result.stdout?.trim(),
+  ].filter(Boolean).join("\n");
+  return {
+    text: [trace, role].filter(Boolean).join("\n\n"),
+    failed,
+  };
 }
+
+// --- seat project boundary: keep this block identical in every script that has it ---
+// A Claude started from inside a seat (its shell, its Bash tool) inherits the seat's environment, so it loads this plugin
+// and its hooks would act as the seat. OpenRig tells the plugin the seat's launch project in OPENRIG_SEAT_PROJECT_DIR;
+// Claude's own CLAUDE_PROJECT_DIR is fixed for the life of a Claude and names the project it was started in (unlike the
+// hook payload's cwd, which follows a `cd`). The seat's effects run only when the two name the same folder. Spellings of
+// one folder (a symlink, a trailing slash, letter case on a case-insensitive disk) count as the same, and a missing
+// variable (an older or manual launch, a runtime without CLAUDE_PROJECT_DIR) leaves the hook doing what it always did.
+function runsForThisSeatsProject(env = process.env) {
+  const launch = env.OPENRIG_SEAT_PROJECT_DIR;
+  const project = env.CLAUDE_PROJECT_DIR;
+  if (!launch || !project) return true;
+  const canonical = (dir) => {
+    const absolute = path.resolve(dir);
+    // .native gives the case the disk has (plain realpathSync keeps the case the path was typed in), which is what Claude's
+    // CLAUDE_PROJECT_DIR carries on a case-insensitive filesystem such as macOS's default.
+    try { return fs.realpathSync.native(absolute); } catch { return absolute; }
+  };
+  return canonical(launch) === canonical(project);
+}
+// --- end seat project boundary ---
 
 (async () => {
   if (!enabled(process.env.OPENRIG_REFOCUS_ENABLED)) process.exit(0);
+  // A Claude started elsewhere inside this seat is not the seat: no state, no refocus.
+  if (!runsForThisSeatsProject()) process.exit(0);
 
   let input = {};
   try { input = JSON.parse((await readStdin()) || "{}") || {}; } catch {}
   const event = input.hook_event_name || "UserPromptSubmit";
   const harness = runtime();
+
+  // The acknowledgement is never an actionable restore turn. The managed
+  // marker below also holds earlier/later peer messages, not just this prompt.
+  const rawPrompt = typeof input.prompt === "string" ? input.prompt.trim() : "";
+  // Claude can wrap a complete submitted message as pasted content. Unwrap only
+  // that envelope; a peer quoting a restore request is still an ordinary prompt.
+  const prompt = harness === "claude"
+    ? (rawPrompt.match(/^<pasted_content id="([^"]+)">\s*([\s\S]*)\s*<\/pasted_content id="\1">$/)?.[2]?.trim() ?? rawPrompt)
+    : rawPrompt;
+  if (event === "UserPromptSubmit" && prompt.startsWith("OpenRig post-compaction turn boundary.")) process.exit(0);
 
   // Fresh-session orientation is the default onboarding pack's job. Even a manually invoked hook must
   // no-op here, so a stale registration cannot corrupt the world install.
@@ -311,16 +424,16 @@ function renderTrace() {
     state = { lastBytes: size, baselineAt: new Date().toISOString() };
     persist();
   } else if (size > 0 && size < Number(state.lastBytes || 0)) {
-    // Shrink clears pending and resets the baseline BEFORE due computation. The
-    // reset itself emits no refocus, and a stale pending can never ride through a
-    // reset into a delivery. Advisory once per reset episode: the reset moment is
-    // the dedupe (afterwards lastBytes === size), and the marker records in state.
-    delete state.pendingOn;
-    delete state.pendingAt;
+    // Shrink invalidates growth-based due state, not an exact PostCompact event
+    // awaiting its actionable restore turn.
+    if (state.pendingOn !== "PostCompact") {
+      delete state.pendingOn;
+      delete state.pendingAt;
+    }
     state.lastReset = { at: new Date().toISOString(), fromBytes: Number(state.lastBytes || 0), toBytes: size };
     state.lastBytes = size;
     persist();
-    process.stderr.write(`refocus: transcript shrank for ${seat} — baseline reset, pending cleared\n`);
+    process.stderr.write(`refocus: transcript shrank for ${seat} — baseline reset; PostCompact pending retained if present\n`);
   }
 
   const lastBytes = Number(state.lastBytes || 0);
@@ -334,17 +447,46 @@ function renderTrace() {
   if (!due) process.exit(0);
 
   if (event !== "UserPromptSubmit") {
+    if (event === "PostCompact" && harness === "claude") {
+      // PreCompact records whether THIS compact was initiated by the enforcer.
+      // A manual /compact overwrites the marker with false; other occupants
+      // cannot hold this session. Read the early sentinel first if it survives.
+      state.managedRestorePending = false;
+      for (const suffix of [".expected.json", ".json"]) {
+        try {
+          const marker = JSON.parse(fs.readFileSync(path.join(home, "compaction", "restore-pending", seatKey + suffix), "utf8"));
+          if (marker.sessionName !== seat || (marker.sessionId ? marker.sessionId !== identity : !transcriptPath || marker.transcriptPath !== transcriptPath)) continue;
+          state.managedRestorePending = marker.managedRefocusPending === true;
+          break;
+        } catch {}
+      }
+      if (state.managedRestorePending) state.managedRestorePendingAt = new Date().toISOString();
+      else delete state.managedRestorePendingAt;
+    }
     if (event === "PostCompact" || !state.pendingOn) state.pendingOn = event;
     state.pendingAt ||= new Date().toISOString();
     persist();
     process.exit(0);
   }
 
+  if (harness === "claude" && state.managedRestorePending) {
+    const heldFor = Date.now() - Date.parse(state.managedRestorePendingAt);
+    // Missing/invalid timestamps from older state, or a clock moving backwards,
+    // cannot establish a live hold. No timer or extra turn is created here.
+    if (heldFor >= 0 && heldFor < MANAGED_RESTORE_HOLD_MS
+      && !prompt.startsWith("Please respond to this normal user message now by restoring this Claude session after compaction.")) process.exit(0);
+    delete state.managedRestorePending;
+    delete state.managedRestorePendingAt;
+    persist();
+  }
+
   // Run the public trace before resolving a context ref. Besides keeping the
   // content ladder untouched, this makes `rig context get` the last resolver
   // call and preserves the existing observable ref contract.
-  const trace = renderTrace();
+  const rendered = renderTrace();
+  const trace = rendered.text;
   const configured = readConfiguredContent(home);
+  const failed = rendered.failed || Boolean(configured.failure);
   const why = onDemand
     ? "on demand"
     : state.pendingOn === "PostCompact"
@@ -391,7 +533,17 @@ function renderTrace() {
       additionalContext: payload,
     },
   });
-  process.stdout.write(output, () => {
+  process.stdout.write(output, (error) => {
+    // The report gets its own window after the attempt's lookups, however long they actually took (default lookups keep
+    // their fixed caps, so a default attempt can run past its 4.5 s budget).
+    recordRefocusResult({ home, seat, identity, failed: failed || Boolean(error),
+      deadlineMs: Math.max(BUDGET_MS, Math.floor(process.uptime() * 1_000)) + REPORT_MS });
+    if (failed || error) {
+      state.pendingOn ||= event;
+      state.pendingAt ||= new Date().toISOString();
+      persist();
+      return;
+    }
     if (size > 0) state.lastBytes = size;
     state.firedAt = new Date().toISOString();
     state.firedOn = event;

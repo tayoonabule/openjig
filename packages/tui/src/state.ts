@@ -1,7 +1,8 @@
 import { fileTargetForPath } from "./reading.js";
 import { terminalExplorerRows } from "./terminals/terminal-model.js";
 import { CONFIG_CATEGORIES } from "./config/config-model.js";
-import { availableTabs } from "./commands/registry.js";
+import { availableTabs, COMMAND_REGISTRY } from "./commands/registry.js";
+import { filterPalette } from "./commands/palette.js";
 import { DEFAULT_TIME_ZONE, resolveTimeZone } from "./time.js";
 // ONE instance-scoped view-state with ONE mutation path (dispatch) — PIN 1.
 // No module-level state anywhere in this file (FR-13). The section set is a
@@ -18,6 +19,8 @@ import type {
   ViewState,
   ViewStateStore,
   NavigationFrame,
+  PendingDrill,
+  SpecKind,
 } from "./types.js";
 import { SECTION_REGISTRY, SYSTEM_SECTIONS } from "./sections.js";
 import { scopesExplorerRows } from "./scopes/scopes-model.js";
@@ -88,13 +91,16 @@ export function createViewState(options: CreateViewStateOptions): ViewStateStore
 
   function dispatch(action: Action): ViewState {
     const previous = state;
-    if (["attention-category", "attention-open", "terminal-preview", "project-select", "jump", "drill", "cross", "tab", "scopes-mission-open", "scopes-open", "health-open", "execution-open", "recent-open", "timezone", "config-category", "config-setting"].includes(action.type)) state = { ...state, file: null, externalUrl: null, recentOpen: null, timeZoneHelp: false, attentionOpen: null };
+    if (["attention-category", "attention-open", "terminal-preview", "project-select", "jump", "drill", "cross", "tab", "scopes-mission-open", "scopes-open", "health-open", "execution-open", "recent-open", "timezone", "config-category", "config-setting"].includes(action.type)) state = { ...state, file: null, externalUrl: null, recentOpen: null, timeZoneHelp: false, attentionOpen: null, specLaunch: null, ...(state.pendingDrill ? { pendingDrill: null } : {}) };
     state = reduce(state, action, getSnapshot());
+    // A pending address belongs to the Topology landing it opened; leaving it cancels the address.
+    if (state.pendingDrill && (state.section !== "topology" || state.drill.length > 0)) state = { ...state, pendingDrill: null };
     // Connections is a side trip from work, including explorer/palette entry.
     if (action.type === "jump" && ![...SYSTEM_SECTIONS, "needs"].includes(action.section) && ![...SYSTEM_SECTIONS, "needs"].includes(previous.section)) state.history = [];
     // A filter changes the current view; clearing it must not add the detail
-    // being left back onto history (Escape would then cycle forever).
-    else if (!["back", "execution-close", "filter"].includes(action.type) && !state.lastError && location(previous) !== location(state)) {
+    // being left back onto history (Escape would then cycle forever). A resolved
+    // address replaces its interim landing, so Back returns where it was typed.
+    else if (!["back", "execution-close", "filter", "resolve-pending"].includes(action.type) && !state.lastError && location(previous) !== location(state)) {
       state.history = [...(previous.history ?? []), navigationFrame(previous)].slice(-50);
     }
     for (const fn of listeners) fn(state);
@@ -116,6 +122,18 @@ function reduce(state: ViewState, action: Action, snap: FleetSnapshot): ViewStat
   const readingNotice = state.notice?.includes("\n") && (["layout", "content-scroll", "content-select", "focus", "copy-mode"].includes(action.type) || (action.type === "select" && action.origin === "refresh"));
   const next: ViewState = { ...state, lastError: null, notice: action.type === "notice" || action.type === "act" || readingNotice ? state.notice : null };
   switch (action.type) {
+    case "spec-launch": {
+      const leaf = state.drill.at(-1);
+      const spec = state.section === "specs" ? findSpec(snap, leaf?.name ?? "", leaf?.specKind) : null;
+      if (spec?.kind !== "rig") return { ...next, lastError: "Open a rig spec before Launch." };
+      return { ...resetContent(next), focusedPane: "content", specLaunch: { source: spec.name, folder: "", host: "" } };
+    }
+    case "launch-folder":
+      return state.specLaunch ? { ...resetContent(next), specLaunch: { ...state.specLaunch, folder: action.folder } } : { ...next, lastError: "Open Launch first." };
+    case "launch-host":
+      return state.specLaunch ? { ...resetContent(next), specLaunch: { ...state.specLaunch, host: action.host } } : { ...next, lastError: "Open Launch first." };
+    case "launch-close":
+      return { ...resetContent(next), specLaunch: null };
     case "terminal-result":
       return { ...next, terminalResult: { view: action.view, message: action.message } };
     case "terminal-preview":
@@ -150,6 +168,7 @@ function reduce(state: ViewState, action: Action, snap: FleetSnapshot): ViewStat
       return row ? resetContent({ ...next, recentOpen: { ...row }, healthOpen: null }) : { ...next, lastError: "Event is outside the served Recent window" };
     }
     case "back": {
+      if (state.specLaunch) return { ...resetContent(next), specLaunch: null };
       const history = [...(state.history ?? [])];
       const frame = history.pop();
       return frame ? { ...next, ...frame, history } : { ...next, notice: "No previous view" };
@@ -165,6 +184,7 @@ function reduce(state: ViewState, action: Action, snap: FleetSnapshot): ViewStat
     case "config-setting":
       return resetContent({ ...next, section: "config", drill: [], viewTab: "table", configKey: action.key, healthOpen: null });
     case "jump": {
+      next.specLaunch = null;
       next.terminalView = null;
       next.terminalPage = 0;
       if (action.section === "needs") { next.attentionCategory = null; next.attentionOpen = null; next.file = null; next.externalUrl = null; next.recentOpen = null; next.timeZoneHelp = false; }
@@ -231,7 +251,10 @@ function reduce(state: ViewState, action: Action, snap: FleetSnapshot): ViewStat
       return next.palette ? { ...next, palette: { query: action.query, selection: 0 } } : next;
     case "palette-move": {
       if (!next.palette) return next;
-      const sel = Math.max(0, next.palette.selection + action.delta);
+      // Clamp to the matches Help shows (their count does not depend on context), so
+      // overshooting the last row cannot leave later up-presses with nothing to undo.
+      const last = Math.max(0, filterPalette(next.palette.query, COMMAND_REGISTRY, "").length - 1);
+      const sel = Math.min(last, Math.max(0, next.palette.selection + action.delta));
       return { ...next, palette: { ...next.palette, selection: sel } };
     }
     case "style": {
@@ -305,15 +328,27 @@ function reduce(state: ViewState, action: Action, snap: FleetSnapshot): ViewStat
       return reduce(next, row.action, snap);
     }
     case "drill": {
-      const drilled = drillTo(next, action.resource, action.name, snap, action.target);
-      if (drilled.lastError) return drilled;
-      const sectionState = clearScopeCoordinatesOnSectionChange(state, drilled);
-      const spec = action.resource === "spec" ? findSpec(snap, action.name) : null;
-      // filters are VIEW-scoped: a drill that crosses sections clears the old
-      // section's filter (founder direct-drive catch — a specs filter leaked
-      // into the topology table and blanked it)
-      const filter = drilled.section === state.section ? drilled.filter : "";
-      return syncSelection({ ...resetContent({ ...sectionState, filter, viewTab: spec?.kind === "rig" ? "configuration" : "table" }), healthOpen: null }, snap);
+      next.specLaunch = null;
+      const resource = action.resource;
+      // Terminals, Needs, System, Scopes, Config, Specs and file pages read no
+      // rigs. Rather than call a running rig absent, switch to Topology and
+      // resolve once its own read settles.
+      if (resource !== "spec" && !snap.hosts.some((host) => host.rigs.length > 0)) {
+        const seq = (state.pendingSeq ?? 0) + 1;
+        const pendingDrill: PendingDrill = { resource, name: action.name, ...(action.target ? { target: action.target } : {}), seq };
+        const landing = clearScopeCoordinatesOnSectionChange(state, { ...next, section: "topology", drill: [], runningOf: null });
+        return syncSelection({ ...resetContent({ ...landing, filter: state.section === "topology" ? next.filter : "", viewTab: "table" }), healthOpen: null, pendingDrill, pendingSeq: seq }, snap);
+      }
+      return applyDrill(state, next, action, snap);
+    }
+    case "resolve-pending": {
+      const pending = state.pendingDrill;
+      if (!pending) return next;
+      const resolved = applyDrill(state, { ...next, pendingDrill: null }, { type: "drill", resource: pending.resource, name: pending.name, target: pending.target }, snap);
+      // An incomplete Topology read cannot prove absence.
+      if (resolved.lastError?.startsWith("no such ") && (snap.readErrors.length > 0 || !snap.hydratedAt))
+        return { ...resolved, lastError: `could not confirm ${pending.resource} "${pending.name}": ${snap.readErrors[0] ?? "the Topology read did not complete"}` };
+      return resolved;
     }
     case "cross": {
       const crossed = crossNav(next, action.kind, action.name, snap, action.target);
@@ -334,6 +369,18 @@ function location(s: ViewState): string {
 function navigationFrame(s: ViewState): NavigationFrame {
   const { attentionCategory, attentionOpen, project, terminalView, terminalPage, file, externalUrl, section, drill, filter, selection, runningOf, viewTab, contentOffset, contentMaxOffset, contentTargetCount, contentSelection, focusedPane, scopesMission, scopesSelected, scopesCollapseReqs, scopesNarrative, executionOpen, expanded, recentOpen, timeZoneHelp, configCategory, configKey } = s;
   return { attentionCategory, attentionOpen, project, terminalView, terminalPage, file, externalUrl, section, drill, filter, selection, runningOf, viewTab, contentOffset, contentMaxOffset, contentTargetCount, contentSelection, focusedPane, scopesMission, scopesSelected, scopesCollapseReqs, scopesNarrative, executionOpen, expanded, recentOpen, timeZoneHelp, configCategory, configKey };
+}
+
+function applyDrill(state: ViewState, next: ViewState, action: Extract<Action, { type: "drill" }>, snap: FleetSnapshot): ViewState {
+  const drilled = drillTo(next, action.resource, action.name, snap, action.target, action.specKind);
+  if (drilled.lastError) return drilled;
+  const sectionState = clearScopeCoordinatesOnSectionChange(state, drilled);
+  const spec = action.resource === "spec" ? findSpec(snap, action.name, action.specKind) : null;
+  // filters are VIEW-scoped: a drill that crosses sections clears the old
+  // section's filter (founder direct-drive catch — a specs filter leaked
+  // into the topology table and blanked it)
+  const filter = drilled.section === state.section ? drilled.filter : "";
+  return syncSelection({ ...resetContent({ ...sectionState, filter, viewTab: action.resource === "spec" && (!spec || spec.kind === "rig") ? "graph" : "table" }), healthOpen: null }, snap);
 }
 
 function clearScopeCoordinatesOnSectionChange(previous: ViewState, next: ViewState): ViewState {
@@ -380,7 +427,7 @@ export function locationKey(state: ViewState): string {
     case "agent":
       return `agent:${names.get("host")}/${names.get("rig")}/${names.get("pod")}/${leaf.name}`;
     case "spec":
-      return `spec:${leaf.name}`;
+      return `spec:${leaf.specKind ?? "rig"}:${leaf.name}`;
     default:
       return `section:${state.section}`;
   }
@@ -394,7 +441,7 @@ function syncSelection(state: ViewState, snap: FleetSnapshot): ViewState {
   if (names.has("pod")) expanded.add(`pod:${names.get("host")}/${names.get("rig")}/${names.get("pod")}`);
   const leaf = state.drill.at(-1);
   if (leaf?.kind === "spec") {
-    const spec = findSpec(snap, leaf.name);
+    const spec = findSpec(snap, leaf.name, leaf.specKind);
     if (spec) expanded.add(`specs-kind:${spec.kind}`);
     if (spec?.kind === "agent" && spec.namespace) expanded.add(`folder:${spec.namespace}`);
   }
@@ -422,8 +469,10 @@ export function findAgent(snap: FleetSnapshot, name: string, target?: { host: st
   return matches.length === 1 ? matches[0]! : null;
 }
 
-export function findSpec(snap: FleetSnapshot, name: string) {
-  return snap.specs.find((s) => s.name === name) ?? null;
+export function findSpec(snap: FleetSnapshot, name: string, kind?: SpecKind) {
+  // A bare spec command opens teams first; explicit library links keep their kind.
+  return snap.specs.find((s) => s.name === name && s.kind === (kind ?? "rig"))
+    ?? (kind ? null : snap.specs.find((s) => s.name === name) ?? null);
 }
 
 /** Joins a Needs-You target (a session name) back to the topology agent. */
@@ -461,7 +510,7 @@ export function agentsRunningSpecTargets(snap: FleetSnapshot, specName: string) 
   return out;
 }
 
-function drillTo(state: ViewState, resource: string, name: string, snap: FleetSnapshot, target?: { host: string; rig?: string; pod?: string }): ViewState {
+function drillTo(state: ViewState, resource: string, name: string, snap: FleetSnapshot, target?: { host: string; rig?: string; pod?: string }, specKind?: SpecKind): ViewState {
   switch (resource) {
     case "host": {
       if (!snap.hosts.some((h) => h.name === name)) return { ...state, lastError: `no such host "${name}"` };
@@ -530,8 +579,9 @@ function drillTo(state: ViewState, resource: string, name: string, snap: FleetSn
     case "spec": {
       // Another section may intentionally omit Specs. Its absence there is not
       // evidence that this source is missing; judge after the catalog read.
-      if (snap.specsLoaded && !findSpec(snap, name)) return { ...state, lastError: `no such spec "${name}"` };
-      return { ...state, section: "specs", drill: [{ kind: "spec", name }], selection: 0, runningOf: null };
+      const spec = findSpec(snap, name, specKind);
+      if (snap.specsLoaded && !spec) return { ...state, lastError: `no such spec "${name}"` };
+      return { ...state, section: "specs", drill: [{ kind: "spec", name, specKind: specKind ?? spec?.kind }], selection: 0, runningOf: null };
     }
     default:
       return { ...state, lastError: `unknown resource "${resource}"` };
@@ -557,11 +607,11 @@ function crossNav(state: ViewState, kind: "spec-of" | "running", name: string, s
     if (matches.length > 1) return { ...state, lastError: `ambiguous agent "${name}" — use spec-of <host>/<rig>/<pod>/<agent>` };
     const found = matches[0];
     if (!found) return { ...state, lastError: `no such agent "${name}"` };
-    if (!findSpec(snap, found.agent.spec)) return { ...state, lastError: `spec "${found.agent.spec}" not in the library` };
+    if (!findSpec(snap, found.agent.spec, "agent")) return { ...state, lastError: `spec "${found.agent.spec}" not in the library` };
     return resetContent({
       ...state,
       section: "specs",
-      drill: [{ kind: "spec", name: found.agent.spec }],
+      drill: [{ kind: "spec", name: found.agent.spec, specKind: "agent" }],
       selection: 0,
       runningOf: null,
       viewTab: "table",
@@ -577,7 +627,7 @@ export function computeExplorerRows(state: ViewState, snap: FleetSnapshot): Expl
   const rows: ExplorerRow[] = [];
   for (const section of state.sections) {
     const active = section.name === state.section || section.name === "system" && SYSTEM_SECTIONS.includes(state.section);
-    if (section.name === "config" || section.name === "connections") continue;
+    if (section.name === "config" || section.name === "connections" || section.name === "usage" || section.name === "usage-hosts" || section.name === "cost") continue;
     const label =
       section.name === "topology"
         ? "TOPOLOGY"
@@ -598,7 +648,10 @@ export function computeExplorerRows(state: ViewState, snap: FleetSnapshot): Expl
       rows.push({ label: "  Health", key: "system:health", action: { type: "jump", section: "system" } },
         { label: "  Configuration", key: "section:config", action: { type: "jump", section: "config" } });
       if (state.section === "config") rows.push(...CONFIG_CATEGORIES.map((c) => ({ label: "    " + c.label, key: `config:${c.id}`, action: { type: "config-category" as const, category: c.id } })));
-      rows.push({ label: "  Connections", key: "section:connections", action: { type: "jump", section: "connections" } });
+      rows.push({ label: "  Connections", key: "section:connections", action: { type: "jump", section: "connections" } },
+        { label: "  Usage", key: "section:usage", action: { type: "jump", section: "usage" } },
+        { label: "  Usage · all hosts", key: "section:usage-hosts", action: { type: "jump", section: "usage-hosts" } },
+        { label: "  Cost", key: "section:cost", action: { type: "jump", section: "cost" } });
       if (state.history?.length) rows.push({ label: "  Back", key: "system:back", action: { type: "back" } });
       continue;
     }
@@ -669,7 +722,7 @@ export function computeExplorerRows(state: ViewState, snap: FleetSnapshot): Expl
         if (!openKind) continue;
         if (kind !== "agent") {
           for (const spec of list)
-            rows.push({ label: `    ▪ ${spec.name}`, action: { type: "drill", resource: "spec", name: spec.name }, key: `spec:${spec.name}` });
+            rows.push({ label: `    ▪ ${spec.name}`, action: { type: "drill", resource: "spec", name: spec.name, specKind: kind }, key: `spec:${kind}:${spec.name}` });
           continue;
         }
         const groups = new Map<string, typeof list>();
@@ -693,8 +746,8 @@ export function computeExplorerRows(state: ViewState, snap: FleetSnapshot): Expl
           for (const spec of specs)
             rows.push({
               label: `${namespace === "(root)" ? "    " : "      "}▪ ${spec.name}`,
-              action: { type: "drill", resource: "spec", name: spec.name },
-              key: `spec:${spec.name}`,
+              action: { type: "drill", resource: "spec", name: spec.name, specKind: kind },
+              key: `spec:${kind}:${spec.name}`,
             });
         }
       }

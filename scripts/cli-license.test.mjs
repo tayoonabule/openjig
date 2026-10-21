@@ -9,11 +9,13 @@ test("the CLI build carries the unchanged repository LICENSE and README into npm
   const root = mkdtempSync(join(tmpdir(), "cli-license-"));
   try {
     const cli = join(root, "packages/cli");
-    const bin = join(root, "bin");
+    const bin = join(cli, "node_modules/.bin");
     for (const dir of [cli, bin, join(cli, "src/schemas"), join(cli, "src/lib/scope-templates")]) mkdirSync(dir, { recursive: true });
     copyFileSync("LICENSE", join(root, "LICENSE"));
     copyFileSync("README.md", join(root, "README.md"));
     copyFileSync("packages/cli/package.json", join(cli, "package.json"));
+    mkdirSync(join(root, "scripts"), { recursive: true });
+    copyFileSync("scripts/prepare-workspace-build.mjs", join(root, "scripts/prepare-workspace-build.mjs"));
     writeFileSync(join(cli, "src/schemas/fixture.json"), "{}\n");
     writeFileSync(join(cli, "src/lib/scope-templates/fixture.md"), "fixture\n");
     // Compilation is outside this packaging regression. Run the actual build

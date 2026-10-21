@@ -61,6 +61,8 @@ export interface HeldObligation extends ObligationRow {
   state: "blocked";
   wake: ParkWakeDiagnosis | null;
   healthy: boolean;
+  /** Present when the row is healthy because its owner's own active repeating reminder keeps waking it. */
+  servedByOwnReminder?: true;
 }
 
 export interface ObligationRead {
@@ -77,6 +79,9 @@ export interface ParkedQueryDeps {
   listOpenObligations: (destinationSession: string, limit: number) => ObligationRead;
   /** Optional only for pre-073 fixtures. Missing is honestly wakeless. */
   getParkWake?: (qitemId: string) => unknown;
+  /** Whether the row's own owner is still being woken by the active repeating reminder attached to it, and that
+   *  reminder's latest delivery reached them. Missing means no such exemption. */
+  servedByOwnReminder?: (qitemId: string) => boolean;
 }
 
 export interface SeatParkedDiagnosis {
@@ -145,7 +150,12 @@ export function diagnoseSeatParked(
   const readComplete = read.rows.length < read.limit;
   const held: HeldObligation[] = read.rows.filter((r) => r.state === "blocked").map((row) => {
     const wake = parseWake(deps.getParkWake?.(row.qitemId));
-    return { ...row, state: "blocked", wake, healthy: (readComplete && isOwnerInputHold(row)) || (wake?.live === true && (!wake.unconsumed || wake.recoveryOwner === "queue-stuck-sweep")) };
+    const ownerInputHold = readComplete && isOwnerInputHold(row);
+    const healthy = ownerInputHold || (wake?.live === true && (!wake.unconsumed || wake.recoveryOwner === "queue-stuck-sweep"));
+    // A fired reminder reads spent to the wake status, but one that is still active, aimed at this owner and
+    // delivering keeps waking them: the row is waiting, not stranded.
+    const served = !healthy && deps.servedByOwnReminder?.(row.qitemId) === true;
+    return { ...row, state: "blocked", wake, healthy: healthy || served, ...(served ? { servedByOwnReminder: true as const } : {}) };
   });
   const unhealthyHeld = held.filter((row) => !row.healthy);
   const open = read.rows.filter((r) => r.state !== "blocked");
@@ -193,13 +203,19 @@ export function diagnoseSeatParked(
   const stopped = state.activity === "idle-at-prompt" || state.needsInput.count > 0;
   const parked = stopped && (open.length > 0 || unhealthyHeld.length > 0);
   const unconsumed = unhealthyHeld.filter((row) => row.wake?.unconsumed);
+  const served = held.filter((row) => row.servedByOwnReminder).length;
+  const ownerInputHeld = complete ? held.filter((row) => isOwnerInputHold(row)).length : 0;
   const reason = parked
     ? state.needsInput.count > 0
       ? `needs-input (${state.needsInput.reason ?? "unanswered block"}) with ${open.length} open obligation(s) and ${unhealthyHeld.length} unhealthy HELD row(s) — ${unconsumed.length > 0 ? `${unconsumed.length} wake(s) fired but remain unconsumed. ` : ""}${HELD_REMEDY}`
       : `idle-at-prompt with ${open.length} open obligation(s) and ${unhealthyHeld.length} unhealthy HELD row(s) — ${unconsumed.length > 0 ? `${unconsumed.length} wake(s) fired but remain unconsumed. ` : ""}${HELD_REMEDY}`
     : stopped
       ? held.length > 0
-        ? `stopped with ${held.length} HELD row(s), all healthy (live wake, or waiting on owner/human input) — not parked`
+        ? ownerInputHeld > 0
+          ? `stopped with ${held.length} HELD row(s), including ${ownerInputHeld} waiting for owner/human input${served > 0 ? ` and ${served} served by its own repeating reminder` : ""}, not parked`
+          : served > 0
+          ? `stopped with ${held.length} HELD row(s), all healthy: ${held.length - served} with a live wake, ${served} served by its own repeating reminder — not parked`
+          : `stopped with ${held.length} HELD row(s), all healthy with a live wake — not parked`
         : "stopped but the board is clean"
       : `working — not parked`;
 

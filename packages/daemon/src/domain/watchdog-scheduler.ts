@@ -1,5 +1,6 @@
 import type { WatchdogJob, WatchdogJobsRepository } from "./watchdog-jobs-repository.js";
-import type { WatchdogPolicyEngine } from "./watchdog-policy-engine.js";
+import type { ReminderPass, WatchdogPolicyEngine } from "./watchdog-policy-engine.js";
+import { nextDueAt } from "./watchdog-due.js";
 
 /**
  * Watchdog scheduler (PL-004 Phase C; daemon-native supervision tree
@@ -132,15 +133,19 @@ export class WatchdogScheduler {
     const nowMs = passStartedAt.getTime();
     this.beforeTick?.();
     const active = this.jobsRepo.listActive();
+    // Parked-row reminders due in this pass are held and sent at its end, one message per seat.
+    const pass: ReminderPass = { held: [] };
     for (const job of active) {
       if (this.shuttingDown) return;
       if (!isDue(job, nowMs)) continue;
       try {
-        await this.policyEngine.evaluate(job, passStartedAt.toISOString());
+        await this.policyEngine.evaluate(job, passStartedAt.toISOString(), pass);
       } catch (err) {
         this.onTickError(err);
       }
     }
+    if (this.shuttingDown) return;
+    await this.policyEngine.deliverHeldReminders(pass, (err) => this.onTickError(err), () => this.shuttingDown);
   }
 }
 
@@ -152,9 +157,6 @@ export class WatchdogScheduler {
  * is enforced one layer up by the policy engine, NOT here.
  */
 export function isDue(job: WatchdogJob, nowMs: number): boolean {
-  if (!job.lastEvaluationAt) return true;
-  const last = Date.parse(job.lastEvaluationAt);
-  if (Number.isNaN(last)) return true;
-  const cadenceSeconds = job.scanIntervalSeconds ?? job.intervalSeconds;
-  return nowMs - last >= cadenceSeconds * 1000;
+  const due = nextDueAt(job);
+  return due === null || nowMs >= due;
 }

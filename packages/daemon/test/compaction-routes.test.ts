@@ -10,7 +10,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { Hono } from "hono";
 import { tmpdir } from "node:os";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, renameSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import type Database from "better-sqlite3";
 import { RigRepository } from "../src/domain/rig-repository.js";
@@ -125,8 +125,8 @@ describe("compaction routes — POST /api/compaction/trigger", () => {
       tmuxAdapter: idleTmux(async (_t, text) => {
         sentTexts.push(text);
         const marker = text.match(/<!-- openrig-compaction-complete .*? -->/)?.[0];
-        const target = text.match(/atomically rename it to ("(?:[^"\\]|\\.)*")/);
-        if (opts?.completeMap !== false && marker && target) { const file = JSON.parse(target[1]!); mkdirSync(dirname(file), { recursive: true }); writeFileSync(file + ".tmp", "# Fixture map\n" + marker); renameSync(file + ".tmp", file); }
+        const target = text.match(/Write this attempt's complete restore map to ("(?:[^"\\]|\\.)*")/);
+        if (opts?.completeMap !== false && marker && target) { const file = JSON.parse(target[1]!); mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, "# Fixture map\n" + marker); }
         return { ok: true as const };
       }),
       sleep: async () => undefined,
@@ -157,7 +157,7 @@ describe("compaction routes — POST /api/compaction/trigger", () => {
     });
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body).toEqual({ ok: true, session: "dev-impl@my-rig", stage: "compact-sent" });
+    expect(body).toEqual({ ok: true, session: "dev-impl@my-rig", stage: "compact-sent", compact: expect.stringMatching(/^submitted, unconfirmed: /) });
     // The manual request does not claim that the threshold was reached.
     expect(sentTexts[0]).toContain("OpenRig manual compaction was requested");
     expect(sentTexts[0]).not.toContain("configured compaction threshold");

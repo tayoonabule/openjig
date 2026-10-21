@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { OPENRIG_HOME } from "../src/openrig-compat.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type Database from "better-sqlite3";
 import type { Hono } from "hono";
@@ -125,6 +126,44 @@ describe("Restore check routes", () => {
       activeSessionIdByNode: Object.fromEntries(sessions.map((s) => [s.nodeId, s.id])),
     });
   }
+
+  it.each(["hooks", "hookless", "missing", "relative"])("reads current %s selection without writes at explicit full/compact detail routes", async kind => {
+    const rig = rigRepo.createRig("selection-check");
+    const source = path.join(openRigHome, "agent"); fs.mkdirSync(source);
+    const agent = `name: diagnostic-fixture
+version: "1.0.0"
+resources:
+  runtime_resources:
+    - id: activity
+      path: hooks.json
+      runtime: claude-code
+      type: claude_activity_hooks
+profiles:
+  hooks:
+    uses:
+      runtime_resources: [activity]
+  hookless:
+    uses:
+      runtime_resources: []
+`;
+    fs.writeFileSync(path.join(source, "agent.yaml"), agent);
+    const node = rigRepo.addNode(rig.id, "seat", { runtime: "claude-code", cwd: openRigHome,
+      agentRef: kind === "relative" ? "local:agent" : `path:${source}`, profile: kind === "hookless" ? "hookless" : "hooks" });
+    insertStartupContextRow(db, node.id);
+    if (kind === "missing") fs.unlinkSync(path.join(source, "agent.yaml"));
+    const before = db.serialize();
+    for (const query of ["", "&compact=1&ready=1"]) {
+      const response = await app.request(`/api/restore-check?rig=selection-check&noQueue=true${query}`);
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      const hook = body.checks.find((c: { check: string }) => c.check.endsWith(".hooks"));
+      expect(hook.status).toBe(kind === "hookless" ? "green" : "yellow");
+      expect(hook.evidence).toContain(kind === "hookless" ? "not selected" : kind === "hooks" ? "stale selection" : "unknown");
+      expect(hook.remediation).toBe("");
+    }
+    expect(db.serialize()).toEqual(before);
+    if (kind !== "missing") expect(fs.readFileSync(path.join(source, "agent.yaml"), "utf8")).toBe(agent);
+  });
 
   it("uses restore's ranked snapshot and reports missing service inputs in compact output", async () => {
     const rig = rigRepo.createRig("service-rig");
@@ -334,7 +373,10 @@ describe("Restore check routes", () => {
     const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "restore-check-route-hook-cwd-"));
     const settingsDir = path.join(projectDir, ".claude");
     const settingsPath = path.join(settingsDir, "settings.local.json");
-    const relayPath = path.join(projectDir, ".openrig", "hooks", "scripts", "activity-relay.cjs");
+    // beforeEach changes the environment; delivery and this reader must retain the daemon root.
+    expect(openRigHome).not.toBe(OPENRIG_HOME);
+    const relayPath = path.join(OPENRIG_HOME, "state", "claude-activity-hooks", "activity-relay.cjs");
+    const previousRelay = fs.existsSync(relayPath) ? fs.readFileSync(relayPath) : null;
     fs.mkdirSync(settingsDir, { recursive: true });
     fs.mkdirSync(path.dirname(relayPath), { recursive: true });
     fs.writeFileSync(relayPath, "// test relay\n");
@@ -370,6 +412,8 @@ describe("Restore check routes", () => {
       expect(hook.evidence).toContain("hook execution is not verified");
     } finally {
       fs.rmSync(projectDir, { recursive: true, force: true });
+      if (previousRelay) fs.writeFileSync(relayPath, previousRelay);
+      else fs.rmSync(relayPath, { force: true });
     }
   });
 

@@ -1,8 +1,9 @@
 // B7 (0.5.2, RULING-rig-mode-rig-policy-naming) — `rig policy`: the top-level PERMISSION-POLICY
 // verb, introduced after the context-mode verb took its natural name (`rig mode`).
 //
-// BINDING HONESTY PIN (carried VERBATIM from setup.ts, per the ruling): OpenRig bakes NO
-// allow/ask/deny permission policy — the harness-native permissions are the control surface.
+// BINDING HONESTY PIN (carried VERBATIM from setup.ts, per the ruling; 0.6.7 states the per-launch team and
+// kernel defaults from #820/#893): those defaults pass allow/ask lists per launch and save none; a selected
+// Claude settings fragment can merge native settings, rules included; harness-native permissions are the control surface.
 // `rig policy` TEACHES and RECORDS into RigSpec (`permission_policy: builtin:<name> | none`); it
 // never enforces at runtime. OpenRig records posture into RigSpec, harness-native permissions
 // enforce — never runtime enforcement.
@@ -15,6 +16,8 @@
 //                                           through the AUTHORITATIVE validator/resolver
 //   rig policy apply <name> --spec <path> — record the choice (same flow as `rig setup --policy`,
 //                                           which STAYS as the setup-flow composition, not an alias)
+//   rig policy apply <name> --seat <seat> — store the choice on an EXISTING seat (restore, resume and
+//                                           launches that read the seat's stored state use it)
 //
 // AUTHORITATIVE SEMANTICS, NOT A PRIVATE CLASSIFIER (r2 HIGH-2): every ref this verb reports runs
 // through validatePermissionPolicyRef + resolvePermissionPolicyAttachment — byte-equivalent CLI
@@ -40,9 +43,13 @@ import {
   type ResolvedPolicyAttachment,
 } from "../lib/permission-policy/policy-ref.js";
 import { parsePolicySpec, validatePolicySpec } from "../lib/permission-policy/policy-spec.js";
+import { DaemonClient } from "../client.js";
+import { getDaemonStatus, getDaemonUrl, daemonStatusGuard } from "../daemon-lifecycle.js";
+import { realDeps } from "./daemon.js";
+import type { StatusDeps } from "./status.js";
 
 const HONESTY_PIN =
-  "OpenRig bakes NO allow/ask/deny permission policy — the harness-native permissions are the control surface. " +
+  "The team and kernel launch defaults pass allow/ask lists per launch and save none; a selected Claude settings fragment can merge native settings, rules included; the harness-native permissions are the control surface. " +
   "OpenRig records posture into RigSpec; harness-native permissions enforce — never runtime enforcement.";
 
 const BUILTIN_DESCRIPTIONS: Record<string, string> = {
@@ -51,7 +58,7 @@ const BUILTIN_DESCRIPTIONS: Record<string, string> = {
   open: "a permissive packaged posture for trusted, high-autonomy seats",
   yolo: "the operator/no-guardrails posture — everything the harness allows (launch posture: full_bypass)",
   auto: "Claude runs with --permission-mode auto; Codex and Pi launch at the floor (launch posture: auto)",
-  none: "the RESERVED deliberate-none choice: recorded as permission_policy: none — posture identical to absent (the floor), but the absence is chosen and visible",
+  none: "the RESERVED deliberate-none choice: recorded as permission_policy: none — the floor, without the team launch default an absent policy gets; the choice is visible",
 };
 
 function refFor(name: string): string {
@@ -117,22 +124,62 @@ function describeAttachment(a: ResolvedPolicyAttachment): string {
   return parts.join(" · ") + advisory;
 }
 
-export function policyCommand(): Command {
+export function policyCommand(depsOverride?: StatusDeps): Command {
   const cmd = new Command("policy").description(
     `Teach and record the rig-level permission policy. ${HONESTY_PIN} (The context-mode verb formerly at this name is now: rig mode.)`,
   );
+  const getDeps = (): StatusDeps => depsOverride ?? {
+    lifecycleDeps: realDeps(),
+    clientFactory: (url: string) => new DaemonClient(url),
+  };
 
   const permissions = new Command("permissions").description(
     "Native permission policy: list, show, current and apply. Work posture is separate; this does not relaunch seats.",
   );
-  registerPermissionCommands(permissions);
+  registerPermissionCommands(permissions, getDeps);
   cmd.addCommand(permissions);
   // Compatibility aliases share the exact actions and output, including JSON and exit codes.
-  registerPermissionCommands(cmd);
+  registerPermissionCommands(cmd, getDeps);
   return cmd;
 }
 
-function registerPermissionCommands(cmd: Command): void {
+/** `apply --seat`: the daemon validates the ref like a spec member's and stores it on the seat. */
+async function applyToSeat(
+  getDeps: () => StatusDeps,
+  name: string,
+  opts: { seat: string; reason?: string; operator?: string; json?: boolean },
+): Promise<void> {
+  if (!(POLICY_CHOICES as readonly string[]).includes(name)) {
+    const refusal = { ok: false, code: "invalid_policy", message: `Unknown policy choice '${name}'. Choose one of: ${POLICY_CHOICES.join(", ")}.` };
+    if (opts.json) console.log(JSON.stringify(refusal));
+    else console.error(refusal.message);
+    process.exitCode = 1;
+    return;
+  }
+  const deps = getDeps();
+  const daemon = await getDaemonStatus(deps.lifecycleDeps);
+  if (!daemonStatusGuard(daemon)) return;
+  const client = deps.clientFactory(getDaemonUrl(daemon));
+  const ref = refFor(name);
+  const res = await client.post<Record<string, unknown>>(`/api/seat/set-policy/${encodeURIComponent(opts.seat)}`, {
+    ref, reason: opts.reason ?? "", ...(opts.operator ? { operator: opts.operator } : {}),
+  });
+  if (opts.json) console.log(JSON.stringify(res.data));
+  else if (res.status >= 400) {
+    console.error(String(res.data["message"] ?? res.data["error"] ?? `Policy apply failed (HTTP ${res.status})`));
+    if (typeof res.data["guidance"] === "string") console.error(res.data["guidance"]);
+  } else {
+    const unchanged = res.data["changed"] === false ? " (unchanged)" : "";
+    const posture = `launch_posture=${String(res.data["launchPosture"])}`;
+    console.log(name === "none"
+      ? `Recorded permission_policy: none on seat ${opts.seat}: an explicit floor for this seat, not "no policy"; it does not inherit the rig's policy (${posture})${unchanged}.`
+      : `Recorded permission_policy: ${ref} on seat ${opts.seat} (${posture})${unchanged}.`);
+    console.log(String(res.data["effect"]));
+  }
+  if (res.status >= 400) process.exitCode = res.status >= 500 ? 2 : 1;
+}
+
+function registerPermissionCommands(cmd: Command, getDeps: () => StatusDeps): void {
 
   cmd
     .command("list")
@@ -285,7 +332,7 @@ function registerPermissionCommands(cmd: Command): void {
         // it must surface as ITS OWN defect, never silently disappear behind the rig ref).
         const effective = site === "rig" ? ref : (ref !== undefined ? ref : rigRef);
         if (effective === undefined) {
-          return { site, ref: null, effective: null, applies: "absent — the floor (honest absence; nothing recorded)" };
+          return { site, ref: null, effective: null, applies: "absent — nothing recorded: eligible Claude Code and Codex seats get the team launch default (the kernel's own seats the kernel default) unless an explicit seat choice or a named Codex profile takes precedence; other seats the floor" };
         }
         const invalid = validatePermissionPolicyRef(effective, `${site}.permission_policy`);
         if (invalid) {
@@ -311,10 +358,22 @@ function registerPermissionCommands(cmd: Command): void {
 
   cmd
     .command("apply <name>")
-    .description(`Record a policy choice into an EXISTING rig spec (the same recording flow as \`rig setup --policy\`, which stays as the setup-step composition). ${HONESTY_PIN}`)
-    .requiredOption("--spec <path>", "Rig spec file, or a directory containing rig.yaml/agent.yaml")
+    .description(`Record a policy choice into an EXISTING rig spec (the same recording flow as \`rig setup --policy\`, which stays as the setup-step composition), or with --seat store it on an existing seat. Restore, resume and launches that read the seat's stored state use the stored policy, unless an explicit native selection (rig seat set-permissions) takes precedence; \`rig up <rig name>\` uses it, while a launch from a spec that declares a policy replaces it with the spec's policy, which later restores then use. ${HONESTY_PIN}`)
+    .option("--spec <path>", "Rig spec file, or a directory containing rig.yaml/agent.yaml")
+    .option("--seat <seat>", "An existing seat (canonical session name or logical seat ref). `none` is an explicit floor for that seat and does not inherit the rig's policy. The running process and the spec file are unchanged. Afterwards a `rig launch --retry-startup-from` file has to carry the new policy")
+    .option("--reason <text>", "With --seat: the audit reason (required)")
+    .option("--operator <address>", "With --seat: operator recorded on the audit event when no session identity is present")
     .option("--json", "Machine-readable output")
-    .action((name: string, opts: { spec: string; json?: boolean }) => {
+    .action(async (name: string, opts: { spec?: string; seat?: string; reason?: string; operator?: string; json?: boolean }) => {
+      if ((opts.spec === undefined) === (opts.seat === undefined)) {
+        console.error("Pass exactly one of --spec <path> (record into a rig spec) or --seat <seat> (record on an existing seat).");
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.seat !== undefined) {
+        await applyToSeat(getDeps, name, { ...opts, seat: opts.seat });
+        return;
+      }
       const step = recordPermissionPolicyStep(defaultDeps(), name, opts.spec);
       if (opts.json) console.log(JSON.stringify(step));
       else {

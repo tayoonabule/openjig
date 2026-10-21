@@ -14,8 +14,8 @@ const fixtures: string[] = [];
 afterEach(() => { for (const p of fixtures.splice(0)) fs.rmSync(p, { recursive: true, force: true }); });
 const write = (p: string, data: string | object) => { fs.mkdirSync(join(p, ".."), { recursive: true }); fs.writeFileSync(p, typeof data === "string" ? data : YAML.stringify(data)); };
 
-function project(root: string, id: string, judge: string, missionsDir = "missions") {
-  write(join(root, "project.yaml"), { kind: "project", metadata: { id }, proofPolicy: { judges: [judge] }, missions: { root: missionsDir } });
+function project(root: string, id: string, judge: string | string[], missionsDir = "missions") {
+  write(join(root, "project.yaml"), { kind: "project", metadata: { id }, proofPolicy: { judges: Array.isArray(judge) ? judge : [judge] }, missions: { root: missionsDir } });
   write(join(root, "README.md"), `# ${id}\n`);
   const mission = join(root, missionsDir, "m0"), slice = join(mission, "slices", "01-t001");
   write(join(mission, "mission.yaml"), { kind: "mission", metadata: { name: "m0", status: "active" }, composition: { slices: [{ ref: "slices/01-t001/slice.yaml", order: 1, active: true }] } });
@@ -26,9 +26,9 @@ function project(root: string, id: string, judge: string, missionsDir = "mission
 }
 
 function fixture(alphaMissions = "missions") {
-  const workspace = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "proof-catalog-"))); fixtures.push(workspace);
-  write(join(workspace, "workspace.yaml"), { projects: [{ id: "alpha", root: "alpha" }, { id: "beta", root: "beta" }] });
-  const alpha = project(join(workspace, "alpha"), "alpha", "judge@rig", alphaMissions);
+  const workspace = fs.mkdtempSync(join(tmpdir(), "proof-catalog-")); fixtures.push(workspace);
+  write(join(workspace, "workspace.yaml"), { projects: [{ id: "alpha", root: "alpha", rigs: ["hull"] }, { id: "beta", root: "beta", rigs: ["provineer"] }] });
+  const alpha = project(join(workspace, "alpha"), "alpha", ["judge@rig", "judge@hull"], alphaMissions);
   const beta = project(join(workspace, "beta"), "beta", "judge@rig");
   // The daemon's single selected slices root is a different (legacy) project.
   const legacy = project(join(workspace, "legacy"), "legacy", "judge@rig");
@@ -40,12 +40,12 @@ function fixture(alphaMissions = "missions") {
     await next();
   });
   app.route("/api/proof", proofRoutes());
-  const get = (query: string) => app.request(`/api/proof?${query}`);
-  const judge = async (scope: string, extra: Record<string, unknown> = {}, readDir = alpha.slice) => {
+  const get = (query: string, session?: string) => app.request(`/api/proof?${query}`, { headers: session ? { "X-OpenRig-Session": session } : undefined });
+  const judge = async (scope: string, extra: Record<string, unknown> = {}, readDir = alpha.slice, session = "judge@rig") => {
     const item = readSliceReadiness(readDir).items[0]!;
     return app.request("/api/proof/judge", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-OpenRig-Session": "judge@rig" },
+      headers: { "Content-Type": "application/json", "X-OpenRig-Session": session },
       body: JSON.stringify({ scope, item: item.id, verdict: "accept", reason: "Observed", evidence: ["proof/evidence.md"], expectedRevision: item.revision, expectedPrevious: null, ...extra }),
     });
   };
@@ -53,6 +53,48 @@ function fixture(alphaMissions = "missions") {
 }
 
 describe("project-qualified proof scope (#132)", () => {
+  it("infers projects from the sender rig but preserves explicit selection", async () => {
+    const f = fixture();
+
+    const hull = await f.get("scope=m0/slices/01-t001", "worker@hull");
+    expect(hull.status).toBe(200);
+    expect((await hull.json()).items[0].text).toContain("Prove alpha.");
+
+    const provineer = await f.get("scope=m0/slices/01-t001", "worker@provineer");
+    expect(provineer.status).toBe(200);
+    expect((await provineer.json()).items[0].text).toContain("Prove beta.");
+
+    const explicit = await f.get("project=beta&scope=m0/slices/01-t001", "worker@hull");
+    expect(explicit.status).toBe(200);
+    expect((await explicit.json()).items[0].text).toContain("Prove beta.");
+
+    const judged = await f.judge("m0/slices/01-t001", {}, f.alpha.slice, "judge@hull");
+    expect(judged.status).toBe(201);
+    expect(fs.existsSync(join(f.alpha.slice, "proof/judgments/00000001.md"))).toBe(true);
+    expect(fs.existsSync(join(f.beta.slice, "proof/judgments"))).toBe(false);
+    expect(fs.existsSync(join(f.legacy.slice, "proof/judgments"))).toBe(false);
+  });
+
+  it("normalizes project-root-relative mission paths and rejects escaping paths", async () => {
+    const f = fixture("work/missions");
+
+    const inferred = await f.get("scope=work/missions/m0/slices/01-t001", "worker@hull");
+    expect(inferred.status).toBe(200);
+    expect((await inferred.json()).project).toEqual({ id: "alpha", root: join(f.workspace, "alpha") });
+
+    const explicit = await f.get("project=beta&scope=missions/m0");
+    expect(explicit.status).toBe(200);
+    expect((await explicit.json()).project).toEqual({ id: "beta", root: join(f.workspace, "beta") });
+
+    const judged = await f.judge("work/missions/m0/slices/01-t001", {}, f.alpha.slice, "judge@hull");
+    expect(judged.status).toBe(201);
+    expect((await judged.json()).judgment.scope).toBe("work/missions/m0/slices/01-t001");
+
+    const escaping = await f.get("project=alpha&scope=work/missions/../../../beta/missions/m0");
+    expect(escaping.status).toBe(400);
+    expect((await escaping.json()).error).toBe("path_escape");
+  });
+
   it("show resolves `<project>:<scope>` and `project=` through the catalog, not the selected slices root", async () => {
     const f = fixture();
     const qualified = await f.get(`scope=${encodeURIComponent("alpha:m0/slices/01-t001")}`);

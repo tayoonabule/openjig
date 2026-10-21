@@ -1,12 +1,12 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { proofSourceObservation } from "../domain/proof/source-watch.js";
 import * as path from "node:path";
 import type { SliceIndexer } from "../domain/slices/slice-indexer.js";
 import type { EventBus } from "../domain/event-bus.js";
 import { JudgmentError, evidenceAt, readSliceReadiness, readMissionReadiness, readProjectReadiness, recordJudgment, resolveProofScope, resolveProjectRoot, type JudgeInput } from "../domain/proof/judgments.js";
-import { requireSenderIdentity, resolveRecordedProvenance } from "./require-sender-identity.js";
-import { projectById, sameProjectRoot } from "../domain/workspace/project-read.js";
-import { ProjectReadError } from "../domain/workspace/project-catalog.js";
+import { requireSenderIdentity, resolveRecordedProvenance, transportSenderSession } from "./require-sender-identity.js";
+import { projectById, projectCatalogPaths, sameProjectRoot, selectedProject } from "../domain/workspace/project-read.js";
+import { inferCatalogProject, ProjectReadError, rigFromSession, selectCatalogProject } from "../domain/workspace/project-catalog.js";
 
 // #132 — `<project-id>:<scope>` names a scope inside one workspace-catalog project. Project ids share the
 // catalog's id grammar, which cannot contain "/", so an ordinary mission/slice path never matches. A Windows
@@ -50,20 +50,44 @@ export function proofRoutes(): Hono {
     const value = c.get("sliceIndexer" as never) as SliceIndexer | undefined;
     return value?.isReady() ? value.slicesRoot : null;
   };
-  const target = (c: Parameters<typeof indexer>[0], rawScope: string | undefined, project: unknown, expectedRoot?: unknown) => {
+  const inferredProject = (c: Context) => {
+    try {
+      const { catalog } = projectCatalogPaths(c);
+      try {
+        // Preserve the selected workspace for single-project and uncatalogued setups.
+        selectCatalogProject(catalog);
+        return null;
+      } catch (error) {
+        if (!(error instanceof ProjectReadError) || error.code !== "project_required") return null;
+        const session = transportSenderSession(c);
+        return inferCatalogProject(catalog, error, { rigName: rigFromSession(session) }, []).id;
+      }
+    } catch {
+      // Missing, stale or ambiguous catalog signals keep the legacy selected-root fallback.
+      return null;
+    }
+  };
+  const target = (c: Context, rawScope: string | undefined, project: unknown, expectedRoot?: unknown) => {
     if (project !== undefined && typeof project !== "string") throw new JudgmentError("judgment_invalid", "Project must be a catalog project id");
     if (expectedRoot !== undefined && typeof expectedRoot !== "string") throw new JudgmentError("judgment_invalid", "projectRoot must be the root a prepared read returned");
+    if (project === undefined && c.req.query("project") !== undefined) {
+      try {
+        const selected = selectedProject(c as Parameters<typeof selectedProject>[0]);
+        project = selected?.id;
+        expectedRoot ??= selected?.root;
+      } catch (error) { throw catalogError(error); }
+    }
     let qualified = rawScope === undefined || path.win32.isAbsolute(rawScope) ? null : QUALIFIED_SCOPE.exec(rawScope);
     if (qualified) {
       // The literal path wins where it exists: under the named project (--project) or else the selected workspace.
-      const flagged = project !== undefined ? catalogued(c, project) : null;
+      const flagged = typeof project === "string" ? catalogued(c, project) : null;
       const literalRoot = flagged ? flagged.missionsRoot : project === undefined ? workspaceRoot(c) : null;
       if (existsAt(literalRoot, rawScope!) || !catalogued(c, qualified[1]!)) qualified = null;
     }
-    const id = qualified?.[1] ?? project;
-    if (qualified && project !== undefined && project !== qualified[1]) throw new JudgmentError("project_conflict", `Scope names project ${qualified[1]} but --project names ${project}; select one project`);
+    const id = qualified?.[1] ?? (typeof project === "string" ? project : inferredProject(c));
+    if (qualified && typeof project === "string" && project !== qualified[1]) throw new JudgmentError("project_conflict", `Scope names project ${qualified[1]} but --project names ${project}; select one project`);
     const scope = qualified ? qualified[2]! : rawScope;
-    if (id === undefined) { const owner = indexer(c); return { root: owner.slicesRoot, evidenceRoot: path.dirname(owner.slicesRoot), scope, owner, project: null }; }
+    if (id === undefined || id === null) { const owner = indexer(c); return { root: owner.slicesRoot, evidenceRoot: path.dirname(owner.slicesRoot), scope, owner, project: null }; }
     // Evidence is prepared against the project root (where project.yaml lives), the same root recordJudgment derives,
     // so prepared references still match at judgment time under a nested authored missions.root.
     let p: ReturnType<typeof projectById>;
@@ -72,7 +96,21 @@ export function proofRoutes(): Hono {
     // A judgment carries the root its prepared read resolved: if the catalog now maps the id elsewhere, refuse
     // rather than record against a different project.
     if (typeof expectedRoot === "string" && !sameProjectRoot(expectedRoot, p.root)) throw new JudgmentError("project_changed", `Project ${id} now resolves to ${p.root}, not the ${expectedRoot} the prepared read used; read the proof again`, 409);
-    return { root: p.missionsRoot, evidenceRoot: p.root, scope, owner: null, project: { id: p.id, root: p.root } };
+    let projectScope = scope;
+    if (scope && !path.isAbsolute(scope)) {
+      const missionsPrefix = path.relative(p.root, p.missionsRoot);
+      if (missionsPrefix && missionsPrefix !== ".") {
+        const prefix = `${missionsPrefix}${path.sep}`;
+        if (scope.startsWith(prefix) && existsAt(p.root, scope)) {
+          const fromProjectRoot = path.resolve(p.root, scope);
+          const relativeToMissions = path.relative(p.missionsRoot, fromProjectRoot);
+          if (relativeToMissions && relativeToMissions !== "." && !relativeToMissions.startsWith(`..${path.sep}`) && relativeToMissions !== ".." && !path.isAbsolute(relativeToMissions)) {
+            projectScope = relativeToMissions;
+          }
+        }
+      }
+    }
+    return { root: p.missionsRoot, evidenceRoot: p.root, scope: projectScope, owner: null, project: { id: p.id, root: p.root } };
   };
   // Catalog-project reads have no source watcher (it observes the daemon's selected workspace only), so their
   // freshness is reported as unverified rather than borrowing the selected workspace's state.

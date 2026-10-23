@@ -15,6 +15,7 @@ import { checkpointsSchema } from "../src/db/migrations/005_checkpoints.js";
 import { agentspecRebootSchema } from "../src/db/migrations/014_agentspec_reboot.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
+import { PodRepository } from "../src/domain/pod-repository.js";
 import { StreamStore } from "../src/domain/stream-store.js";
 import type { CmuxTransportFactory } from "../src/adapters/cmux.js";
 import type { ExecFn } from "../src/adapters/tmux.js";
@@ -213,6 +214,55 @@ describe("createDaemon startup composition", () => {
       fs.rmSync(rigRoot, { recursive: true, force: true });
     }
   }, 30000); // harness budget (cold createDaemon compose), not product readiness
+
+  it("managed add with runtime jcode succeeds through the production PodRigInstantiator registry", async () => {
+    const cmuxFactory: CmuxTransportFactory = async () => {
+      throw Object.assign(new Error("no socket"), { code: "ENOENT" });
+    };
+    const rigRoot = fs.mkdtempSync(path.join(os.tmpdir(), "startup-jcode-managed-add-"));
+    fs.mkdirSync(path.join(rigRoot, "agents", "impl"), { recursive: true });
+    fs.writeFileSync(
+      path.join(rigRoot, "agents", "impl", "agent.yaml"),
+      `name: impl\nversion: "1.0.0"\nresources:\n  skills: []\nprofiles:\n  default:\n    uses:\n      skills: []`,
+    );
+    const worldPath = path.join(rigRoot, "world.yaml");
+    fs.writeFileSync(worldPath, DEFAULT_SYSTEM_WORLD_MANIFEST);
+    const saved = saveEnv("OPENRIG_CONTEXT_SYSTEM_WORLD");
+    process.env.OPENRIG_CONTEXT_SYSTEM_WORLD = worldPath;
+    let db: ReturnType<typeof createDb> | undefined;
+    try {
+      const { deps, db: daemonDb } = await createDaemon({ cmuxFactory, tmuxExec: async () => "" });
+      db = daemonDb;
+      const jcodeAdapter = deps.runtimeAdapters?.jcode;
+      const instantiatorAdapters = (deps.podInstantiator as unknown as {
+        deps: { adapters: Record<string, RuntimeAdapter> };
+      }).deps.adapters;
+      expect(jcodeAdapter, "the daemon runtime registry must expose Jcode").toBeDefined();
+      expect(instantiatorAdapters.jcode, "PodRigInstantiator must receive the production Jcode adapter").toBe(jcodeAdapter);
+
+      // The regression is the production adapter map. Stub only the later external
+      // startup boundary so this test exercises managed add without launching a real CLI.
+      vi.spyOn(deps.startupOrchestrator!, "startNode").mockResolvedValue({ ok: true, warnings: [] } as never);
+      const rig = deps.rigRepo.createRig("jcode-managed-add");
+      new PodRepository(db).createPod(rig.id, "core", "Core");
+      const result = await deps.podInstantiator.addMemberToPod(
+        rig.id,
+        "core",
+        { id: "impl", runtime: "jcode", agent_ref: "local:agents/impl", profile: "default", cwd: "." },
+        rigRoot,
+      );
+
+      expect(result.ok, JSON.stringify(result)).toBe(true);
+      if (!result.ok) return;
+      expect(result.result.node.logicalId).toBe("core.impl");
+      expect(result.result.node.status).toBe("launched");
+      expect(result.result.node.sessionName).toBeTruthy();
+    } finally {
+      restoreEnv(saved);
+      db?.close();
+      fs.rmSync(rigRoot, { recursive: true, force: true });
+    }
+  }, 30000);
 
   it("defaults terminal auth to local-trusted mode without minting a token file", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "openrig-terminal-auth-"));

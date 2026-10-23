@@ -42,7 +42,7 @@ describe("readSavedJcodeModel", () => {
   const write = (id: string, body: string) => writeFileSync(join(dir, `${id}.json`), body);
   it("reads the saved model from the tail of a session without loading the transcript", () => {
     const huge = JSON.stringify({ messages: Array.from({ length: 30000 }, (_, i) => ({ role: "user", content: "x".repeat(60), i })) });
-    write("session_big_1790000000000_aa", `{"id":"session_big_1790000000000_aa","messages":${huge.slice(12, -1)},"provider_key":"openai","model":"claude-sonnet-5-5","is_canary":false}`);
+    write("session_big_1790000000000_aa", `{"id":"session_big_1790000000000_aa","messages":${huge.slice(12, -1)},"provider_key":"openai","model":"claude-sonnet-5-5","tail":"${"x".repeat(300 * 1024)}"}`);
     expect(readSavedJcodeModel(home, "session_big_1790000000000_aa")).toBe("claude-sonnet-5-5");
   });
   it("returns null for a missing session, a bad token or no model, keeping the safe hold", () => {

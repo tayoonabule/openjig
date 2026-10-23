@@ -532,7 +532,7 @@ describe("Send CLI", () => {
     expect(sentText?.text).toContain('↩ Reply: rig send');
   });
 
-  it("send without wait-for-idle uses default client timeout path", async () => {
+  it("send without wait-for-idle uses the bounded local-send timeout", async () => {
     const postFn = vi.fn(async () => ({
       status: 200,
       data: { ok: true, sessionName: "dev-impl@my-rig" },
@@ -541,7 +541,7 @@ describe("Send CLI", () => {
     await captureLogs(async () => {
       await makeCmd(deps).parseAsync(["node", "rig", "send", "dev-impl@my-rig", "hello"]);
     });
-    expect(postFn.mock.calls[0]?.[2]).toBeUndefined();
+    expect(postFn.mock.calls[0]?.[2]).toEqual({ timeoutMs: 30_000 });
   });
 
   // Slice-03 Atom 6b — --context delivery flag.

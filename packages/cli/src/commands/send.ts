@@ -16,6 +16,9 @@ import { COMPOSER_PROMPT_CLASS } from "@openrig/daemon/composer-prompts";
 import { resolveContextRef, walkSizedWarning } from "../context-resolve.js";
 
 const WAIT_FOR_IDLE_REQUEST_OVERHEAD_MS = 5_000;
+// Local sends also cross the daemon's tmux/seat boundary. Keep the client budget bounded, but allow for a loaded
+// daemon to finish the request instead of returning an avoidable unknown-outcome timeout after the generic 5s.
+const LOCAL_SEND_TIMEOUT_MS = 30_000;
 // A cross-host send waits for the remote to deliver, and the remote has no fixed deadline of its own (its tmux
 // calls run without a timeout), so no client budget is exact. This one sits well above a normal send, and above
 // fetch's 10 s connect timeout, so a host that never accepts the connection still reads as unreachable. A send
@@ -1150,9 +1153,9 @@ function transportRequestOptions(waitForIdleMs?: number): { timeoutMs?: number; 
   const waitOptions = waitForIdleRequestOptions(waitForIdleMs);
   const headers = terminalAuthHeaders();
   const hasHeaders = Object.keys(headers).length > 0;
-  if (!waitOptions && !hasHeaders) return undefined;
+  if (!waitOptions && !hasHeaders) return { timeoutMs: LOCAL_SEND_TIMEOUT_MS };
   return {
-    ...(waitOptions ?? {}),
+    timeoutMs: Math.max(waitOptions?.timeoutMs ?? 0, LOCAL_SEND_TIMEOUT_MS),
     ...(hasHeaders ? { headers } : {}),
   };
 }

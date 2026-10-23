@@ -471,6 +471,14 @@ export function stopTranscriptRotation(sessionName: string): void {
   unlistedSessions.delete(sessionName);
 }
 
+export async function waitForTranscriptCaptureIdleForTest(sessionName: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (capturingSessions.has(sessionName)) {
+    if (Date.now() >= deadline) throw new Error(`Transcript capture did not stop for ${sessionName}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 /** Test-only: count of active rotators. Production code should not
  *  depend on this. */
 export function getActiveRotationCount(): number {

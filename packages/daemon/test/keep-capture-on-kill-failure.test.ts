@@ -18,7 +18,7 @@ import path from "node:path";
 import { exec, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { shellQuote } from "../src/adapters/shell-quote.js";
-import { startTranscriptRotation, stopTranscriptRotation, getActiveRotationCount, getLastCaptureAt } from "../src/domain/transcript-rotation.js";
+import { startTranscriptRotation, stopTranscriptRotation, getActiveRotationCount, getLastCaptureAt, waitForTranscriptCaptureIdleForTest } from "../src/domain/transcript-rotation.js";
 const run = promisify(exec);
 const runFile = promisify(execFile);
 
@@ -73,7 +73,10 @@ describe.skipIf(process.platform === "win32")("native failed-kill transcript con
     } finally {
       stopTranscriptRotation(sessionName);
       await runFile("tmux", ["-S", socket, "kill-server"], { env }).catch(() => {});
-      db.close(); fs.rmSync(temp, { recursive: true, force: true }); fs.rmSync(socketDir, { recursive: true, force: true });
+      await waitForTranscriptCaptureIdleForTest(sessionName);
+      db.close();
+      fs.rmSync(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+      fs.rmSync(socketDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }
   });
 });

@@ -55,7 +55,7 @@ afterEach(() => {
 });
 
 function indexSection(markdown: string): string {
-  return markdown.match(/\n## The index\n([\s\S]*?)\n## Need more than what ships here\?/)?.[1] ?? "";
+  return markdown.match(/\n## The index\n([\s\S]*?)(?=\n### Shared workspace guidance — read when the task matches|\n## Need more than what ships here\?)/)?.[1] ?? "";
 }
 
 function namedRows(markdown: string): string[] {
@@ -129,9 +129,13 @@ describe("S22 OpenRig skill router coverage", () => {
     darkLayout.skills["seeded-dark-pack"] = { edges: ["spec"], category: "core" };
     expect(coverage(INDEX, darkLayout).dark).toContain("seeded-dark-pack");
 
+    const indexBoundary = "\n### Shared workspace guidance — read when the task matches";
+    const insertionPoint = INDEX.includes(indexBoundary)
+      ? indexBoundary
+      : "\n## Need more than what ships here?";
     const deadIndex = INDEX.replace(
-      "\n## Need more than what ships here?",
-      "\n- **seeded-dead-route** — fixture only.\n\n## Need more than what ships here?",
+      insertionPoint,
+      `\n- **seeded-dead-route** — fixture only.${insertionPoint}`,
     );
     expect(coverage(deadIndex, LAYOUT).dead).toContain("seeded-dead-route");
   });

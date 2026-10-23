@@ -1436,7 +1436,6 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const userSpecLibraryRoot = getDefaultOpenRigPath("specs");
   const compatibleSpecLibraryRoot = getCompatibleOpenRigPath("specs");
 
-
   const deps: AppDeps = {
     databaseWarnings,
     rigRepo,

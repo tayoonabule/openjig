@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import Database from "better-sqlite3";
-import { startLeadCompletionNotice, RECHECK_MS } from "../src/domain/lead-completion-notice.js";
+import { startLeadCompletionNotice, RECHECK_MS, leadCompletionNoticeEnabled } from "../src/domain/lead-completion-notice.js";
 
 function setup(opts: { reported?: boolean; workMs: number; blocked?: boolean; openNotice?: boolean; contentChangedAtMs?: () => number | null; decidedBy?: string | null }) {
   const db = new Database(":memory:");
@@ -29,6 +29,12 @@ function setup(opts: { reported?: boolean; workMs: number; blocked?: boolean; op
 }
 
 describe("lead completion notice", () => {
+  it("keeps the noisy lead-idle policy off unless explicitly opted in", () => {
+    expect(leadCompletionNoticeEnabled({})).toBe(false);
+    expect(leadCompletionNoticeEnabled({ OPENRIG_LEAD_IDLE_NOTICE: "0" })).toBe(false);
+    expect(leadCompletionNoticeEnabled({ OPENRIG_LEAD_IDLE_NOTICE: "1" })).toBe(true);
+  });
+
   it("queues a notice to the advisor when a lead goes idle after real work with no report", async () => {
     const c = setup({ workMs: 300_000 });
     await Promise.resolve();

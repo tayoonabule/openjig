@@ -10,7 +10,7 @@ import { createDaemon } from "./startup.js";
 import { removeParentSessionEnv } from "./domain/parent-session-env.js";
 import { resolveBindPlan } from "./domain/bind-plan.js";
 import { runQueueRetentionSweep, RETENTION_DEFAULTS } from "./domain/queue-retention.js";
-import { startLeadCompletionNotice } from "./domain/lead-completion-notice.js";
+import { startLeadCompletionNotice, leadCompletionNoticeEnabled } from "./domain/lead-completion-notice.js";
 import {
   createStuckSweepStatus,
   resolveStuckSweepIntervalSeconds,
@@ -370,8 +370,8 @@ export async function startServer(port?: number) {
         retentionTimer = startQueueRetentionScheduler(deps);
         // S02 — the standing stuck sweep: nobody has to remember to run the verbs.
         stuckSweepTimer = startStuckSweepScheduler(deps);
-        // A lead that goes idle after real work without reporting gets an automatic notice queued to the advisor.
-        if (deps.queueRepo && deps.seatActivityService && deps.eventBus) {
+        // Opt-in only: sampled pane state does not prove session inactivity, so avoid noisy lead-idle notices by default.
+        if (leadCompletionNoticeEnabled() && deps.queueRepo && deps.seatActivityService && deps.eventBus) {
           stopLeadNotice = startLeadCompletionNotice({ db: deps.rigRepo.db, eventBus: deps.eventBus, queueRepo: deps.queueRepo, seatActivity: deps.seatActivityService, contentChangedAtMs: (n: string) => deps.seatActivityService?.getContentChangedAtMs(n) ?? null });
         }
         // S01 — wake-or-escalate on batons: a failed baton wake retries on schedule,

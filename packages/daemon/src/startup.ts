@@ -2126,7 +2126,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     deps.herdrAgentBridges = herdrAgentBridges;
     const { ManagedHerdrViews, managedViewInventory, listObserverClients } = await import("./domain/terminal/managed-herdr-views.js");
     const sharedTransport = managedHerdrTransport;
-    const sharedAgentBridge = herdrAgentBridge;
+    const sharedAgentBridge = herdrAgentBridge as InstanceType<typeof HerdrAgentBridge> | null;
     if (!sharedTransport || !sharedAgentBridge) throw new Error("Herdr provider resources are unavailable.");
     deps.managedHerdrViews = new ManagedHerdrViews({
       transport: sharedTransport,

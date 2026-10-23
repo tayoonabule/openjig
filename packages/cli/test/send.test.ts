@@ -660,7 +660,7 @@ describe("Send CLI", () => {
     expect(exitCode).toBe(1);
   });
 
-  it("send without wait-for-idle uses the 60 s response budget", async () => {
+  it("send without wait-for-idle uses at least the 60 s response budget", async () => {
     const postFn = vi.fn(async () => ({
       status: 200,
       data: { ok: true, sessionName: "dev-impl@my-rig" },

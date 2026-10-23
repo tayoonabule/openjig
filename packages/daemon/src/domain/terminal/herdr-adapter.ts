@@ -204,6 +204,19 @@ export interface HerdrSplitNode {
 
 export type HerdrLayoutNode = HerdrPaneNode | HerdrSplitNode;
 
+/** Build an equal first-vs-rest strip for managed observer layouts. */
+export function equalStrip(nodes: HerdrLayoutNode[], direction: "right" | "down"): HerdrLayoutNode {
+  if (nodes.length === 0) throw new Error("Cannot build a Herdr strip without nodes");
+  if (nodes.length === 1) return nodes[0]!;
+  return {
+    type: "split",
+    direction,
+    ratio: 1 / nodes.length,
+    first: nodes[0]!,
+    second: equalStrip(nodes.slice(1), direction),
+  };
+}
+
 /** Herdr's own agent label for a seat's runtime, or null when Herdr doesn't recognise it. */
 function herdrAgent(pane: ComposedPane): "claude" | "codex" | "pi" | null {
   return pane.runtime === "claude-code" ? "claude" : pane.runtime === "codex" ? "codex" : pane.runtime === "pi" ? "pi" : null;

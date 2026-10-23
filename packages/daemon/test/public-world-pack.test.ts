@@ -1,7 +1,7 @@
 // OPR.0.5.6.11 — the public world is authored prose with a derivation seam:
 // real atoms, a claim-to-check ledger, a verifier that can fail or skip loudly,
 // and a worked stranger exercise rather than a private-world copy.
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   chmodSync,
   cpSync,
@@ -127,16 +127,24 @@ function authoredManifestClaims(packDir: string, prefix: "public" | "example") {
   ];
 }
 
-function runVerifier(packDir: string, env: NodeJS.ProcessEnv = process.env) {
-  return spawnSync("/bin/sh", [join(packDir, "verify-world.sh")], {
-    cwd: packDir,
-    env,
-    encoding: "utf8",
+function runCommand(command: string, args: string[], cwd: string | undefined, env: NodeJS.ProcessEnv) {
+  return new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (status) => resolve({ status, stdout, stderr }));
   });
 }
 
+function runVerifier(packDir: string, env: NodeJS.ProcessEnv = process.env) {
+  return runCommand("/bin/sh", [join(packDir, "verify-world.sh")], packDir, env);
+}
+
 function runRig(rigPath: string, args: string[], env: NodeJS.ProcessEnv) {
-  return spawnSync(join(rigPath, "rig"), args, { env, encoding: "utf8" });
+  return runCommand(join(rigPath, "rig"), args, undefined, env);
 }
 
 function writeRigFixture(options: {
@@ -406,7 +414,7 @@ describe("public world pack", () => {
 
   it.each(["world-public", "world-example"] as const)(
     "fails when an uncensused authored prose comment appears in %s",
-    (pack) => {
+    async (pack) => {
       const sourcePack = publicWorldDir();
       const redRoot = mkdtempSync(join(tmpdir(), "public-world-manifest-comment-red-"));
       temporaryRoots.push(redRoot);
@@ -423,7 +431,7 @@ describe("public world pack", () => {
       );
 
       const rigPath = writeRigFixture({ showSourcePath: redPack });
-      const result = runVerifier(redPack, {
+      const result = await runVerifier(redPack, {
         ...process.env,
         PATH: `${rigPath}:${process.env.PATH ?? ""}`,
         OPENRIG_CONTEXT_ROOT: "/fixture/context",
@@ -436,7 +444,7 @@ describe("public world pack", () => {
     },
   );
 
-  it("fails when authored manifest purpose or probe semantics materially drift", () => {
+  it("fails when authored manifest purpose or probe semantics materially drift", async () => {
     const sourcePack = publicWorldDir();
     const redRoot = mkdtempSync(join(tmpdir(), "public-world-manifest-claims-red-"));
     temporaryRoots.push(redRoot);
@@ -456,7 +464,7 @@ describe("public world pack", () => {
     writeFileSync(manifestPath, manifest);
 
     const rigPath = writeRigFixture({ showSourcePath: redPack });
-    const result = runVerifier(redPack, {
+    const result = await runVerifier(redPack, {
       ...process.env,
       PATH: `${rigPath}:${process.env.PATH ?? ""}`,
       OPENRIG_CONTEXT_ROOT: "/fixture/context",
@@ -490,7 +498,7 @@ describe("public world pack", () => {
       "The manifest may name files. The prose can say whatever is convenient.",
       /FAIL.*authoring-convention/i,
     ],
-  ] as const)("fails when an authored %s claim materially drifts", (_label, file, before, after, failure) => {
+  ] as const)("fails when an authored %s claim materially drifts", async (_label, file, before, after, failure) => {
     const sourcePack = publicWorldDir();
     const redRoot = mkdtempSync(join(tmpdir(), "public-world-claim-census-red-"));
     temporaryRoots.push(redRoot);
@@ -503,7 +511,7 @@ describe("public world pack", () => {
     writeFileSync(filePath, source.replace(before, after));
 
     const rigPath = writeRigFixture({ showSourcePath: redPack });
-    const result = runVerifier(redPack, {
+    const result = await runVerifier(redPack, {
       ...process.env,
       PATH: `${rigPath}:${process.env.PATH ?? ""}`,
       OPENRIG_CONTEXT_ROOT: "/fixture/context",
@@ -515,7 +523,7 @@ describe("public world pack", () => {
     expect(result.stdout).toMatch(failure);
   });
 
-  it("passes on the shipped bytes, fails on a falsified claim, and skips loudly when rig is absent", () => {
+  it("passes on the shipped bytes, fails on a falsified claim, and skips loudly when rig is absent", async () => {
     const packDir = publicWorldDir();
     const rigPath = writeRigFixture();
     const fixtureEnv = {
@@ -525,7 +533,7 @@ describe("public world pack", () => {
       OPENRIG_SESSION_NAME: "qa@fixture",
       RIGGED_SESSION_NAME: "",
     };
-    const green = runVerifier(packDir, fixtureEnv);
+    const green = await runVerifier(packDir, fixtureEnv);
     expect(green.status, green.stdout + green.stderr).toBe(0);
     expect(green.stdout).toMatch(/passed · 0 failed · 0 skipped/i);
     expect(green.stdout).toMatch(/ok.*run-public-verifier/i);
@@ -538,14 +546,14 @@ describe("public world pack", () => {
       join(redPack, "manifest.yaml"),
       readFileSync(join(redPack, "manifest.yaml"), "utf8").replace("taxonomy: world", "taxonomy: lore"),
     );
-    const red = runVerifier(redPack, fixtureEnv);
+    const red = await runVerifier(redPack, fixtureEnv);
     expect(red.status).toBe(1);
     expect(red.stdout).toMatch(/FAIL.*pack-taxonomy/i);
 
     const wrongIdentityPath = writeRigFixture({
       identityJson: '{"identity":{"rigName":"fixture","memberId":"qa","sessionName":"wrong@fixture"}}',
     });
-    const wrongIdentity = runVerifier(packDir, {
+    const wrongIdentity = await runVerifier(packDir, {
       ...process.env,
       PATH: `${wrongIdentityPath}:${process.env.PATH ?? ""}`,
       OPENRIG_CONTEXT_ROOT: "/fixture/context",
@@ -557,7 +565,7 @@ describe("public world pack", () => {
     expect(wrongIdentity.stdout).toMatch(/ok.*derive-topology/i);
 
     const wrongTopologyPath = writeRigFixture({ topology: "[]" });
-    const wrongTopology = runVerifier(packDir, {
+    const wrongTopology = await runVerifier(packDir, {
       ...process.env,
       PATH: `${wrongTopologyPath}:${process.env.PATH ?? ""}`,
       OPENRIG_CONTEXT_ROOT: "/fixture/context",
@@ -570,20 +578,20 @@ describe("public world pack", () => {
 
     const missingPath = mkdtempSync(join(tmpdir(), "public-world-path-"));
     temporaryRoots.push(missingPath);
-    const skip = runVerifier(packDir, { ...process.env, PATH: missingPath });
+    const skip = await runVerifier(packDir, { ...process.env, PATH: missingPath });
     expect(skip.status, skip.stdout + skip.stderr).toBe(0);
     expect(skip.stdout).toMatch(/skip.*rig-command-surface/i);
     expect(skip.stdout).toMatch(/1 skipped/i);
   });
 
-  it("fails when world-public is absent from the serving and namespace projections", () => {
+  it("fails when world-public is absent from the serving and namespace projections", async () => {
     const rigPath = writeRigFixture({
       showStatus: 73,
       listJson: JSON.stringify([
         { relativePath: "world/install", sourceType: "user_file", sourcePath: "/fixture/private-world" },
       ]),
     });
-    const result = runVerifier(publicWorldDir(), {
+    const result = await runVerifier(publicWorldDir(), {
       ...process.env,
       PATH: `${rigPath}:${process.env.PATH ?? ""}`,
       OPENRIG_CONTEXT_ROOT: "/fixture/context",
@@ -596,9 +604,9 @@ describe("public world pack", () => {
     expect(result.stdout).toMatch(/FAIL.*private-ref-boundary/i);
   });
 
-  it("fails when the context store projection ignores its typed override", () => {
+  it("fails when the context store projection ignores its typed override", async () => {
     const rigPath = writeRigFixture({ configRoot: "/fixture/wrong-context" });
-    const result = runVerifier(publicWorldDir(), {
+    const result = await runVerifier(publicWorldDir(), {
       ...process.env,
       PATH: `${rigPath}:${process.env.PATH ?? ""}`,
       OPENRIG_CONTEXT_ROOT: "/fixture/expected-context",
@@ -610,9 +618,9 @@ describe("public world pack", () => {
     expect(result.stdout).toMatch(/FAIL.*world-example-install/i);
   });
 
-  it("fails when context add is broken despite healthy help and config projections", () => {
+  it("fails when context add is broken despite healthy help and config projections", async () => {
     const rigPath = writeRigFixture({ addStatus: 71 });
-    const result = runVerifier(publicWorldDir(), {
+    const result = await runVerifier(publicWorldDir(), {
       ...process.env,
       PATH: `${rigPath}:${process.env.PATH ?? ""}`,
       OPENRIG_CONTEXT_ROOT: "/fixture/context",
@@ -628,9 +636,9 @@ describe("public world pack", () => {
     ["public pack retrieval", { publicGet: "# unrelated content" }, /FAIL.*retrieve-public-pack/i],
     ["fresh profile composition", { profileJson: '{"pieces":[],"totalEstimatedTokens":0}' }, /FAIL.*compose-fresh-profile/i],
     ["worked example retrieval", { exampleGet: "# unrelated content" }, /FAIL.*retrieve-world-example/i],
-  ] as const)("fails when %s returns the wrong bytes", (_label, fixtureOptions, expectedFailure) => {
+  ] as const)("fails when %s returns the wrong bytes", async (_label, fixtureOptions, expectedFailure) => {
     const rigPath = writeRigFixture(fixtureOptions);
-    const result = runVerifier(publicWorldDir(), {
+    const result = await runVerifier(publicWorldDir(), {
       ...process.env,
       PATH: `${rigPath}:${process.env.PATH ?? ""}`,
       OPENRIG_CONTEXT_ROOT: "/fixture/context",
@@ -642,11 +650,11 @@ describe("public world pack", () => {
     expect(result.stdout).toMatch(expectedFailure);
   });
 
-  it("removes a copied pack when daemon sync never indexes it", () => {
+  it("removes a copied pack when daemon sync never indexes it", async () => {
     const contextRoot = mkdtempSync(join(tmpdir(), "public-world-context-root-"));
     temporaryRoots.push(contextRoot);
     const rigPath = writeRigFixture({ configRoot: contextRoot, partialSync: true });
-    const result = runVerifier(publicWorldDir(), {
+    const result = await runVerifier(publicWorldDir(), {
       ...process.env,
       PATH: `${rigPath}:${process.env.PATH ?? ""}`,
       OPENRIG_CONTEXT_ROOT: contextRoot,
@@ -659,7 +667,7 @@ describe("public world pack", () => {
     expect(readdirSync(contextRoot)).toEqual([]);
   });
 
-  it("lets a stranger in an empty OPENRIG_HOME follow the taught world journey and observe real content", () => {
+  it("lets a stranger in an empty OPENRIG_HOME follow the taught world journey and observe real content", async () => {
     const strangerRoot = mkdtempSync(join(tmpdir(), "public-world-stranger-"));
     temporaryRoots.push(strangerRoot);
     const openrigHome = join(strangerRoot, "openrig-home");
@@ -677,43 +685,43 @@ describe("public world pack", () => {
       RIGGED_SESSION_NAME: "",
     };
 
-    const publicGet = runRig(rigPath, ["context", "get", "world-public"], env);
+    const publicGet = await runRig(rigPath, ["context", "get", "world-public"], env);
     expect(publicGet.status, publicGet.stderr).toBe(0);
     expect(publicGet.stdout).toContain("# Enter the world");
     expect(publicGet.stdout).toContain("# Build your world");
 
-    const profile = runRig(rigPath, ["context", "profile", "world-public", "--situation", "fresh"], env);
+    const profile = await runRig(rigPath, ["context", "profile", "world-public", "--situation", "fresh"], env);
     expect(profile.status, profile.stderr).toBe(0);
     expect(profile.stdout).toContain("# Enter the world");
     expect(profile.stdout).toContain("# Boundaries");
 
-    const show = runRig(rigPath, ["context", "show", "world-public", "--json"], env);
+    const show = await runRig(rigPath, ["context", "show", "world-public", "--json"], env);
     expect(show.status, show.stderr).toBe(0);
     const shownPack = JSON.parse(show.stdout) as { relativePath: string; sourceType: string; sourcePath: string };
     expect(shownPack).toMatchObject({ relativePath: "world-public", sourceType: "builtin" });
 
-    const verification = runVerifier(shownPack.sourcePath, env);
+    const verification = await runVerifier(shownPack.sourcePath, env);
     expect(verification.status, verification.stdout + verification.stderr).toBe(0);
     expect(verification.stdout).toMatch(/ok.*retrieve-public-pack/i);
     expect(verification.stdout).toMatch(/ok.*compose-fresh-profile/i);
     expect(verification.stdout).toMatch(/ok.*retrieve-world-example/i);
 
-    const exampleGet = runRig(rigPath, ["context", "get", "world-example"], env);
+    const exampleGet = await runRig(rigPath, ["context", "get", "world-example"], env);
     expect(exampleGet.status, exampleGet.stderr).toBe(0);
     expect(exampleGet.stdout).toContain("## Exercise: Book world");
 
-    const add = runRig(rigPath, ["context", "add", join(STATIC_ROOT, "world-example"), "--name", "stranger-example", "--json"], env);
+    const add = await runRig(rigPath, ["context", "add", join(STATIC_ROOT, "world-example"), "--name", "stranger-example", "--json"], env);
     expect(add.status, add.stderr).toBe(0);
     expect(existsSync(join(contextRoot, "stranger-example", "manifest.yaml"))).toBe(true);
-    const list = runRig(rigPath, ["context", "list", "--json"], env);
+    const list = await runRig(rigPath, ["context", "list", "--json"], env);
     expect(list.status, list.stderr).toBe(0);
     expect(JSON.parse(list.stdout).some((entry: { relativePath: string }) => entry.relativePath === "stranger-example")).toBe(true);
-    const cleanup = runRig(rigPath, ["context", "rm", "stranger-example", "--json"], env);
+    const cleanup = await runRig(rigPath, ["context", "rm", "stranger-example", "--json"], env);
     expect(cleanup.status, cleanup.stderr).toBe(0);
     expect(existsSync(join(contextRoot, "stranger-example"))).toBe(false);
   });
 
-  it("fails loudly when the pack path returned by context show has no verifier", () => {
+  it("fails loudly when the pack path returned by context show has no verifier", async () => {
     const strangerRoot = mkdtempSync(join(tmpdir(), "public-world-missing-verifier-"));
     temporaryRoots.push(strangerRoot);
     const missingVerifierRoot = join(strangerRoot, "world-public");
@@ -727,12 +735,12 @@ describe("public world pack", () => {
       RIGGED_SESSION_NAME: "",
     };
 
-    const show = runRig(rigPath, ["context", "show", "world-public", "--json"], env);
+    const show = await runRig(rigPath, ["context", "show", "world-public", "--json"], env);
     expect(show.status, show.stderr).toBe(0);
     const shownPack = JSON.parse(show.stdout) as { sourcePath: string };
     expect(shownPack.sourcePath).toBe(missingVerifierRoot);
 
-    const verification = runVerifier(shownPack.sourcePath, env);
+    const verification = await runVerifier(shownPack.sourcePath, env);
     expect(verification.status).not.toBe(0);
     expect(verification.stderr).toMatch(/verify-world\.sh.*(?:cannot open|no such file)/i);
   });

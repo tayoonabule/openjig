@@ -17,6 +17,13 @@ import type { QueueRepository } from "./queue-repository.js";
 export const LEAD_NOTICE_TAG = "auto-completion-notice";
 const MIN_WORK_MS = 120_000;
 export const RECHECK_MS = 600_000;
+
+/** The lead-idle notice policy is opt-in because pane activity alone cannot prove session inactivity. */
+export function leadCompletionNoticeEnabled(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return env.OPENRIG_LEAD_IDLE_NOTICE === "1";
+}
 // Startup recovery pages back through each lead's persisted activity events in pages of this size; it is
 // bounded by logical state runs (final two stretches), never by wall-clock or a fixed event count.
 const RECOVERY_PAGE = 200;

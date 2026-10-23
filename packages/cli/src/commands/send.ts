@@ -20,6 +20,15 @@ import { resolveContextRef, walkSizedWarning } from "../context-resolve.js";
 const SEND_RESPONSE_TIMEOUT_MS = 60_000;
 const UNCONFIRMED_SEND_GUIDANCE = "A busy agent may hold delivered input off-screen, so absence from a pane capture does not prove non-delivery. " +
   "Wait for recipient acknowledgment or reconcile with the recipient before resending; another send or queue item risks duplicate work.";
+const WAIT_FOR_IDLE_REQUEST_OVERHEAD_MS = 5_000;
+// Local sends also cross the daemon's tmux/seat boundary. Keep the client budget bounded, but allow for a loaded
+// daemon to finish the request instead of returning an avoidable unknown-outcome timeout after the generic 5s.
+const LOCAL_SEND_TIMEOUT_MS = 30_000;
+// A cross-host send waits for the remote to deliver, and the remote has no fixed deadline of its own (its tmux
+// calls run without a timeout), so no client budget is exact. This one sits well above a normal send, and above
+// fetch's 10 s connect timeout, so a host that never accepts the connection still reads as unreachable. A send
+// that outlasts it reads as unconfirmed, never as failed.
+const CROSS_HOST_SEND_TIMEOUT_MS = 30_000;
 
 /** The shared composer glyph set (Claude `❯`, Codex `›`, Codex 0.153 `»`) from the daemon's
  * composer-prompts surface, so the CLI staged check can never disagree with the daemon guard. */
@@ -921,7 +930,7 @@ async function runHttpHostSend(
     session, text: outboundText, exactText: raw ? undefined : text, verify: opts.verify, force: opts.force, waitForIdleMs,
     dangerouslyInteract: opts.dangerouslyInteract, typeWithoutChecking: opts.typeWithoutChecking, reason: opts.reason, actorSession: senderSession ?? null,
     ...(opts.urgent ? { urgent: true } : {}),
-  }, deps, { timeoutMs: (waitForIdleMs ?? 0) + SEND_RESPONSE_TIMEOUT_MS });
+  }, deps, { timeoutMs: Math.max((waitForIdleMs ?? 0) + SEND_RESPONSE_TIMEOUT_MS, CROSS_HOST_SEND_TIMEOUT_MS) });
 
   // A send that may have reached the remote is unconfirmed, not unreachable: it may have been delivered, and a
   // resend without checking risks a duplicate.
@@ -1168,8 +1177,9 @@ function parseWaitForIdleMs(value: string | undefined): number | undefined | nul
 function transportRequestOptions(waitForIdleMs?: number): { timeoutMs: number; headers?: Record<string, string> } {
   const headers = terminalAuthHeaders();
   const hasHeaders = Object.keys(headers).length > 0;
+  const waitOptions = waitForIdleMs === undefined ? undefined : { timeoutMs: waitForIdleMs + WAIT_FOR_IDLE_REQUEST_OVERHEAD_MS };
   return {
-    timeoutMs: (waitForIdleMs ?? 0) + SEND_RESPONSE_TIMEOUT_MS,
+    timeoutMs: Math.max((waitForIdleMs ?? 0) + SEND_RESPONSE_TIMEOUT_MS, waitOptions?.timeoutMs ?? 0, LOCAL_SEND_TIMEOUT_MS),
     ...(hasHeaders ? { headers } : {}),
   };
 }

@@ -23,7 +23,7 @@ const okRig = (stdout = ""): RigResult => ({ code: 0, stdout, stderr: "" });
 // pipeline (the heavy spawn+run half is the integration path).
 
 let dir: string | undefined;
-afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); dir = undefined; });
+afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); dir = undefined; vi.unstubAllEnvs(); });
 function scratch(): string { dir = mkdtempSync(join(tmpdir(), "scn-pipe-")); return dir; }
 function write(name: string, body: string): string {
   const d = dir ?? scratch();
@@ -34,6 +34,7 @@ function write(name: string, body: string): string {
 
 describe("loadScenarioFile", () => {
   it("threads the explicit seed controller through the pipeline without a live daemon", async () => {
+    vi.stubEnv("TMUX", "");
     const { runScenarioFile } = await import("./helpers/scenario-pipeline.js");
     const p = write("seed.yaml", "scenario: seeded\ntopology: ./unused.yaml\nsteps:\n  - seed_regression: {class: baton-drop}\n");
     const seedRegression = vi.fn(async () => ({ code: 0, stdout: "armed", stderr: "" }));

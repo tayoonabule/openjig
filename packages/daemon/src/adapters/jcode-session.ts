@@ -275,7 +275,7 @@ export function readSavedJcodeModel(home: string, resumeToken: string): string |
   let fd: number | undefined;
   try {
     const size = fs.statSync(file).size;
-    const length = Math.min(size, 256 * 1024);
+    const length = Math.min(size, 8 * 1024 * 1024);
     const buffer = Buffer.alloc(length);
     fd = fs.openSync(file, "r");
     fs.readSync(fd, buffer, 0, length, size - length);

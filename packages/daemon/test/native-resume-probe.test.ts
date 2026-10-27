@@ -329,6 +329,10 @@ describe("native resume probe", () => {
     expect(probe("jcode", "Jcode\n1> \nlast turn result")).toMatchObject({ status: "inconclusive" });
     expect(probe("jcode", "Log in to continue\n1> previous\nWelcome to onboarding"))
       .toMatchObject({ status: "attention_required", code: "login_required" });
+    // Idle status bar at 0% context (no token count) directly under the prompt is ready.
+    expect(probe("jcode", "Jcode\n1>\n~/…/core-qa 0% GPT-6 Luna medium")).toMatchObject({ status: "resumed" });
+    // A prompt followed by unrelated text must not count as ready.
+    expect(probe("jcode", "Jcode\n1>\nwaiting for response…")).toMatchObject({ status: "inconclusive" });
     expect(probe("jcode", "Jcode\n2> \n16k/1.0M ▱▱▱▱ 2%"))
       .toMatchObject({ status: "resumed", code: "active_runtime" });
   });

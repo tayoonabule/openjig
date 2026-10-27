@@ -306,8 +306,9 @@ export function assessNativeResumeProbe(
     }
     const lines = paneContent.split("\n").map((line) => line.trim()).filter(Boolean);
     const last = lines.at(-1) ?? "";
-    const prompt = /^\d+>\s*$/.test(last) || (/\d+(?:\.\d+)?[kKmM]?\/\d+(?:\.\d+)?[kKmM]?/.test(last)
-      && /^\d+>\s*$/.test(lines.at(-2) ?? ""));
+    // Idle Jcode panes end with a status bar (token count, or percent at 0% context) directly under the "N>" prompt.
+    const statusBar = /\d+(?:\.\d+)?[kKmM]?\/\d+(?:\.\d+)?[kKmM]?|\b\d+%\s+\S/.test(last);
+    const prompt = /^\d+>\s*$/.test(last) || (statusBar && /^\d+>\s*$/.test(lines.at(-2) ?? ""));
     if (/\b(sign in|log in|login required|authenticate to continue|onboarding)\b/i.test(paneContent) && !prompt) {
       return { status: "attention_required", code: "login_required", detail: "Jcode needs login or onboarding before the session can become interactive." };
     }

@@ -1933,6 +1933,24 @@ export class SeatLifecycleService {
     return row?.resume_token?.trim() || null;
   }
 
+  /**
+   * A seat started by hand has no persisted startup row. Reuse the row of a sibling in the
+   * same pod that runs the same runtime and agent reference (the same role). The sibling row
+   * is read only, never written. The caller still supplies this seat's own cwd.
+   */
+  private sameRoleSiblingStartupContext(nodeId: string): PersistedStartupContextRow | undefined {
+    const self = this.db.prepare("SELECT pod_id, runtime, agent_ref FROM nodes WHERE id = ?").get(nodeId) as
+      | { pod_id: string | null; runtime: string | null; agent_ref: string | null }
+      | undefined;
+    if (!self?.pod_id || !self.runtime || !self.agent_ref) return undefined;
+    return this.db.prepare(
+      `SELECT c.projection_entries_json, c.resolved_files_json, c.startup_actions_json, c.runtime
+         FROM node_startup_context c JOIN nodes n ON n.id = c.node_id
+        WHERE n.pod_id = ? AND n.runtime = ? AND n.agent_ref = ? AND n.id <> ?
+        ORDER BY n.logical_id LIMIT 1`,
+    ).get(self.pod_id, self.runtime, self.agent_ref, nodeId) as PersistedStartupContextRow | undefined;
+  }
+
   readStartupContext(
     nodeId: string,
     cwd: string,
@@ -1940,7 +1958,9 @@ export class SeatLifecycleService {
     const row = this.db.prepare(
       "SELECT projection_entries_json, resolved_files_json, startup_actions_json, runtime FROM node_startup_context WHERE node_id = ?",
     ).get(nodeId) as PersistedStartupContextRow | undefined;
-    if (!row) {
+    const sibling = row ? undefined : this.sameRoleSiblingStartupContext(nodeId);
+    const source = row ?? sibling;
+    if (!source) {
       return {
         ok: false,
         refusal: {
@@ -1955,13 +1975,13 @@ export class SeatLifecycleService {
     let rawFiles: unknown;
     let rawActions: unknown;
     try {
-      rawEntries = JSON.parse(row.projection_entries_json);
-      rawFiles = JSON.parse(row.resolved_files_json);
-      rawActions = JSON.parse(row.startup_actions_json);
+      rawEntries = JSON.parse(source.projection_entries_json);
+      rawFiles = JSON.parse(source.resolved_files_json);
+      rawActions = JSON.parse(source.startup_actions_json);
     } catch (error) {
       return this.malformedStartupContext(nodeId, `JSON parse failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-    if (!Array.isArray(rawEntries) || !Array.isArray(rawFiles) || !Array.isArray(rawActions) || !row.runtime?.trim()) {
+    if (!Array.isArray(rawEntries) || !Array.isArray(rawFiles) || !Array.isArray(rawActions) || !source.runtime?.trim()) {
       return this.malformedStartupContext(nodeId, "projection entries, resolved files, and startup actions must be arrays and runtime must be non-empty");
     }
 
@@ -2052,7 +2072,7 @@ export class SeatLifecycleService {
       appliesOn: file.appliesOn,
     }));
     const plan: ProjectionPlan = {
-      runtime: row.runtime,
+      runtime: source.runtime,
       cwd,
       entries,
       startup: { files: startupFiles, actions: startupActions },
@@ -2061,9 +2081,9 @@ export class SeatLifecycleService {
       diagnostics: [],
     };
     const hash = createHash("sha256")
-      .update(JSON.stringify([row.projection_entries_json, row.resolved_files_json, row.startup_actions_json, row.runtime]))
+      .update(JSON.stringify([source.projection_entries_json, source.resolved_files_json, source.startup_actions_json, source.runtime]))
       .digest("hex");
-    return { ok: true, context: { plan, resolvedStartupFiles, startupActions, runtime: row.runtime, hash } };
+    return { ok: true, context: { plan, resolvedStartupFiles, startupActions, runtime: source.runtime, hash } };
   }
 
   private malformedStartupContext(

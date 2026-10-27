@@ -894,6 +894,15 @@ table, and `rig up kernel --existing` refuses a kernel with live sessions.
 A retained `excluded_from_subset` reason may come from an earlier subset
 restore; inspect its event before attributing it to the latest reboot.
 
+### Recover an existing agent seat without losing its conversation
+
+When a recovery is already authorized, carry it out within the stated scope, including busy seats if explicitly included. Do not ask for the same approval again. Check the actual seat and preserve its session, model and work; report a concrete blocker only when no authorized safe path remains.
+
+- Use the canonical session name, including its rig. Inspect `rig ps --nodes --rig <rig>`, the pane and the recorded resume identity before changing anything. A single-node `rig launch <rig> <node>` leaves siblings unchanged, but `already_running` is a no-op, not a restart. Check the result fields, not just `ok`.
+- A stopped or detached seat may return `awaiting-decision` rather than resume an unverified token. Do not replace it with `--fresh` unless a fresh conversation was explicitly requested. If a session is manually resumed in its canonical pane, `rig reconcile-session <canonical-session> --rig <rig-id> --node <logical-id> --no-launch` reattaches it without launching. Check its continuity and projection warnings; reconciliation alone does not prove the transcript or effective model.
+- `rig seat stop` refuses adopted sessions. `rig unclaim` preserves the live tmux session but removes its OpenRig binding; it does not stop the process or make it managed. If a name is ambiguous, the exact ID it expects is the OpenRig session **row ID**, not the native Jcode resume ID. Do not release other seats to resolve one seat's ambiguity.
+- Verify the actual outcome: native session and model, usable pane, binding and a real turn when needed. A configured model or footer is not proof of the provider request. A synthetic hook POST or runtime self-report is not proof that a natural turn hook fired. Check the execution boundary, especially shared Jcode servers, before assuming a new client environment updates their hooks. Never print credentials.
+
 **When the kernel's seats all fail at the first start.** A report on Oracle Linux 10
 ([#980](https://github.com/mvschwarz/openrig/issues/980)) traced this to the distribution's packaged tmux, whose
 `tmux -V` prints `next-3.4`: its server exited on every `capture-pane -p`, also outside OpenRig. `rig setup` (its tmux

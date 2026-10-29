@@ -28,6 +28,8 @@ interface QueueNoticeEvent {
   fromState?: string;
   toState?: string;
   closureReason?: string | null;
+  closureTarget?: string | null;
+  actorSession?: string;
   fromSession?: string;
   toSession?: string;
 }
@@ -127,8 +129,8 @@ export function startQueueEmptyFrontierNotice(deps: {
 
     try {
       const row = deps.db.prepare(
-        "SELECT destination_session AS destination, tags, state, closure_reason FROM queue_items WHERE qitem_id = ?",
-      ).get(event.qitemId) as { destination: string; tags: string | null; state: string; closure_reason: string | null } | undefined;
+        "SELECT destination_session AS destination, tags, state, closure_reason, closure_target FROM queue_items WHERE qitem_id = ?",
+      ).get(event.qitemId) as { destination: string; tags: string | null; state: string; closure_reason: string | null; closure_target: string | null } | undefined;
       if (!row?.destination) return;
       let tags: string[] = [];
       try { tags = JSON.parse(row.tags ?? "[]") as string[]; } catch { /* malformed legacy tags do not opt in */ }
@@ -136,16 +138,27 @@ export function startQueueEmptyFrontierNotice(deps: {
 
       const noFollowOn = event.type === "queue.updated"
         && event.fromState === "in-progress" && event.toState === "done" && event.closureReason === "no-follow-on";
-      // Both queue.handoff() and queue.handoffAndComplete() emit queue.handed_off.
-      // The latter stores the source row as done, while the former stores handed-off.
+      // Transactional handoff verbs emit queue.handed_off. Some established CLI
+      // handoff closures instead arrive as queue.updated with handed_off_to while
+      // storing the source as done. Accept both observed persisted event paths.
       // The recipient's successor is not actionable work for the original sender.
       const handedOff = ["handed-off", "done"].includes(row.state) && row.closure_reason === "handed_off_to"
         && (event.type === "queue.handed_off"
           ? event.fromSession === row.destination
-          : event.type === "queue.updated" && event.fromState === "in-progress" && event.toState === "handed-off");
+          : event.type === "queue.updated"
+            && event.fromState === "in-progress"
+            && ["handed-off", "done"].includes(event.toState ?? "")
+            && event.closureReason === "handed_off_to"
+            && event.actorSession === row.destination);
       if (noFollowOn || handedOff) {
         const evidence = candidates.get(row.destination) ?? new Map<string, string>();
-        evidence.set(event.qitemId, handedOff ? `handed off to ${event.toSession ?? "recipient"}` : "no-follow-on");
+        let recipient = event.toSession;
+        if (handedOff && !recipient && row.closure_target) {
+          recipient = (deps.db.prepare(
+            "SELECT destination_session AS destination FROM queue_items WHERE qitem_id = ?",
+          ).get(row.closure_target) as { destination?: string } | undefined)?.destination;
+        }
+        evidence.set(event.qitemId, handedOff ? `handed off to ${recipient ?? "recipient"}` : "no-follow-on");
         candidates.set(row.destination, evidence);
       }
       // A non-qualifying transition can still remove the last actionable blocker for

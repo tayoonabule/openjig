@@ -136,7 +136,10 @@ export function startQueueEmptyFrontierNotice(deps: {
 
       const noFollowOn = event.type === "queue.updated"
         && event.fromState === "in-progress" && event.toState === "done" && event.closureReason === "no-follow-on";
-      const handedOff = row.state === "handed-off" && row.closure_reason === "handed_off_to"
+      // Both queue.handoff() and queue.handoffAndComplete() emit queue.handed_off.
+      // The latter stores the source row as done, while the former stores handed-off.
+      // The recipient's successor is not actionable work for the original sender.
+      const handedOff = ["handed-off", "done"].includes(row.state) && row.closure_reason === "handed_off_to"
         && (event.type === "queue.handed_off"
           ? event.fromSession === row.destination
           : event.type === "queue.updated" && event.fromState === "in-progress" && event.toState === "handed-off");

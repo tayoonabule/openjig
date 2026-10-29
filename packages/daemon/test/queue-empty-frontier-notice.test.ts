@@ -263,4 +263,66 @@ describe("queue empty-frontier notice", () => {
       db.close();
     }
   });
+
+  it("cues the original sender for the persisted queue.updated done/handed_off_to path", async () => {
+    const db = createDb();
+    migrate(db, ALL_MIGRATIONS);
+    const eventBus = new EventBus(db);
+    const repo = new QueueRepository(db, eventBus, { validateRig: () => true });
+    let activity = "working";
+    const stop = startQueueEmptyFrontierNotice({
+      db,
+      eventBus,
+      queueRepo: repo,
+      seatActivity: { getSeatStateBySession: () => ({ activity }) },
+      resolveLead: (_db, seat) => seat === "researcher@test" ? "lead@test" : null,
+    });
+
+    try {
+      const source = await repo.create({
+        sourceSession: "lead@test",
+        destinationSession: "researcher@test",
+        body: "complete a concrete production-path inventory",
+        nudge: false,
+      });
+      repo.claim({ qitemId: source.qitemId, destinationSession: "researcher@test" });
+      const successor = await repo.create({
+        sourceSession: "researcher@test",
+        destinationSession: "architect@test",
+        body: "review the completed production-path inventory",
+        nudge: false,
+      });
+      repo.update({
+        qitemId: source.qitemId,
+        actorSession: "researcher@test",
+        state: "done",
+        closureReason: "handed_off_to",
+        closureTarget: successor.qitemId,
+      });
+
+      activity = "idle-at-prompt";
+      eventBus.emit({
+        type: "seat.activity_changed",
+        sessionName: "researcher@test",
+        seatNodeId: "researcher-node",
+        seq: 1,
+        at: new Date().toISOString(),
+      } as never);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      const cues = db.prepare(
+        "SELECT destination_session, body, tags FROM queue_items WHERE source_session = 'daemon@kernel' AND tags LIKE ?",
+      ).all(`%${EMPTY_FRONTIER_NOTICE_TAG}%`) as Array<{ destination_session: string; body: string; tags: string }>;
+      expect(cues).toHaveLength(1);
+      expect(cues[0]?.destination_session).toBe("lead@test");
+      expect(cues[0]?.body).toContain(`${source.qitemId} (handed off to architect@test)`);
+      expect(cues[0]?.body).toContain("successor belongs to its recipient");
+      expect(repo.getById(successor.qitemId)?.destinationSession).toBe("architect@test");
+      expect(repo.list({ destinationSession: "researcher@test", state: ["pending", "in-progress"] })).toHaveLength(0);
+    } finally {
+      stop();
+      db.close();
+    }
+  });
 });

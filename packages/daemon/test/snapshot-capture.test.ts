@@ -208,8 +208,8 @@ describe("SnapshotCapture", () => {
     sessionRegistry.updateResumeToken(occupant.id, "claude_id", "native-a", "hook");
     sessionRegistry.updateStatus(occupant.id, "running");
     const generation = sessionRegistry.currentOccupantTenure(n1.id)!.generationUuid;
-    db.prepare("INSERT INTO events (rig_id, type, payload) VALUES (?, 'seat.fresh_launched', ?)")
-      .run(rig.id, JSON.stringify({ nodeId: n1.id, sessionId: occupant.id, newGeneration: generation }));
+    db.prepare("INSERT INTO events (rig_id, node_id, type, payload) VALUES (?, ?, 'seat.fresh_launched', ?)")
+      .run(rig.id, n1.id, JSON.stringify({ nodeId: n1.id, sessionId: occupant.id, newGeneration: generation }));
     const snapshot = capture.captureSnapshot(rig.id, "auto-pre-down");
     sessionRegistry.updateStatus(occupant.id, "exited");
     const current = rigRepo.getRig(rig.id)!;

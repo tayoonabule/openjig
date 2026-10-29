@@ -54,7 +54,7 @@ export function listSharedHistories(
   const savedNode = snapshot.data.nodes.find((entry) => entry.id === node.id && entry.logicalId === node.logicalId);
   if (!savedNode || (snapshot.data.topologyRoster && !snapshot.data.topologyRoster.intendedNodeIds.includes(node.id))
     || savedNode.runtime !== node.runtime
-    || restoreRuntimeCompatibilityError(node.runtime, snapshot.data.nodeStartupContext?.[node.id]?.runtime)) return sourceUnavailable();
+    || restoreRuntimeCompatibilityError(node.runtime, snapshot.data.nodeStartupContext?.[node.id]?.runtime, savedNode.runtime)) return sourceUnavailable();
   const active = resolveActiveSnapshotSession(snapshot.data, node.id);
   if (active.kind === "ambiguous") return sourceUnavailable();
   if (selection && selection.snapshotId !== snapshot.id) return historyUnavailable();

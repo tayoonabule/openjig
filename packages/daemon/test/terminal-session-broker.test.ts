@@ -236,7 +236,12 @@ describe("TerminalSessionBroker", () => {
   it("test 7b: canonical geometry is set ONCE at open (window-size manual + 120xN, NOT aggressive-resize)", async () => {
     const setWindowOption = vi.fn(async () => ({ ok: true as const }));
     const resizeWindow = vi.fn(async () => ({ ok: true as const }));
-    const broker = track(new TerminalSessionBroker("dev@rig", makeTmux({ setWindowOption, resizeWindow }), {
+    const broker = track(new TerminalSessionBroker("dev@rig", makeTmux({
+      readWindow: async () => ({ id: "@7", userOption: "" }),
+      getWindowLocalOption: async () => null,
+      setWindowOption,
+      resizeWindow,
+    }), {
       pollMs: 10,
       cols: 120,
       rows: 40,
@@ -245,20 +250,30 @@ describe("TerminalSessionBroker", () => {
     await broker.attach(makeSub());
 
     expect(resizeWindow).toHaveBeenCalledOnce();
-    expect(resizeWindow).toHaveBeenCalledWith("dev@rig", 120, 40);
-    expect(setWindowOption).toHaveBeenCalledWith("dev@rig", "window-size", "manual");
+    expect(resizeWindow).toHaveBeenCalledWith("@7", 120, 40);
+    expect(setWindowOption).toHaveBeenCalledWith("@7", "window-size", "manual");
     // aggressive-resize fights fixed geometry (shrinks to smallest client) — must NOT be set.
     expect(setWindowOption).not.toHaveBeenCalledWith("dev@rig", "aggressive-resize", expect.anything());
   });
 
-  it("test 7c: the last detach restores window-size latest so the seat window follows tmux config again", async () => {
-    const setWindowOption = vi.fn(async () => ({ ok: true as const }));
-    const broker = track(new TerminalSessionBroker("dev@rig", makeTmux({ setWindowOption }), { pollMs: 10, cols: 120, rows: 40 }));
+  it("test 7c: the last detach restores inherited sizing on the immutable window", async () => {
+    let pinRecord = "";
+    const setWindowOption = vi.fn(async (_target: string, option: string, value: string) => {
+      if (option === "@openrig-window-size-prior") pinRecord = value;
+      return { ok: true as const };
+    });
+    const restoreWindowOption = vi.fn(async () => ({ ok: true as const }));
+    const broker = track(new TerminalSessionBroker("dev@rig", makeTmux({
+      readWindow: async () => ({ id: "@7", userOption: pinRecord }),
+      getWindowLocalOption: async () => null,
+      setWindowOption,
+      restoreWindowOption,
+    }), { pollMs: 10, cols: 120, rows: 40 }));
     const a = makeSub();
     await broker.attach(a);
-    expect(setWindowOption).not.toHaveBeenCalledWith("dev@rig", "window-size", "latest");
+    expect(setWindowOption).not.toHaveBeenCalledWith("@7", "window-size", "latest");
     broker.detach(a);
-    await vi.waitFor(() => expect(setWindowOption).toHaveBeenLastCalledWith("dev@rig", "window-size", "latest"));
+    await vi.waitFor(() => expect(restoreWindowOption).toHaveBeenCalledWith("@7", "window-size", null));
   });
 
   it("test 8: seeds on FIRST attach with NO resize message, as the first bytes the subscriber sees", async () => {
@@ -965,11 +980,29 @@ describe("TerminalSessionBroker - window sizing after the last viewer", () => {
     expect(restoreWindowOption).not.toHaveBeenCalled();
   });
 
-  it("without a window id the session's window is pinned as before, and nothing is given back to another window", async () => {
-    const { tmux, calls, restoreWindowOption } = sizingTmux("largest", { readWindow: async () => null });
-    await visit(tmux);
-    expect(calls).toEqual(["set:dev@rig:window-size=manual"]);
-    expect(restoreWindowOption).not.toHaveBeenCalled();
+  it("does not resize the wrong window if the session switches while its window ID is unreadable", async () => {
+    let currentWindow = "@1";
+    const targets: { target: string; currentWindow: string }[] = [];
+    const tmux = makeTmux({
+      readWindow: async () => null,
+      setWindowOption: async (target) => {
+        targets.push({ target, currentWindow });
+        return { ok: true };
+      },
+      resizeWindow: async (target) => {
+        targets.push({ target, currentWindow });
+        return { ok: true };
+      },
+    });
+    let finishTeardown!: () => void;
+    const teardownFinished = new Promise<void>(resolve => { finishTeardown = resolve; });
+    const b = broker(tmux, finishTeardown);
+    const subscriber = makeSub();
+    await b.attach(subscriber);
+    currentWindow = "@2";
+    b.detach(subscriber);
+    await teardownFinished;
+    expect(targets).toEqual([]);
   });
 
   it("a failed open gives the sizing back too", async () => {

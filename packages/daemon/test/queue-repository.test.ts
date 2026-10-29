@@ -1458,7 +1458,7 @@ describe("QueueRepository.listOpenObligations: same rows, order and limit as lis
       for (const seat of [...seats, "nobody@r"]) {
         for (const limit of [1, 3, 500]) {
           const want = repo.list({ destinationSession: seat, state: ["pending", "in-progress", "blocked"], limit })
-            .map((r) => ({ qitemId: r.qitemId, state: r.state, summary: r.summary ?? null }));
+            .map((r) => ({ qitemId: r.qitemId, state: r.state, summary: r.summary ?? null, blockedOn: r.blockedOn ?? null }));
           expect(repo.listOpenObligations(seat, limit), `seed ${seed} ${seat} limit ${limit}`).toEqual(want);
         }
       }

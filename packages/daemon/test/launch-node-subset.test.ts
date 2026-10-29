@@ -138,7 +138,7 @@ describe("RestoreOrchestrator.launchNodeSubset", () => {
     const before = db.prepare("SELECT * FROM sessions ORDER BY id").all();
     const result = await orchestrator.launchNodeSubset(rigId, ["dev.driver"], { snapshotId });
     expect(result.ok).toBe(true); // The subset envelope reports individual launch outcomes.
-    expect(result.launched?.[0]).toMatchObject({ status: "awaiting-decision", error: "No session was started for this seat. Restore a snapshot whose saved startup runtime matches the seat's current runtime." });
+    expect(result.launched?.[0]).toMatchObject({ status: "awaiting-decision", error: "No session was started for this seat. Restore a snapshot whose saved seat and startup runtimes match the seat's current runtime." });
     expect(tmux.createSession).not.toHaveBeenCalled();
     expect(db.prepare("SELECT * FROM sessions ORDER BY id").all()).toEqual(before);
   });

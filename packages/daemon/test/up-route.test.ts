@@ -514,8 +514,8 @@ describe("Up API route", () => {
       sessionRegistry.updateResumeToken(current.id, "claude_id", "native-current", "hook");
       sessionRegistry.updateStatus(current.id, "running");
       const generation = sessionRegistry.currentOccupantTenure(node.id)!.generationUuid;
-      db.prepare("INSERT INTO events (rig_id, type, payload) VALUES (?, 'seat.fresh_launched', ?)")
-        .run(rig.id, JSON.stringify({ nodeId: node.id, sessionId: current.id, newGeneration: generation }));
+      db.prepare("INSERT INTO events (rig_id, node_id, type, payload) VALUES (?, ?, 'seat.fresh_launched', ?)")
+        .run(rig.id, node.id, JSON.stringify({ nodeId: node.id, sessionId: current.id, newGeneration: generation }));
       const snapshot = snapshotCapture.captureSnapshot(rig.id, "auto-pre-down");
       sessionRegistry.updateStatus(current.id, "exited");
       return { rig, node, current, snapshot };
@@ -570,8 +570,8 @@ describe("Up API route", () => {
       sessionRegistry.markSuperseded(current.id);
       const successor = sessionRegistry.registerSession(node.id, "main-lead@kadence-moved-on", "fresh");
       const generation = sessionRegistry.currentOccupantTenure(node.id)!.generationUuid;
-      db.prepare("INSERT INTO events (rig_id, type, payload) VALUES (?, 'seat.fresh_launched', ?)")
-        .run(rig.id, JSON.stringify({ nodeId: node.id, sessionId: successor.id, newGeneration: generation }));
+      db.prepare("INSERT INTO events (rig_id, node_id, type, payload) VALUES (?, ?, 'seat.fresh_launched', ?)")
+        .run(rig.id, node.id, JSON.stringify({ nodeId: node.id, sessionId: successor.id, newGeneration: generation }));
       sessionRegistry.updateStatus(successor.id, "exited");
       const restoreSpy = vi.spyOn(restoreOrchestrator, "restore");
 
@@ -584,7 +584,7 @@ describe("Up API route", () => {
       expect(res.status).toBe(404);
       const body = await res.json();
       expect(body).toMatchObject({ code: "no_snapshot", rigId: rig.id });
-      expect(body.error).toContain("older occupant");
+      expect(body.error).toContain("current occupant state");
       expect(restoreSpy).not.toHaveBeenCalled();
     });
   });

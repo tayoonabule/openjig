@@ -311,12 +311,13 @@ export function buildRestorePlanPreview(
           return selected ? { kind: "resolved" as const, session: selected } : { kind: "none" as const };
         })()
       : resolveActiveSnapshotSession<PreviewSessionRow>(occupancy, savedNodeId);
+    const savedRuntime = snapshot?.data.nodes?.find(saved => saved.logicalId === node.logicalId)?.runtime ?? node.runtime;
     const runtimeError = resolution.kind !== "ambiguous"
-      ? restoreRuntimeCompatibilityError(node.runtime, snapshot?.data.nodeStartupContext?.[savedNodeId]?.runtime)
+      ? restoreRuntimeCompatibilityError(node.runtime, snapshot?.data.nodeStartupContext?.[savedNodeId]?.runtime, savedRuntime)
       : null;
     // The runtimes and recorded sessions restore reads the seat's policy through: the snapshot's own node, else the live one.
     const seat: RestoreSeatFacts = {
-      savedRuntime: snapshot?.data.nodes?.find(saved => saved.logicalId === node.logicalId)?.runtime ?? node.runtime,
+      savedRuntime,
       currentRuntime: node.runtime,
       recordedSessions: sessionRows.filter((row) => row.nodeId === savedNodeId),
     };

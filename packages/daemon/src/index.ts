@@ -11,6 +11,7 @@ import { removeParentSessionEnv } from "./domain/parent-session-env.js";
 import { resolveBindPlan } from "./domain/bind-plan.js";
 import { runQueueRetentionSweep, RETENTION_DEFAULTS } from "./domain/queue-retention.js";
 import { startLeadCompletionNotice, leadCompletionNoticeEnabled } from "./domain/lead-completion-notice.js";
+import { startQueueEmptyFrontierNotice, queueEmptyFrontierNoticeEnabled } from "./domain/queue-empty-frontier-notice.js";
 import {
   createStuckSweepStatus,
   resolveStuckSweepIntervalSeconds,
@@ -330,6 +331,7 @@ export async function startServer(port?: number) {
   let retentionTimer: ReturnType<typeof setInterval> | null = null;
   let stuckSweepTimer: ReturnType<typeof setInterval> | null = null;
   let stopLeadNotice: (() => void) | null = null;
+  let stopEmptyFrontierNotice: (() => void) | null = null;
   let wakeLadderScheduler: WakeLadderScheduler | null = null;
   // P7 — lifecycle heartbeat: advance last-seen every tick while running.
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -374,6 +376,10 @@ export async function startServer(port?: number) {
         if (leadCompletionNoticeEnabled() && deps.queueRepo && deps.seatActivityService && deps.eventBus) {
           stopLeadNotice = startLeadCompletionNotice({ db: deps.rigRepo.db, eventBus: deps.eventBus, queueRepo: deps.queueRepo, seatActivity: deps.seatActivityService, contentChangedAtMs: (n: string) => deps.seatActivityService?.getContentChangedAtMs(n) ?? null });
         }
+        // Opt-in event-driven cue for an idle seat with no actionable successor after explicit no-follow-on.
+        if (queueEmptyFrontierNoticeEnabled() && deps.queueRepo && deps.seatActivityService && deps.eventBus) {
+          stopEmptyFrontierNotice = startQueueEmptyFrontierNotice({ db: deps.rigRepo.db, eventBus: deps.eventBus, queueRepo: deps.queueRepo, seatActivity: deps.seatActivityService });
+        }
         // S01 — wake-or-escalate on batons: a failed baton wake retries on schedule,
         // then escalates through recorded rungs; never a silent park.
         wakeLadderScheduler = startWakeLadderScheduler(deps);
@@ -410,6 +416,7 @@ export async function startServer(port?: number) {
         if (retentionTimer) clearInterval(retentionTimer);
         if (stuckSweepTimer) clearInterval(stuckSweepTimer);
         if (stopLeadNotice) stopLeadNotice();
+        if (stopEmptyFrontierNotice) stopEmptyFrontierNotice();
       }],
       ["runtime-probes", () => stopRuntimeProbes()],
       ["proof-source-watch", () => deps.proofSourceWatch?.close()],

@@ -63,7 +63,20 @@ describe("FR-6 restore-plan token state", () => {
     } } as unknown as Snapshot;
     const result = buildRestorePlanPreview(rig, snapshot, rows, fresh ? ["a"] : undefined).nodes[0]!;
     expect(result.intendedAction).toBe("awaiting-decision");
-    expect(result.reason).toBe("No session was started for this seat. Restore a snapshot whose saved startup runtime matches the seat's current runtime.");
+    expect(result.reason).toBe("No session was started for this seat. Restore a snapshot whose saved seat and startup runtimes match the seat's current runtime.");
+  });
+
+  it("refuses a snapshot node runtime mismatch even when startup context matches the live seat", () => {
+    const rig = rigWith([{ id: "n1", logicalId: "a", runtime: "codex" }]);
+    const rows = [row("n1", { resumeType: "claude_id" })];
+    const snapshot = { id: "snap", kind: "manual", createdAt: "now", data: {
+      nodes: [{ id: "n1", logicalId: "a", runtime: "claude-code" }],
+      sessions: rows, activeSessionIdByNode: { n1: "s-n1" },
+      nodeStartupContext: { n1: { runtime: "codex" } },
+    } } as unknown as Snapshot;
+    const result = buildRestorePlanPreview(rig, snapshot, rows).nodes[0]!;
+    expect(result.intendedAction).toBe("awaiting-decision");
+    expect(result.reason).toBe("No session was started for this seat. Restore a snapshot whose saved seat and startup runtimes match the seat's current runtime.");
   });
 
   it.each([undefined, null, { runtime: null }, { runtime: "claude-code" }])("does not refuse legacy token with missing, unknown, or matching startup context: %j", (context) => {

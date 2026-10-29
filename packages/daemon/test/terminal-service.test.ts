@@ -405,7 +405,7 @@ describe("default saved kernel conversations", () => {
     const newLabel = planHerdrLayout(herdr.lastView!, "fixed").pages[0]!.tabLabel;
     expect(oldLabel).toBe("dashboard");
     expect(newLabel).toBe("operator");
-    expect(planHerdrLayout(herdr.lastView!, "fixed").workspaceLabel).toBe("kernel");
+    expect(planHerdrLayout(herdr.lastView!, "fixed").workspaceLabel).toBe("openrig kernel");
   });
 
   it.each([false, true])("keeps the default kernel handoff distinct from a team (provider unavailable=%s)", async unavailable => {

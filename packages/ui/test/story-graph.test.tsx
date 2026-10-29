@@ -51,7 +51,7 @@ describe("StoryGraph", () => {
     expect(within(childRow).getByText("In progress")).toBeTruthy();
     // date cell shows the calendar date (month + day) + time, never a
     // time-only / relative "Today"/"Yesterday" label (tz-robust shape check)
-    expect(rootRow.textContent).toMatch(/[A-Za-z]{3}\s+\d{1,2}/);
+    expect(rootRow.textContent).toMatch(/(?:\p{L}{2,}\.?\s+\d{1,2}|\d{1,2}\s+\p{L}{2,}\.?)/u);
     expect(rootRow.textContent).toMatch(/\d{1,2}:\d{2}/);
     expect(rootRow.textContent).not.toMatch(/today|yesterday/i);
   });

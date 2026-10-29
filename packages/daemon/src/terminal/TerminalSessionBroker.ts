@@ -400,7 +400,6 @@ export class TerminalSessionBroker {
     this.onEmpty?.(this.sessionName);
   }
 
-  private pinnedWindowSize = false;
   private async openPipe(): Promise<{ ok: true } | { ok: false; code: number; reason: string }> {
     // Close codes mirror the pre-broker route so the UI keeps its semantics:
     // 1008 (policy) = the session genuinely does not exist; 1011 (server error)
@@ -416,10 +415,10 @@ export class TerminalSessionBroker {
     // is named by its id, so the pin and the give-back reach the same window even
     // after a client switches windows, and the read, record and pin run in its
     // queue (window-pin.ts), so a readable capture in this daemon takes its turn.
-    // Without a window id or a readable value, the session's window is pinned as
-    // before; the fallback restores tmux's `latest` sizing when this broker detaches.
+    // Without an immutable window id, don't change sizing through a mutable
+    // session target: its current window could change before cleanup.
     const window = (await this.tmux.readWindow?.(this.sessionName, WINDOW_SIZE_PRIOR_OPTION).catch(() => null))?.id ?? null;
-    const pinned = await (window ? withWindowPin(window, () => this.pinWindow(window)) : this.pinWindow(null));
+    const pinned = window ? await withWindowPin(window, () => this.pinWindow(window)) : !this.torndown;
     if (!pinned || this.torndown) return { ok: false, code: 1011, reason: "terminal broker unavailable" }; // dispose gives it back
 
     const outputPath = path.join(
@@ -446,18 +445,17 @@ export class TerminalSessionBroker {
   }
 
   /** Read the window's sizing, record this broker as a holder, then pin the window (FR-7). False: disposed first. */
-  private async pinWindow(window: string | null): Promise<boolean> {
-    const sizing = window ? await readPinSizing(this.tmux, window) : null;
+  private async pinWindow(window: string): Promise<boolean> {
+    const sizing = await readPinSizing(this.tmux, window);
     if (this.torndown) return false; // disposed: pin nothing
     if (sizing) {
       this.pinnedWindow = sizing.window;
       await recordPin(this.tmux, sizing, this.holder);
-    } else {
-      // With no readable window identity, retain the legacy session-level pin and
-      // restore tmux's default sizing mode when the last subscriber detaches.
-      this.pinnedWindowSize = true;
     }
-    const target = sizing?.window ?? this.sessionName;
+    // If the identity or prior sizing isn't readable, skip the mutation. There
+    // is no safe target to restore later.
+    if (!sizing) return true;
+    const target = sizing.window;
     await this.tmux.setWindowOption(target, "window-size", "manual").catch(() => {});
     await this.tmux.resizeWindow(target, this.cols, this.rows).catch(() => {});
     return true;
@@ -620,10 +618,6 @@ export class TerminalSessionBroker {
     if (window) {
       await releasePin(this.tmux, window, this.holder);
       return;
-    }
-    if (this.pinnedWindowSize) {
-      this.pinnedWindowSize = false;
-      await this.tmux.setWindowOption(this.sessionName, "window-size", "latest").catch(() => {});
     }
   }
 

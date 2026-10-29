@@ -185,11 +185,11 @@ export function slicesRoutes(): Hono {
         const mission = c.req.query("mission");
         if (!mission || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name)) return c.json({ error: "exact_mission_and_slice_required" }, 400);
         const dir = projectMission(project, mission);
-        const slicesRoot = path.join(dir, "slices");
-        workSource(project.root, path.join(slicesRoot, name));
+        const slicesRoot = project.missionsRoot;
+        workSource(project.root, path.join(dir, "slices", name));
         // A project-scoped detail request names one exact mission and slice.
-        // Anchor lookup at that mission's validated slices directory so an
-        // identically named slice in an earlier mission cannot win the index.
+        // Keep the indexer's missions-root layout while restricting lookup to
+        // this exact validated mission.
         const indexer = new SliceIndexer({ db: deps.indexer.db, slicesRoot, dogfoodEvidenceRoot: null, projectId: project.id, projectRigs: project.rigs, missionId: mission });
         deps = { indexer, projector: deps.projector.withIndexer(indexer) };
       }

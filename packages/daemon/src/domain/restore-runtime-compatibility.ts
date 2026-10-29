@@ -1,8 +1,10 @@
-/** Stop restore before launch when saved startup context names a different runtime. */
+/** Stop restore before launch when saved startup or snapshot identity names a different runtime. */
 export function restoreRuntimeCompatibilityError(
   runtime: string | null,
   startupRuntime: string | null | undefined,
+  snapshotRuntime?: string | null,
 ): string | null {
-  if (!runtime || !startupRuntime || startupRuntime === runtime) return null;
-  return "No session was started for this seat. Restore a snapshot whose saved startup runtime matches the seat's current runtime.";
+  if (!runtime) return null;
+  if ((!startupRuntime || startupRuntime === runtime) && (!snapshotRuntime || snapshotRuntime === runtime)) return null;
+  return "No session was started for this seat. Restore a snapshot whose saved seat and startup runtimes match the seat's current runtime.";
 }

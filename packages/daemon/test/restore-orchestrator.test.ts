@@ -662,15 +662,15 @@ describe("RestoreOrchestrator", () => {
     const forecast = buildRestorePlanPreview(rigRepo.getRig(snap.rigId)!, snap, snap.data.sessions, fresh ? ["worker"] : undefined);
     expect(forecast.nodes[0]!.intendedAction).toBe("awaiting-decision");
     expect(forecast.nodes[0]!.reason).toBe(result.result.nodes[0]!.error);
-    expect(result.result.nodes[0]!.error).toBe("No session was started for this seat. Restore a snapshot whose saved startup runtime matches the seat's current runtime.");
+    expect(result.result.nodes[0]!.error).toBe("No session was started for this seat. Restore a snapshot whose saved seat and startup runtimes match the seat's current runtime.");
     expect(tmux.sendText).not.toHaveBeenCalled();
     expect(db.prepare("SELECT * FROM sessions ORDER BY id").all()).toEqual(sessionsBefore);
   });
 
   it.each([
     [null, "claude-code", "claude_id", "resumed", "fully_restored"],
-    ["codex", "codex", "codex_id", "attention_required", "partially_restored"],
-  ] as const)("keeps saved-node postlaunch behavior with live=%s and context=%s", async (live, context, resumeType, status, rigResult) => {
+    ["codex", "codex", "codex_id", "awaiting-decision", "partially_restored"],
+  ] as const)("respects saved-node runtime compatibility with live=%s and context=%s", async (live, context, resumeType, status, rigResult) => {
     const rig = rigRepo.createRig("saved-runtime");
     db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("saved-runtime-pod", rig.id, "Dev");
     const node = rigRepo.addNode(rig.id, "dev.owner", { runtime: "claude-code", podId: "saved-runtime-pod" });
@@ -705,9 +705,9 @@ describe("RestoreOrchestrator", () => {
     if (!result.ok) return;
     expect({ node: result.result.nodes[0], calls: [vi.mocked(claude.launchHarness).mock.calls.length, vi.mocked(codex.launchHarness).mock.calls.length] }).toMatchObject({ node: { status } });
     expect(result.result.rigResult).toBe(rigResult);
-    expect(tmux.createSession).toHaveBeenCalledTimes(1);
+    expect(tmux.createSession).toHaveBeenCalledTimes(status === "awaiting-decision" ? 0 : 1);
     expect(tmux.killSession).not.toHaveBeenCalled();
-    expect((context === "codex" ? codex : claude).launchHarness).toHaveBeenCalledTimes(1);
+    expect((context === "codex" ? codex : claude).launchHarness).toHaveBeenCalledTimes(status === "awaiting-decision" ? 0 : 1);
   });
 
   it.each([[false, false], [true, false], [false, true], [true, true]])("preview agrees after removing/regrowing a seat, fresh=%s legacy=%s", async (fresh, legacy) => {

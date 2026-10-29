@@ -10,6 +10,12 @@ import { provenCodexResume } from "./helpers/codex-resume-proof.js";
 const payload = { cwd: "/project", approval_policy: "on-request", sandbox_policy: { type: "workspace-write",
   network_access: false, exclude_tmpdir_env_var: false, exclude_slash_tmp: true, writable_roots: ["/kept dir", "/kept'quote"] } };
 const roots: string[] = [];
+const weekday = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+function psLstart(date: Date): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${weekday[date.getDay()]} ${month[date.getMonth()]} ${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())} ${date.getFullYear()}`;
+}
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 it("emits all observed workspace fields, with native TOML values and exact quoted roots", () => {
@@ -43,13 +49,16 @@ it.each([
 describe("the live predecessor record", () => {
   function fixture(options: { wrongThread?: boolean; stale?: boolean; incompleteLatest?: boolean; turnover?: boolean; argv?: string[] | null } = {}) {
     const root = mkdtempSync(join(tmpdir(), "codex-rebuild-")); roots.push(root);
+    const started = Date.parse("2026-10-20T05:00:01Z");
+    const contextAt = new Date(started + (options.stale ? -1_000 : 60_000));
+    const observedAt = contextAt.toISOString();
     const path = join(root, "record.jsonl");
     writeFileSync(path, [
       { type: "session_meta", payload: { id: options.wrongThread ? "another" : "fixture-thread", base_instructions: "x".repeat(40_000) } },
-      { type: "turn_context", timestamp: options.stale ? "2026-10-20T04:59:59Z" : "2026-10-20T05:01:00Z", payload },
-      ...(options.incompleteLatest ? [{ type: "turn_context", timestamp: "2026-10-20T05:02:00Z", payload: { cwd: "/project", approval_policy: "never" } }] : []),
+      { type: "turn_context", timestamp: observedAt, payload },
+      ...(options.incompleteLatest ? [{ type: "turn_context", timestamp: new Date(started + 120_000).toISOString(), payload: { cwd: "/project", approval_policy: "never" } }] : []),
     ].map(row => JSON.stringify(row)).join("\n") + "\n");
-    const native = provenCodexResume("fixture-thread");
+    const native = provenCodexResume("fixture-thread", { startedAt: psLstart(new Date(started)) });
     let reads = 0;
     const listProcesses = vi.fn(() => {
       const rows = native.listProcesses().map(row => row.executableName === "codex" && options.argv !== undefined
@@ -60,13 +69,14 @@ describe("the live predecessor record", () => {
     return { nodeId: "seat", sessionName: "member@team", cwd: "/project", path,
       tmux: { getPanePid: native.getPanePid }, listProcesses,
       readThreadId: vi.fn(async () => "fixture-thread"), rollout: vi.fn(() => path),
-      sessions: { currentOccupantTenure: () => ({ generationUuid: "generation", bootAt: "2026-10-20T05:00:00Z" }),
+      sessions: { currentOccupantTenure: () => ({ generationUuid: "generation", bootAt: new Date(started - 1_000).toISOString() }),
         getBindingForNode: () => ({ tmuxSession: "member@team", tmuxPane: "%1" }),
-        currentOccupantGenerationForSession: () => "generation" } as never };
+        currentOccupantGenerationForSession: () => "generation" } as never, observedAt };
   }
   it("joins the process, thread header, current working directory and post-launch context", async () => {
-    const result = await observeCodexRebuildPermissions(fixture());
-    expect(result).toMatchObject({ state: "observed", observedAt: "2026-10-20T05:01:00.000Z",
+    const input = fixture();
+    const result = await observeCodexRebuildPermissions(input);
+    expect(result).toMatchObject({ state: "observed", observedAt: input.observedAt,
       envelope: { approvalPolicy: "on-request", sandboxPolicy: payload.sandbox_policy } });
   });
   it("reports a managed profile containing spaces from the selected process's exact argv", async () => {

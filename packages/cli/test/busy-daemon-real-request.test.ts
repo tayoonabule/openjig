@@ -74,7 +74,7 @@ describe.skipIf(!fs.existsSync(cliEntry))("a busy but alive daemon gets the real
 
   async function rig(args: string[], env: NodeJS.ProcessEnv = {}): Promise<Run> {
     const childEnv: NodeJS.ProcessEnv = { ...process.env, OPENRIG_HOME: home, OPENRIG_URL: `http://127.0.0.1:${port}`, ...env };
-    for (const key of ["RIGGED_HOME", "RIGGED_URL", "OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME"]) if (!(key in env)) delete childEnv[key];
+    for (const key of ["RIGGED_HOME", "RIGGED_URL", "OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME", "JCODE_SESSION_ID"]) if (!(key in env)) delete childEnv[key];
     for (const [key, value] of Object.entries(env)) if (value === undefined) delete childEnv[key];
     const child = spawn(process.execPath, [cliEntry, ...args], { env: childEnv });
     let stdout = "";

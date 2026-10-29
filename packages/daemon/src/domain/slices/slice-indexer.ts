@@ -508,7 +508,7 @@ export class SliceIndexer {
     const addLocation = (location: SliceLocation) => {
       // Apply mission selection before name deduplication so another mission's
       // identically named slice cannot consume this mission's detail lookup.
-      if (this.missionId && location.missionId !== this.missionId) return;
+      if (!physical && this.missionId && location.missionId !== this.missionId) return;
       if (!physical) {
         if (seen.has(location.name)) return;
         seen.add(location.name);

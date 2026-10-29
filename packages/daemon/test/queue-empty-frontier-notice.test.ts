@@ -264,6 +264,67 @@ describe("queue empty-frontier notice", () => {
     }
   });
 
+  it("routes a real handoff frontier cue to the rig root, not the specialist parent", async () => {
+    const db = createDb();
+    migrate(db, ALL_MIGRATIONS);
+    db.prepare("INSERT INTO rigs (id, name) VALUES ('hull', 'hull')").run();
+    db.prepare("INSERT INTO nodes (id, rig_id, logical_id) VALUES ('lead', 'hull', 'main.lead')").run();
+    db.prepare("INSERT INTO nodes (id, rig_id, logical_id) VALUES ('architect', 'hull', 'design.architect')").run();
+    db.prepare("INSERT INTO nodes (id, rig_id, logical_id) VALUES ('researcher', 'hull', 'design.researcher')").run();
+    db.prepare("INSERT INTO edges (id, rig_id, source_id, target_id, kind) VALUES ('e1', 'hull', 'lead', 'architect', 'delegates_to')").run();
+    db.prepare("INSERT INTO edges (id, rig_id, source_id, target_id, kind) VALUES ('e2', 'hull', 'architect', 'researcher', 'delegates_to')").run();
+    db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES ('s1', 'lead', 'main-lead@hull', 'running')").run();
+    db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES ('s2', 'architect', 'design-architect@hull', 'running')").run();
+    db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES ('s3', 'researcher', 'design-researcher@hull', 'running')").run();
+    const eventBus = new EventBus(db);
+    const repo = new QueueRepository(db, eventBus, { validateRig: () => true });
+    let activity = "working";
+    const stop = startQueueEmptyFrontierNotice({
+      db,
+      eventBus,
+      queueRepo: repo,
+      seatActivity: { getSeatStateBySession: () => ({ activity }) },
+    });
+
+    try {
+      const source = await repo.create({
+        sourceSession: "main-lead@hull",
+        destinationSession: "design-researcher@hull",
+        body: "complete the real documented investigation",
+        nudge: false,
+      });
+      repo.claim({ qitemId: source.qitemId, destinationSession: "design-researcher@hull" });
+      const handoff = await repo.handoff({
+        qitemId: source.qitemId,
+        fromSession: "design-researcher@hull",
+        toSession: "design-architect@hull",
+        body: "review the concrete investigation outcome",
+        nudge: false,
+      });
+      expect(handoff.closed.state).toBe("handed-off");
+      activity = "idle-at-prompt";
+      eventBus.emit({
+        type: "seat.activity_changed",
+        sessionName: "design-researcher@hull",
+        seatNodeId: "researcher",
+        seq: 2,
+        at: new Date().toISOString(),
+      } as never);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      const cues = db.prepare(
+        "SELECT destination_session FROM queue_items WHERE source_session = 'daemon@kernel' AND tags LIKE ?",
+      ).all(`%${EMPTY_FRONTIER_NOTICE_TAG}%`) as Array<{ destination_session: string }>;
+      expect(cues).toEqual([{ destination_session: "main-lead@hull" }]);
+      expect(cues[0]?.destination_session).not.toBe("design-architect@hull");
+      expect(repo.getById(handoff.created.qitemId)?.destinationSession).toBe("design-architect@hull");
+    } finally {
+      stop();
+      db.close();
+    }
+  });
+
   it("cues the original sender for the persisted queue.updated done/handed_off_to path", async () => {
     const db = createDb();
     migrate(db, ALL_MIGRATIONS);

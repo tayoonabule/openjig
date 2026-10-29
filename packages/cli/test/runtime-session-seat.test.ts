@@ -34,6 +34,23 @@ describe("adoptRuntimeSessionSeat", () => {
     expect(env["OPENRIG_NODE_ID"]).toBeUndefined();
   });
 
+  it("clears an unvalidated node id when the mapped seat name already matches", async () => {
+    const env: NodeJS.ProcessEnv = {
+      JCODE_SESSION_ID: "runtime-session-1",
+      OPENRIG_SESSION_NAME: "mapped-seat@kernel",
+      OPENRIG_NODE_ID: "stale-node-id",
+    };
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ seat: "mapped-seat@kernel" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+
+    await adoptRuntimeSessionSeat(env, fetchImpl);
+
+    expect(env["OPENRIG_SESSION_NAME"]).toBe("mapped-seat@kernel");
+    expect(env["OPENRIG_NODE_ID"]).toBeUndefined();
+  });
+
   it.each([
     ["unknown mapping", 200, { seat: null }],
     ["ambiguous mapping", 200, {}],

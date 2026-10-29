@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { getDefaultOpenRigPath } from "../../openrig-compat.js";
-import { HerdrViewer, findAttributedViewerPanes, readHerdrViewerBody as body, parseHerdrViewerPane as pane,
+import { HerdrViewer, ViewerCreateNotDispatchedError, findAttributedViewerPanes, readHerdrViewerBody as body, parseHerdrViewerPane as pane,
   type HerdrViewerRun, type InspectViewerSeat, type ViewerKey, type ViewerMapping, type ViewerPane } from "./herdr-viewer.js";
 import { DEFAULT_FOLLOW_POLICY, planFollowingTiles, type FollowControls, type FollowPolicy, type FollowTile, type FollowingStatus } from "./terminal-follow-policy.js";
 import type { ComposedPane, ComposedView, OpenViewResult } from "./terminal-provider.js";
@@ -161,9 +161,12 @@ export class HerdrFollowView {
             throw new Error(`${tile.seat}: Core's current attachment differs from the retained viewer; keeping the previous view unconfirmed.`);
           }
         }
-        const current = await currentPane(tile.viewer);
+        let current: ViewerPane;
+        try { current = await currentPane(tile.viewer); }
+        catch (error) { throw new Error(`${tile.seat}: unknown: ${error instanceof Error ? error.message : String(error)}`); }
         const verified = await viewers.lookup(tile.member, tile.target);
-        if (!verified.ok || JSON.stringify(verified.viewer) !== JSON.stringify(tile.viewer)) throw new Error("A retained viewer is unconfirmed; keeping the whole view.");
+        if (!verified.ok) throw new Error(`${tile.seat}: ${verified.phase ?? "unknown"}: ${verified.error} Keeping the whole view.`);
+        if (JSON.stringify(verified.viewer) !== JSON.stringify(tile.viewer)) throw new Error(`${tile.seat}: Viewer mapping changed; keeping the whole view.`);
         observations.set(tile.key, { focused: current.focused!, input: await this.deps.input?.(tile.target) ?? "unknown" });
       }
       const plan = planFollowingTiles(state.tiles, members, true, observations, policy, now());
@@ -174,19 +177,24 @@ export class HerdrFollowView {
         if (!target || !member.key.hostId || !member.key.nodeId) { notice(`${join.seat}: ${member.reason ?? "Terminal is unavailable; the member remains in this task."}`); continue; }
         const memberKey = { hostId: member.key.hostId, nodeId: member.key.nodeId };
         let verified = await viewers.ensure(memberKey, target, stillCurrent, async (cwd) => {
-          await currentPane(state!.pane!);
-          if (!await stillCurrent()) throw new Error("Membership changed before the split.");
           const anchor = state!.tiles.at(-1)?.viewer;
-          if (anchor) await currentPane(anchor);
+          try {
+            await currentPane(state!.pane!);
+            if (!await stillCurrent()) throw new Error("Membership changed before the split.");
+            if (anchor) await currentPane(anchor);
+          } catch (error) {
+            throw new ViewerCreateNotDispatchedError(error instanceof Error ? error.message : String(error));
+          }
           const split = body(await this.deps.run(["pane", "split", "--pane", anchor?.paneId ?? state!.pane!.pane_id,
             "--direction", anchor && state!.tiles.length % 2 ? "right" : "down", "--no-focus", "--cwd", cwd]));
           return JSON.stringify({ root_pane: split.pane });
         });
+        const originalFailure = !verified.ok ? `${verified.phase ?? "unknown"}: ${verified.error}` : undefined;
         for (let attempt = 0; !verified.ok && attempt < 5; attempt++) {
           await new Promise(resolve => setTimeout(resolve, 50));
           verified = await viewers.lookup(memberKey, target); // read-only: never repeats a create/run.
         }
-        if (!verified.ok) { notice(`${join.seat}: ${verified.error}`); continue; }
+        if (!verified.ok) { notice(`${join.seat}: ${originalFailure}; confirmation: ${verified.phase ?? "unknown"}: ${verified.error}`); continue; }
         state.tiles.push({ key: join.key, seat: join.seat, target, member: { hostId: member.key.hostId, nodeId: member.key.nodeId }, viewer: verified.viewer });
         notice(`${join.seat}: ${join.reason}`); save();
       }
@@ -255,7 +263,7 @@ export class HerdrFollowView {
       for (const overflow of plan.overflow) notice(`${overflow.seat}: ${overflow.reason}`);
       if (!members.length && !state.tiles.length) notice(view.task.kind === "qitem"
         ? "No open obligation remains. Automatic following has stopped; the workspace is kept. Use --follow to resume it."
-        : "No active work; waiting for associated work while following this slice.");
+        : `No active work; waiting for associated work while following this ${view.task.kind}.`);
       save();
       const unavailableJoins = plan.joins.filter(join => !state!.tiles.some(tile => tile.key === join.key)
         && view.task!.members.some(m => keyOf(m.key.hostId, m.key.nodeId) === join.key && m.availability === "available"));

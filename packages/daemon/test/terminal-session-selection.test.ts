@@ -81,7 +81,7 @@ async function fixture(options: {
     resolveSessionProvider: (name, session) => name === "herdr" ? providers.sessionProvider(session) : null,
     viewsStore: { get: () => null, list: () => [] }, listRigNames: () => ["build", "prod", "stage"],
     listRigSeats: name => name === "kernel" ? [] : ["build", "prod", "stage"].includes(name) ? rows(name) : null,
-    listPodSeats: () => null, listScopeSeats: () => rows("build"), resolveHost: () => null, hasSession: () => true,
+    listPodSeats: () => null, resolveHost: () => null, hasSession: () => true,
   });
   const app = new Hono(); app.use("*", async (c, next) => { c.set("terminalService" as never, service); await next(); });
   app.route("/api/terminal", terminalRoutes()); app.route("/api/rigs/:rigId/terminal", rigTerminalRoutes);

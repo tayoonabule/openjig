@@ -116,6 +116,40 @@ describe("ClaimService.reconcileSession (OPR.0.3.4.3)", () => {
     expect(nodes[0]!.id).toBe(node.id);
   });
 
+  it("warns that no-launch reconcile leaves old-generation hooks unverified", async () => {
+    const { node, sessionName } = await seedDetachedSeat();
+    const oldGeneration = setup.sessionRegistry.currentOccupantTenure(node.id)?.generationUuid;
+    if (!oldGeneration) throw new Error("seeded seat has no occupant generation");
+
+    const result = await setup.claimService.reconcileSession({ sessionName });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.result.warnings?.join(" ")).toContain("does not refresh the live client environment");
+    expect(result.result.warnings?.join(" ")).toContain("old-generation hooks remain unverified");
+    expect(result.result.warnings?.join(" ")).toContain("managed same-session recovery may be needed");
+
+    const newGeneration = setup.sessionRegistry.currentOccupantTenure(node.id)?.generationUuid;
+    expect(newGeneration).toBeTruthy();
+    expect(newGeneration).not.toBe(oldGeneration);
+
+    const now = new Date();
+    const staleHook = setup.agentActivityStore.recordHookEvent({
+      runtime: "terminal",
+      sessionName,
+      hookEvent: "UserPromptSubmit",
+      generation: oldGeneration,
+      occurredAt: now.toISOString(),
+    });
+    expect(staleHook.ok).toBe(true);
+    expect(setup.agentActivityStore.getLatestForNode({ nodeId: node.id, sessionName, now })).toMatchObject({
+      state: "unknown",
+      reason: "generation_mismatch",
+      stale: true,
+      generationProvenance: "resolved",
+    });
+  });
+
   it("reconcileSession replaces a NULL binding pane with the live pane and the next identity pass verifies it", async () => {
     const localDb = createFullTestDb();
     const panes = [{ id: "%refreshed", index: 0, cwd: "/tmp", width: 80, height: 24, active: true }];
@@ -374,7 +408,9 @@ describe("binding-only missing-pane repair", () => {
     const before = stored();
     const res = await post();
     expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ ok: true, result: { mode: "repair-missing-pane", sessionId, pane: "%1", continuity: "unverified" } });
+    const repaired = await res.json();
+    expect(repaired).toMatchObject({ ok: true, result: { mode: "repair-missing-pane", sessionId, pane: "%1", continuity: "unverified" } });
+    expect(repaired.result.warnings).toBeUndefined();
     const after = stored();
     const binding = (after.bindings as Record<string, unknown>[])[0]!;
     expect(binding.tmux_pane).toBe("%1");

@@ -68,6 +68,8 @@ export interface ReconcileSessionResult {
   /** Topology metadata the reconcile could not prove on the live pane (e.g.
    *  "runtime unverified: pane command 'node' does not confirm runtime 'codex'"). */
   projectionDrift: string[];
+  /** Operational cautions about reconcile that are not topology drift. */
+  warnings?: string[];
   /** Provider-session conversation continuity is never verified by reconcile. */
   continuity: "unverified";
   /** Absent for the binding-only missing-pane repair, which does not capture. */
@@ -683,6 +685,9 @@ export class ClaimService {
           sessionName,
           sessionId,
           projectionDrift,
+          warnings: [
+            "No-launch reconcile does not refresh the live client environment; old-generation hooks remain unverified, and a managed same-session recovery may be needed.",
+          ],
           continuity: "unverified",
           resumeMetadata,
         },

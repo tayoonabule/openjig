@@ -49,6 +49,7 @@ const OK_RESPONSE = {
     sessionName: "dev-impl@my-rig",
     sessionId: "sess-2",
     projectionDrift: ['runtime unverified: pane command "zsh" does not confirm runtime "claude-code"'],
+    warnings: ["No-launch reconcile does not refresh the live client environment; old-generation hooks remain unverified, and a managed same-session recovery may be needed."],
     continuity: "unverified",
   },
 };
@@ -127,6 +128,9 @@ describe("rig reconcile-session", () => {
     expect(out).toContain("node id unchanged");
     expect(out).toContain("Projection drift");
     expect(out).toContain("runtime unverified");
+    expect(out).toContain("Warning: No-launch reconcile does not refresh the live client environment");
+    expect(out).toContain("old-generation hooks remain unverified");
+    expect(out).toContain("managed same-session recovery may be needed");
     expect(out).toContain("Conversation continuity: unverified");
     expect(exitCode).toBeUndefined();
   });
@@ -165,6 +169,7 @@ describe("rig reconcile-session", () => {
     expect(parsed.ok).toBe(true);
     expect(parsed.result.continuity).toBe("unverified");
     expect(parsed.result.projectionDrift).toHaveLength(1);
+    expect(parsed.result.warnings).toContain("No-launch reconcile does not refresh the live client environment; old-generation hooks remain unverified, and a managed same-session recovery may be needed.");
   });
 
   it.each([false, true].flatMap(json => [false, true].map(captured => ({ json, captured }))))(

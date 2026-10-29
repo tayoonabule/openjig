@@ -19,6 +19,7 @@ interface ReconcileResponse {
     sessionName: string;
     sessionId: string;
     projectionDrift: string[];
+    warnings?: string[];
     continuity: string;
     resumeMetadata?: {
       capture: { outcome: string; reason?: string };
@@ -121,6 +122,7 @@ continuity remain unverified; ordinary sends still apply their existing checks.`
         console.log(`Resume metadata: ${status} (capture: ${capture.outcome}${capture.reason ? `; ${capture.reason}` : ""}).`);
         if (guidance) console.log(guidance);
       }
+      for (const warning of r.warnings ?? []) console.log(`  Warning: ${warning}`);
       if (r.projectionDrift.length > 0) {
         console.log("  Projection drift (unproven metadata):");
         for (const d of r.projectionDrift) console.log(`    - ${d}`);

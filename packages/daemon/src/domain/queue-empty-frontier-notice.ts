@@ -28,6 +28,8 @@ interface QueueNoticeEvent {
   fromState?: string;
   toState?: string;
   closureReason?: string | null;
+  fromSession?: string;
+  toSession?: string;
 }
 
 export function startQueueEmptyFrontierNotice(deps: {
@@ -40,7 +42,7 @@ export function startQueueEmptyFrontierNotice(deps: {
 }): () => void {
   const resolveLead = deps.resolveLead ?? defaultResolveOrchestrator;
   const sourceSession = deps.sourceSession ?? "daemon@kernel";
-  const candidates = new Map<string, Set<string>>();
+  const candidates = new Map<string, Map<string, string>>();
   const notifying = new Set<string>();
   const scheduled = new Set<string>();
   let disposed = false;
@@ -71,10 +73,12 @@ export function startQueueEmptyFrontierNotice(deps: {
       const blocked = deps.db.prepare(
         "SELECT qitem_id AS id, substr(summary,1,100) AS summary FROM queue_items WHERE destination_session = ? AND state = 'blocked' ORDER BY ts_created DESC LIMIT 10",
       ).all(seat) as Array<{ id: string; summary: string | null }>;
-      const completionIds = [...completions];
+      const closureEvidence = [...completions].map(([id, kind]) => `${id} (${kind})`);
+      const handoffs = [...completions.values()].filter((kind) => kind.startsWith("handed off to "));
       const body = [
         `Automated empty-frontier cue for ${seat}; this is not a completion claim and does not create work.`,
-        `The seat is idle after explicit no-follow-on closure(s): ${completionIds.join(", ")}.`,
+        `The seat is idle after queue closure(s): ${closureEvidence.join(", ")}.`,
+        ...(handoffs.length ? ["A handed-off successor belongs to its recipient; it does not count as next work assigned to the sender."] : []),
         "There are no pending or in-progress queue items assigned to the seat.",
         blocked.length
           ? `Blocked obligations remain (not actionable):\n${blocked.map((item) => `- ${item.id}: ${item.summary ?? "(no summary)"}`).join("\n")}`
@@ -119,21 +123,27 @@ export function startQueueEmptyFrontierNotice(deps: {
       if (event.sessionName) scheduleEvaluate(event.sessionName);
       return;
     }
-    if (event.type !== "queue.updated" || !event.qitemId) return;
+    if ((event.type !== "queue.updated" && event.type !== "queue.handed_off") || !event.qitemId) return;
 
     try {
       const row = deps.db.prepare(
-        "SELECT destination_session AS destination, tags FROM queue_items WHERE qitem_id = ?",
-      ).get(event.qitemId) as { destination: string; tags: string | null } | undefined;
+        "SELECT destination_session AS destination, tags, state, closure_reason FROM queue_items WHERE qitem_id = ?",
+      ).get(event.qitemId) as { destination: string; tags: string | null; state: string; closure_reason: string | null } | undefined;
       if (!row?.destination) return;
       let tags: string[] = [];
       try { tags = JSON.parse(row.tags ?? "[]") as string[]; } catch { /* malformed legacy tags do not opt in */ }
       if (tags.includes(EMPTY_FRONTIER_NOTICE_TAG)) return;
 
-      if (event.fromState === "in-progress" && event.toState === "done" && event.closureReason === "no-follow-on") {
-        const ids = candidates.get(row.destination) ?? new Set<string>();
-        ids.add(event.qitemId);
-        candidates.set(row.destination, ids);
+      const noFollowOn = event.type === "queue.updated"
+        && event.fromState === "in-progress" && event.toState === "done" && event.closureReason === "no-follow-on";
+      const handedOff = row.state === "handed-off" && row.closure_reason === "handed_off_to"
+        && (event.type === "queue.handed_off"
+          ? event.fromSession === row.destination
+          : event.type === "queue.updated" && event.fromState === "in-progress" && event.toState === "handed-off");
+      if (noFollowOn || handedOff) {
+        const evidence = candidates.get(row.destination) ?? new Map<string, string>();
+        evidence.set(event.qitemId, handedOff ? `handed off to ${event.toSession ?? "recipient"}` : "no-follow-on");
+        candidates.set(row.destination, evidence);
       }
       // A non-qualifying transition can still remove the last actionable blocker for
       // a previously recorded candidate, so re-evaluate only when one already exists.

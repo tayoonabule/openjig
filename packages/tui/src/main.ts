@@ -233,9 +233,9 @@ async function run(): Promise<void> {
     // openjig: repaint only changed lines inside synchronized output, so the
     // blinking command cursor does not erase and flash every static line.
     const paint = stylizeLines(lastScreen, style);
-    const size = `${process.stdout.columns}x${process.stdout.rows}`;
-    const full = paint.length !== paintedLines.length || size !== paintedSize;
-    paintedSize = size;
+    const terminalSize = `${process.stdout.columns}x${process.stdout.rows}`;
+    const full = paint.length !== paintedLines.length || terminalSize !== paintedSize;
+    paintedSize = terminalSize;
     const out = paint.map((l, i) => (full || l !== paintedLines[i] ? `\x1b[${i + 1};1H\x1b[2K${l}` : "")).join("");
     paintedLines = paint;
     if (out) process.stdout.write("\x1b[?2026h\x1b[?7l" + out + "\x1b[?7h\x1b[?2026l");

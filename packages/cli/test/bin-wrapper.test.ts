@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,7 +8,13 @@ import { resolveBinEntry, resolveNodeReexecBinary, run } from "../src/bin-wrappe
 describe("bin-wrapper", () => {
   let tempDir: string | null = null;
 
+  beforeEach(() => {
+    vi.stubEnv("JCODE_SESSION_ID", "");
+  });
+
   afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     if (tempDir) {
       fs.rmSync(tempDir, { recursive: true, force: true });
       tempDir = null;
@@ -81,6 +87,49 @@ describe("bin-wrapper", () => {
     expect(human.err[0]).toBe(`error: ${parsed.error.message}`);
     expect(human.err[1]).toContain("commands/queue.js");
     expect(human.err[1]).toMatch(/\n\s+at /);
+  });
+
+  it("adopts the runtime seat before dispatching a lazy command", async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openrig-bin-wrapper-"));
+    const dist = path.join(tempDir, "dist");
+    fs.mkdirSync(dist);
+    const wrapper = path.join(dist, "bin-wrapper.js");
+    fs.writeFileSync(wrapper, "");
+    fs.writeFileSync(path.join(dist, "package.json"), '{ "type": "module" }\n');
+    fs.writeFileSync(path.join(dist, "lazy-program.js"), [
+      "export async function createLazyProgram() { return {}; }",
+      "export async function runProgram() { globalThis.__openrigLazyDispatchSeat = process.env.OPENRIG_SESSION_NAME; return 0; }",
+    ].join("\n"));
+
+    const originalRuntimeId = process.env["JCODE_SESSION_ID"];
+    const originalSeat = process.env["OPENRIG_SESSION_NAME"];
+    const originalNode = process.env["OPENRIG_NODE_ID"];
+    process.env["JCODE_SESSION_ID"] = "runtime-session-1";
+    delete process.env["OPENRIG_SESSION_NAME"];
+    delete process.env["OPENRIG_NODE_ID"];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("http://127.0.0.1:7433/api/whoami/seat");
+      expect(new Headers(init?.headers).get("X-OpenRig-Runtime-Session")).toBe("runtime-session-1");
+      return new Response(JSON.stringify({ seat: "test-seat@kernel" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }));
+
+    try {
+      await run(["node", wrapper, "queue", "whoami"]);
+      expect((globalThis as typeof globalThis & { __openrigLazyDispatchSeat?: string }).__openrigLazyDispatchSeat)
+        .toBe("test-seat@kernel");
+      expect(process.env["OPENRIG_NODE_ID"]).toBeUndefined();
+    } finally {
+      delete (globalThis as typeof globalThis & { __openrigLazyDispatchSeat?: string }).__openrigLazyDispatchSeat;
+      if (originalRuntimeId === undefined) delete process.env["JCODE_SESSION_ID"];
+      else process.env["JCODE_SESSION_ID"] = originalRuntimeId;
+      if (originalSeat === undefined) delete process.env["OPENRIG_SESSION_NAME"];
+      else process.env["OPENRIG_SESSION_NAME"] = originalSeat;
+      if (originalNode === undefined) delete process.env["OPENRIG_NODE_ID"];
+      else process.env["OPENRIG_NODE_ID"] = originalNode;
+    }
   });
 
   it("does not re-exec when already running under the sibling node", () => {

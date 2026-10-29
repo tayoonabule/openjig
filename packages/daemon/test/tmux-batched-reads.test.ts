@@ -20,7 +20,7 @@ function fakeExec() {
   const exec = vi.fn(async (cmd: string) => {
     calls.push(cmd);
     if (cmd.startsWith("tmux list-windows -a")) return WINDOWS.map(([s, a, t]) => `${a}|${t}|${s}`).join("\n") + "\n";
-    if (cmd.startsWith("tmux list-panes -a")) return PANES.map(([p, pid, c]) => `${p}|${pid}|${c}`).join("\n") + "\n";
+    if (cmd.startsWith("tmux list-panes -a")) return PANES.map(([p, pid, c]) => `${p}|${pid}|0|${c}`).join("\n") + "\n";
     const m = cmd.match(/^tmux display-message -p -t (\S+) ["']#\{(\w+)\}["']$/);
     if (!m) throw new Error(`unexpected: ${cmd}`);
     const target = unquote(m[1]!), field = m[2]!;
@@ -51,8 +51,17 @@ describe("batched tmux reads", () => {
     for (const [id] of PANES) {
       const pid = await tmux.getPanePid(id), cmd = await tmux.getPaneCommand(id);
       if (pid === null) expect(batch!.has(id), id).toBe(false);
-      else expect(batch!.get(id), id).toEqual({ pid, command: cmd });
+      else expect(batch!.get(id), id).toEqual({ pid, command: cmd, dead: false });
     }
+  });
+
+  it("membership can inspect all windows of the exact session without changing default pane listing", async () => {
+    const calls: string[] = [];
+    const tmux = new TmuxAdapter((async (cmd: string) => { calls.push(cmd); return ""; }) as never);
+    await tmux.listPanes("worker@rig");
+    await tmux.listPanes("worker@rig", true);
+    expect(calls[0]).toContain("list-panes -t '=worker@rig:'");
+    expect(calls[1]).toContain("list-panes -s -t '=worker@rig:'");
   });
 
   it("a tmux failure makes the batch null (callers then read per seat)", async () => {
@@ -77,12 +86,12 @@ describe("batched tmux reads: the separator inside a session name or a command",
   it("keeps a session name and a pane command that contain the field separator intact", async () => {
     const exec = vi.fn(async (cmd: string) => {
       if (cmd.startsWith("tmux list-windows -a")) return "1|1790000100|odd|name@rig\n0|1790000200|odd|name@rig\n";
-      if (cmd.startsWith("tmux list-panes -a")) return "%9|4242|a|b\n";
+      if (cmd.startsWith("tmux list-panes -a")) return "%9|4242|0|a|b\n";
       throw new Error(`unexpected: ${cmd}`);
     });
     const tmux = new TmuxAdapter(exec as never);
     expect(await tmux.readAllSessionWindowActivity()).toEqual(new Map([["odd|name@rig", 1790000100]]));
-    expect(await tmux.readAllPaneProcesses()).toEqual(new Map([["%9", { pid: 4242, command: "a|b" }]]));
+    expect(await tmux.readAllPaneProcesses()).toEqual(new Map([["%9", { pid: 4242, command: "a|b", dead: false }]]));
   });
 });
 
@@ -100,13 +109,14 @@ describe("SeatActivityService sweep with the batch", () => {
     return { out, calls };
   }
 
-  it("same observations as the per-seat path; one tmux call plus per-seat reads only for the misses", async () => {
+  it("same observations as the per-seat path, in one tmux call, and no per-target query for a seat the batch lacks", async () => {
     const per = await sweep(false), bat = await sweep(true);
     expect(bat.out).toEqual(per.out);
     expect(per.calls).toHaveLength(5);                                   // one display-message per seat before
     expect(bat.calls.filter((c) => c.startsWith("tmux list-windows -a"))).toHaveLength(1);
-    // misses fall back: s3 (no valid timestamp) and gone@rig (no such session); s1, s2, s4 come from the batch
-    expect(bat.calls.filter((c) => c.startsWith("tmux display-message")).map((c) => c.match(/-t (\S+)/)![1]).map(unquote).sort()).toEqual(["=gone@rig:", "=s3@rig:"]);
+    // s1, s2, s4 come from the batch. gone@rig (no such session) and s3 (no valid timestamp, the same value a per-target
+    // read returns) are not asked about by target: tmux 3.2a exits its whole server on a query for a vanished target.
+    expect(bat.calls.filter((c) => c.startsWith("tmux display-message")).map((c) => c.match(/-t (\S+)/)![1]).map(unquote)).toEqual([]);
     expect(bat.out["s1@rig"]!.isActiveWithinWindow).toBe(true);
     expect(bat.out["s2@rig"]!.isActiveWithinWindow).toBe(false);
   });

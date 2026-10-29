@@ -1,13 +1,17 @@
+import { runtimeSwitchActivityRole } from "./runtime-switch-custody.js";
+import { physicalSessionName, sessionCommunityHarnessSelect, sessionCommunityRunnerSelect } from "../domain/session-registry.js";
 import { existsSync } from "node:fs";
 import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
 import type { AgentActivityStore } from "../domain/agent-activity-store.js";
+import { hookEventState, isRunnerExit } from "../domain/agent-activity-store.js";
 import type { SessionRegistry } from "../domain/session-registry.js";
 import type { EventBus } from "../domain/event-bus.js";
 import { verifyStartupProof } from "../domain/startup-proof.js";
-import type { ActivityEvidence } from "../domain/activity-taxonomy.js";
+import type { ActivityEvidence, EvidenceRoute } from "../domain/activity-taxonomy.js";
 import type { AgentActivity } from "../domain/types.js";
 import * as parkedQuery from "../domain/parked-query.js";
+import { nodeExecutorConfirmedStopped } from "../domain/node-inventory.js";
 import { runtimeRungInventory } from "../domain/activity-taxonomy.js";
 import { validateResumeToken } from "../domain/resume-token-validation.js";
 import { claudeHookFromLaunchedProcess, type ClaudeLaunchedProcess, type NativeProcessLister } from "../domain/native-process-lineage.js";
@@ -31,6 +35,7 @@ export function evidenceFromHookActivity(input: {
   runtime: string | null;
   activity: AgentActivity;
   seq: number;
+  route?: EvidenceRoute;
 }): ActivityEvidence | null {
   const base = {
     seatNodeId: input.seatNodeId,
@@ -39,13 +44,29 @@ export function evidenceFromHookActivity(input: {
     sourceId: `${input.runtime ?? "unknown-runtime"}:hooks`,
     seq: input.seq,
     observedAt: input.activity.eventAt ?? input.activity.sampledAt,
+    ...(input.activity.sourceSequence ? { sourceSequence: input.activity.sourceSequence } : {}),
+    ...(input.activity.livenessSeconds ? { livenessSeconds: input.activity.livenessSeconds } : {}),
+    ...(input.route ? { route: input.route } : {}),
   };
   if (input.activity.reason === "permission_request_pending") {
     return { ...base, permissionRequest: { id: input.activity.turnId ?? "uncorrelated" } };
   }
+  if (input.runtime === "claude-code" && input.activity.rawEvent === "Notification"
+      && input.activity.reason === "permission_prompt") {
+    const hookAgentId = input.activity.hookAgentId;
+    return { ...base, permissionRequest: {
+      id: hookAgentId ? `claude-permission-prompt:${hookAgentId}` : "claude-permission-prompt",
+      ...(hookAgentId !== undefined ? { hookAgentId } : {}),
+    }, needsInput: { count: 1, reason: "permission_prompt" } };
+  }
+  // A runner's exit report clears what its last turn said: the seat is no longer at a prompt or mid-turn.
+  if (input.activity.rawEvent === "Stop" && isRunnerExit(input.activity.rawSubtype, input.runtime, input.activity.communityRunner === true)) {
+    return { ...base, activity: "unknown", needsInput: { count: 0, reason: null } };
+  }
   switch (input.activity.state) {
     case "running":
-      return { ...base, activity: "working", needsInput: { count: 0, reason: null } };
+      return { ...base, activity: "working", needsInput: { count: 0, reason: null },
+        ...(input.runtime === "claude-code" && input.activity.rawEvent === "UserPromptSubmit" ? { permissionResolved: true } : {}) };
     case "idle":
       return { ...base, activity: "idle-at-prompt", needsInput: { count: 0, reason: null } };
     case "needs_input":
@@ -53,6 +74,30 @@ export function evidenceFromHookActivity(input: {
     default:
       return null; // unknown = noise, never evidence
   }
+}
+
+/** A runner seat's last recorded hook as oracle evidence, for restoring after a daemon restart. Only the store's own
+ *  checks pass it: the seat's current session, and an occupant generation resolved as the live one. Past the store's
+ *  freshness window it means what its retained raw event means, as for the wake ladder: a runner's boundary holds. */
+export function restoredRunnerHookEvidence(
+  store: Pick<AgentActivityStore, "getLatestForNode">,
+  seat: { seatNodeId: string; sessionName: string },
+  runtime: string,
+): ActivityEvidence | null {
+  const latest = store.getLatestForNode({ nodeId: seat.seatNodeId, sessionName: seat.sessionName, order: "source" });
+  if (!latest || latest.evidenceSource !== "runtime_hook" || latest.generationProvenance !== "resolved") return null;
+  const state = !latest.stale ? latest.state
+    : latest.reason === "stale_runtime_hook"
+      ? hookEventState(latest.rawEvent, latest.rawSubtype, runtime, latest.communityRunner === true) : "unknown";
+  return evidenceFromHookActivity({ seatNodeId: seat.seatNodeId, sessionName: seat.sessionName, runtime,
+    activity: { ...latest, state }, seq: 0 });
+}
+
+/** The relay route a hook post names: "plugin" or "managed". An untagged post (an older relay) stays untagged; any
+ *  other value is "unrecognised", so a poster can't add promotion keys of its own. */
+export function hookRelayRoute(value: unknown): EvidenceRoute | undefined {
+  if (value === undefined || value === null) return undefined;
+  return value === "plugin" || value === "managed" ? value : "unrecognised";
 }
 
 // Per-source monotonic seq for ingested hook evidence (the relay does not mint one).
@@ -167,6 +212,20 @@ activityRoutes.post("/hooks", async (c) => {
     body = await c.req.json() as Record<string, unknown>;
   } catch {
     return c.json({ ok: false, code: "invalid_json", error: "Request body must be JSON." }, 400);
+  }
+
+  if (typeof body.sessionName === "string") body = { ...body, sessionName: physicalSessionName(store.db, body.sessionName) };
+
+  // Slice 16: a runtime switch's staged successor (before commit) and retired predecessor (after) don't speak for the
+  // seat. The staged successor's native identity is kept on the switch record, which the commit applies.
+  const switchRole = runtimeSwitchActivityRole(store.db, stringOrNull(body.sessionName), stringOrNull(body.generation));
+  if (switchRole) {
+    if (switchRole.role === "staged_successor" && body.eventFamily === "session_identity" && typeof body.sessionId === "string") {
+      store.db.prepare(`UPDATE seat_runtime_switches SET successor_resume_type = ?, successor_resume_token = ?,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND committed_at IS NULL`)
+        .run(stringOrNull(body.runtime), body.sessionId, switchRole.id);
+    }
+    return c.json({ ok: true, ignored: switchRole.role, switchId: switchRole.id, tokenPersisted: false });
   }
 
   if (body.eventFamily === "session_identity") {
@@ -321,6 +380,33 @@ activityRoutes.post("/hooks", async (c) => {
           listProcesses: c.get("listProcesses" as never) as NativeProcessLister | undefined });
       }
     }
+    // #1524 (a), Codex only, synchronous with the write below (no await between them):
+    // - a known earlier occupant's hook (its generation is registered for this node and isn't the current one)
+    //   neither writes nor publishes. An absent or unregistered generation, no current tenure, or an unreadable
+    //   ledger keep today's write.
+    // - Codex sends an explicit transcript_path null for a thread it never persists (an internal thread), and also
+    //   when it can't read a persisted conversation's rollout. Either way the saved pointer is kept, so an internal
+    //   thread can't replace it. An absent key, an empty string or a malformed value keep today's write.
+    if (runtime === "codex") {
+      let generationMismatch = false;
+      try {
+        const current = sessionRegistry.currentOccupantTenure(resolved.nodeId);
+        generationMismatch = !!generation && !!current && current.generationUuid !== generation
+          && sessionRegistry.isOccupantGenerationRegistered(resolved.nodeId, generation);
+      } catch { /* an unreadable ledger is no evidence of a mismatch */ }
+      if (generationMismatch) {
+        return c.json({
+          ok: false, code: "generation_mismatch", tokenPersisted: false,
+          error: "Codex session identity ignored: emitter is an earlier occupant of this seat.",
+        }, 409);
+      }
+      if (body.transcriptPathPresent === true && body.transcriptPath === null) {
+        return c.json({
+          ok: true, sessionId, provenance: "hook", tokenPersisted: false, code: "transcript_absent",
+          detail: "Codex reported no transcript for this thread, so the saved conversation pointer was kept.",
+        });
+      }
+    }
     const persistHook = (type: string, token: string): boolean => {
       if (runtime !== "claude-code") return sessionRegistry.updateResumeToken(resolved.sessionId, type, token, "hook");
       return sessionRegistry.recordHookSessionIdentity(resolved.sessionId, type, token,
@@ -368,6 +454,46 @@ activityRoutes.post("/hooks", async (c) => {
     return c.json({ ok: true, oriented: "verified", nodeId: result.nodeId, challengeId: result.challengeId });
   }
 
+  // All tools in this actor's batch have resolved. An individual PostToolUse can belong to a parallel tool,
+  // and a subagent's batch says nothing about the main session's permission. Only the current occupant can
+  // settle a matching, older episode. Do not record an unrelated batch as an unknown hook that hides attention.
+  const claudePermission = body.runtime === "claude-code" && body.hookEvent === "Notification" && body.subtype === "permission_prompt";
+  if (body.hookEvent === "PostToolBatch" || claudePermission) {
+    const oracle = c.get("seatActivityService" as never) as import("../domain/seat-activity-service.js").SeatActivityService | undefined;
+    const registry = c.get("sessionRegistry" as never) as SessionRegistry | undefined;
+    const sessionName = stringOrNull(body.sessionName);
+    const seat = store.resolveSession({ sessionName, nodeId: stringOrNull(body.nodeId) });
+    const hookAgentId = body.hookAgentId;
+    const generation = stringOrNull(body.generation);
+    const occurredAt = stringOrNull(body.occurredAt);
+    let current: ReturnType<SessionRegistry["currentOccupantTenure"]> | undefined;
+    try {
+      current = seat ? registry?.currentOccupantTenure(seat.nodeId) : null;
+    } catch {
+      return c.json({ ok: false, code: "generation_resolver_error", error: "Occupant generation is unavailable." }, 503);
+    }
+    const session = seat && store.db.prepare("SELECT status FROM sessions WHERE id = ?")
+      .get(seat.sessionId) as { status: string } | undefined;
+    const attributable = body.runtime === "claude-code" && seat?.runtime === "claude-code"
+      && (!sessionName || sessionName === seat.sessionName) && session?.status === "running"
+      && generation !== null && current?.generationUuid === generation
+      && (hookAgentId === null || (typeof hookAgentId === "string" && hookAgentId.trim().length > 0))
+      && occurredAt !== null && Number.isFinite(Date.parse(occurredAt));
+    if (body.hookEvent === "PostToolBatch") {
+      if (attributable && oracle && !oracle.hasRungInventory(seat!.nodeId, seat!.sessionName)) {
+        // The completion may be this occupant's first hook to reach the daemon.
+        oracle.declareRungInventory({ seatNodeId: seat!.nodeId, sessionName: seat!.sessionName }, runtimeRungInventory("claude-code"));
+      }
+      const settled = attributable && oracle
+        ? oracle.completeClaudeToolBatch(seat!.sessionName, hookAgentId as string | null, occurredAt!) : false;
+      return c.json({ ok: true, permissionResolved: settled });
+    }
+    // Do not publish an already-completed request as fresh attention to the store's event consumers.
+    if (attributable && oracle?.hasLaterClaudeToolBatch(seat!.sessionName, hookAgentId as string | null, occurredAt!)) {
+      return c.json({ ok: true, permissionResolved: true });
+    }
+  }
+
   const result = store.recordHookEvent({
     runtime: stringOrNull(body.runtime),
     sessionName: stringOrNull(body.sessionName),
@@ -380,6 +506,11 @@ activityRoutes.post("/hooks", async (c) => {
     // (sound per-path absence; never false-fresh).
     generation: stringOrNull(body.generation),
     turnId: stringOrNull(body.turnId),
+    ...(body.hookAgentId === null || (typeof body.hookAgentId === "string" && body.hookAgentId.trim().length > 0)
+      ? { hookAgentId: body.hookAgentId } : {}),
+    sourceSequence: typeof body.sequence === "number" && Number.isSafeInteger(body.sequence) && body.sequence > 0 ? body.sequence : null,
+    livenessSeconds: typeof body.livenessSeconds === "number" && Number.isSafeInteger(body.livenessSeconds)
+      && body.livenessSeconds > 0 && body.livenessSeconds <= 3600 ? body.livenessSeconds : null,
   });
 
   if (!result.ok) {
@@ -400,8 +531,9 @@ activityRoutes.post("/hooks", async (c) => {
   // the emitter supplied an old sessionName, so check both identities before
   // declaring an inventory (which would reactivate a retired seat).
   const currentSession = oracle && emitted?.nodeId
-    ? store.db.prepare("SELECT session_name, status FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1")
-      .get(emitted.nodeId) as { session_name: string; status: string } | undefined
+    ? store.db.prepare(`SELECT s.session_name, s.status, ${sessionCommunityHarnessSelect(store.db)} AS community_harness,
+        ${sessionCommunityRunnerSelect(store.db)} AS community_runner FROM sessions s WHERE s.node_id = ? ORDER BY s.id DESC LIMIT 1`)
+      .get(emitted.nodeId) as { session_name: string; status: string; community_harness: string | null; community_runner: number | null } | undefined
     : undefined;
   const suppliedSessionName = stringOrNull(body.sessionName);
   if (oracle && emitted?.nodeId && emitted.sessionName
@@ -421,7 +553,8 @@ activityRoutes.post("/hooks", async (c) => {
     if (!oracle.hasRungInventory(emitted.nodeId, emitted.sessionName)) {
       oracle.declareRungInventory(
         { seatNodeId: emitted.nodeId, sessionName: emitted.sessionName },
-        runtimeRungInventory(runtime),
+        // The same recorded launch facts the reconcile pass reads, so a community seat's first hook gets its own inventory.
+        runtimeRungInventory(runtime, currentSession?.community_harness ?? null, currentSession?.community_runner === 1),
       );
     }
     const evidence = evidenceFromHookActivity({
@@ -430,6 +563,7 @@ activityRoutes.post("/hooks", async (c) => {
       runtime,
       activity: result.activity,
       seq: nextHookSeq(`${emitted.nodeId}:${runtime ?? "unknown-runtime"}:hooks`),
+      route: hookRelayRoute(body.relayRoute),
     });
     if (evidence) oracle.reportEvidence(evidence);
   }
@@ -438,7 +572,7 @@ activityRoutes.post("/hooks", async (c) => {
 });
 
 // ── S19 AM-R18 — the push substrate: GET /api/activity/events (SSE) ──
-// Desk-accepted shape (ruling row qitem-20260827001530): CHANGE NOTIFICATIONS ONLY —
+// Desk-accepted shape (ruling row): CHANGE NOTIFICATIONS ONLY —
 // seat.activity_changed (identity + seq) and seat.rung_health stream to the open view;
 // the view REHYDRATES from /api/ps. The push never carries derived vocabulary, so "no
 // second activity mechanism" holds by construction. No timers: pure bus relay;
@@ -496,7 +630,7 @@ activityRoutes.get("/parked", (c) => {
 
   const { diagnoseSeatParked, diagnoseRigParked, PARKED_OBLIGATION_LIMIT } = parkedQuery;
   const deps = {
-    getSeatState: (id: string) => oracle.getSeatState(id),
+    getSeatState: (id: string) => nodeExecutorConfirmedStopped(rigRepo.db, id) ? null : oracle.getSeatState(id),
     listOpenObligations: (destination: string, limit: number) => ({
       rows: queueRepo
         .list({ destinationSession: destination, state: ["pending", "in-progress", "blocked"], limit })
@@ -551,7 +685,8 @@ activityRoutes.get("/parked", (c) => {
   `).all(scope.rig) as Array<{ node_id: string; session_name: string }>;
 
   if (seatParam) {
-    const match = seats.find((s) => s.node_id === seatParam || s.session_name === seatParam);
+    const physical = physicalSessionName(rigRepo.db, seatParam);
+    const match = seats.find((s) => s.node_id === seatParam || s.session_name === physical);
     if (!match) {
       return c.json({
         ok: false,

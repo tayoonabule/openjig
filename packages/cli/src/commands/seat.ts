@@ -1,9 +1,14 @@
+import { accountHomePlanMatches } from "../lib/account-home-switch.js";
+import { readFileSync } from "node:fs";
 import { Command } from "commander";
 import { DaemonClient, DaemonTimeoutError, terminalAuthHeaders } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
 import { shellQuote } from "../cross-host-executor.js";
+import { localSelfHostId, originFor, runOnSshHost, type RunOnHostDeps } from "../lib/run-on-host.js";
+import { readOpenRigEnv } from "../openrig-compat.js";
+import { seatLaunchAdditionLines, type SeatLaunchAdditionsView } from "../seat-launch-additions-lines.js";
 
 export type SeatDeps = StatusDeps;
 
@@ -23,9 +28,18 @@ interface SeatStatusResponse {
   pod_id: string | null;
   pod_namespace: string | null;
   runtime: string | null;
+  /** Slice 16: an open runtime switch, or one recovery stopped short of finishing. */
+  runtimeSwitch?: { id: string; phase: string; from: string; to: string; committed: boolean; startedAt: string; attention: string | null; outcome: string | null };
+  compaction?: { stage: string; detail: string };
   current_occupant: string | null;
   typingGuard?: { desired: boolean; effective: boolean; pending: boolean; heldCount: number;
-    desiredMode?: string; effectiveMode?: string; };
+    desiredMode?: string; effectiveMode?: string; desiredLevel?: string; effectiveLevel?: string; };
+  terminalPolicy?: {
+    state: string; label?: string; source?: string; actor?: string | null; instruction?: string;
+    helpers?: string[]; rules?: Record<string, Record<string, string>>;
+    rigDefault?: { config: unknown; appliesTo: string };
+    supported?: { compaction: string; model: string }; limits?: string; error?: string;
+  };
   permissions?: {
     selectionState: "explicit" | "inherit" | "unknown";
     desired: { mode: string } | null;
@@ -37,9 +51,25 @@ interface SeatStatusResponse {
       source: string;
       fallbackReason?: string;
     };
+    /** The daemon's planned account (permission-account.ts); older daemons don't send it. */
+    account?: {
+      summary: string;
+      overrides: string[];
+      openRigAdds: { claudeAllow: string[]; claudeAsk: string[]; claudeDeny?: string[]; notes: string[] };
+      unknown: string[];
+      controls: string[];
+      advisories?: string[];
+    };
   };
   session_status: string | null;
   launch_cwd?: string | null;
+  runtime_home?: {
+    variable: string;
+    home: string | null;
+    source: "member" | "rig" | "daemon" | "native_default" | "account-switch";
+    ignored?: { source: string; value: string };
+  };
+  claude_token?: { kind?: "api-key"; label: string; token_file: string; file: "readable" | "unusable"; problem?: string; notice?: string };
   session_reason?: string | null;
   startup_status: string | null;
   occupant_lifecycle: string;
@@ -130,7 +160,9 @@ interface SeatHandoverMutationResult {
   /** OPR.0.5.5.5 — per-source execution record (wire mirror of the daemon shape). */
   sourceOutcome?:
     | { mode: "fork"; forkedFrom: string; forkId?: "captured" | "pending"; limit?: string }
-    | { mode: "rebuild"; primedArtifacts: Array<{ address: string; label: string }>; gaps: string[]; emptyChainReason?: string };
+    | { mode: "rebuild"; primedArtifacts: Array<{ address: string; label: string }>; gaps: string[]; emptyChainReason?: string; permissions?: { state: string; detail: string } };
+  /** The restore packet was pasted and Enter pressed, but its submission couldn't be confirmed. */
+  restorePacket?: { status: "unconfirmed"; reason: string };
   sideEffects: {
     departingSessionKilled: false;
     startupContextDelivered: boolean;
@@ -156,23 +188,63 @@ function sessionReason(reason: string | null | undefined): string | null {
   return reason === "session_missing" ? "tmux session missing; restore or relaunch the seat" : null;
 }
 
+const LEVEL_WORDS: Record<string, string> = {
+  "openrig-urgent": "OpenRig's own messages and anything marked urgent type.",
+  "urgent-only": "Only messages marked urgent type.",
+  "sends-only": "Deliberate sends from people and agents type; OpenRig's own notices are held.",
+};
+
+/** Show configured seat state, including selected account references, without claiming the running login is verified. */
 function printHuman(status: SeatStatusResponse): void {
   console.log(`Seat ${status.seat_ref}`);
   console.log(`Rig: ${status.rig_name}`);
   console.log(`Logical ID: ${status.logical_id}`);
   console.log(`Current occupant: ${display(status.current_occupant)}`);
   if (status.launch_cwd !== undefined) console.log(`Working directory for future launches: ${display(status.launch_cwd)}`);
+  if (status.runtime_home) {
+    const h = status.runtime_home;
+    const from = h.source === "member" || h.source === "rig" ? `the seat's own, from its ${h.source} env`
+      : h.source === "account-switch" ? "the seat's selected account home"
+      : h.source === "daemon" ? "the daemon's" : "the native default";
+    console.log(`Runtime home (${h.variable}) for launches: ${display(h.home)} (${from}; configured, not proof of the login a running session uses)`);
+    if (h.ignored) console.log(`  Ignored: its ${h.ignored.source} env sets ${h.variable}=${h.ignored.value}, which isn't an absolute path`);
+  }
+  if (status.claude_token) {
+    const t = status.claude_token;
+    console.log(`Claude ${t.kind === "api-key" ? "API key" : "subscription token"}: ${t.label}, read from ${t.token_file} at each launch (${t.file === "readable" ? "readable now" : "won't apply at the next launch"})`);
+    if (t.notice) console.log(`  ${t.notice}`);
+  }
   if (status.typingGuard) {
     const g = status.typingGuard;
-    const mode = g.effectiveMode ?? (g.effective ? "on" : "off");
-    console.log(`Typing guard: ${mode === "hold" ? "on (hold)" : mode}${g.pending ? ` (activation pending; requested ${g.desiredMode ?? (g.desired ? "on" : "off")})` : ""}; ${g.heldCount} retained`);
+    const mode = g.effectiveLevel ?? g.effectiveMode ?? (g.effective ? "on" : "off");
+    const requested = g.desiredLevel ?? g.desiredMode ?? (g.desired ? "on" : "off");
+    console.log(`Typing guard: ${mode === "hold" ? "on (hold)" : mode}${g.pending ? ` (activation pending; requested ${requested})` : ""}; ${g.heldCount} retained`);
     if (mode === "draft-aware") console.log(`Draft-aware sends return immediately; inspect held messages with rig seat held-messages ${status.seat_ref}.`);
+    else if (LEVEL_WORDS[mode]) console.log(`${LEVEL_WORDS[mode]} Other automatic input is held, readable with rig seat held-messages ${status.seat_ref}. Changing it does not replay held messages.`);
+    else if (mode === "off") console.log("Off: automatic input types as it arrives.");
     else console.log("Hold pauses all automatic input, including writing lifecycle. Changing mode does not replay held messages.");
   }
   console.log(`Session: ${display(status.session_status, "unknown")}`);
+  if (status.compaction) console.log(`Managed compaction (${status.compaction.stage}): ${status.compaction.detail}`);
   const reason = sessionReason(status.session_reason);
   if (reason) console.log(`Reason: ${reason}`);
-  if (status.permissions) {
+  if (status.permissions?.account) {
+    const p = status.permissions;
+    const a = p.account!;
+    console.log("Permissions, planned for the next fresh managed launch (not observed):");
+    console.log(`  ${a.summary}`);
+    for (const advisory of a.advisories ?? []) console.log(`  ${advisory}`);
+    if (a.overrides.length) console.log(`  This seat's choice is used instead of the ${a.overrides.join(" and the ")}.`);
+    for (const note of a.openRigAdds.notes) console.log(`  ${note}`);
+    if (a.openRigAdds.claudeDeny) console.log(`  Claude member rules (planned): ${a.openRigAdds.claudeDeny.length} denies; exact lists are in --json.`);
+    if (a.openRigAdds.claudeAllow.length) console.log("  The exact allowance and ask lists are in --json, under permissions.account.openRigAdds.");
+    console.log(`  Last launch arguments (observed): ${p.lastLaunchArguments?.value ?? "unknown"}${p.lastLaunchArguments?.approvalPolicy ? `; approval=${p.lastLaunchArguments.approvalPolicy}` : ""}`);
+    for (const item of a.unknown) console.log(`  Unknown: ${item}`);
+    if (a.controls.length) {
+      console.log("  To change it, for future launches only:");
+      for (const control of a.controls) console.log(`    ${control}`);
+    }
+  } else if (status.permissions) {
     const p = status.permissions;
     const formatSource = (source: string): string => {
       if (source === "member_spec") return "from the member's permission_policy";
@@ -191,12 +263,31 @@ function printHuman(status: SeatStatusResponse): void {
     console.log("Native permission effect: unverified by this status read");
     if (p.error) console.log(`Permission selection unavailable: ${p.error}`);
   }
+  if (status.terminalPolicy) {
+    const p = status.terminalPolicy;
+    console.log(`Terminal interaction (${p.state}; managed checks): ${p.label ?? "unknown"}${p.source ? ` [${p.source}]` : ""}`);
+    for (const [scope, rules] of Object.entries(p.rules ?? {}))
+      console.log(`  ${scope}: compaction=${rules.compaction}; model/effort=${rules.model}`);
+    if (p.helpers?.length) console.log(`  Named helpers: ${p.helpers.join(", ")}`);
+    if (p.instruction) console.log(`  Instruction: ${p.instruction}${p.actor ? ` (recorded by ${p.actor})` : ""}`);
+    if (p.rigDefault) console.log(`  Rig default (${p.rigDefault.appliesTo}): ${JSON.stringify(p.rigDefault.config)}`);
+    if (p.supported) console.log(`  Compaction: ${p.supported.compaction}; model/effort: ${p.supported.model}`);
+    console.log("  Enforced: managed compaction and saved model/effort changes. Other interventions: guidance-only.");
+    if (p.limits) console.log(`  ${p.limits}`);
+    if (p.error) console.log(`  Unknown: ${p.error}`);
+  }
   console.log(`Startup: ${display(status.startup_status, "unknown")}`);
   console.log(`Occupant lifecycle: ${status.occupant_lifecycle}`);
   console.log(`Continuity outcome: ${display(status.continuity_outcome, "unverified")}`);
   console.log(`Handover result: ${display(status.handover_result)}`);
   console.log(`Previous occupant: ${display(status.previous_occupant)}`);
   console.log(`Handover at: ${display(status.handover_at)}`);
+  if (status.runtimeSwitch) {
+    const sw = status.runtimeSwitch;
+    console.log(`Runtime switch: ${sw.from} -> ${sw.to} (switch ${sw.id}, since ${sw.startedAt}): ${sw.committed
+      ? `committed; the ${sw.to} occupant holds the seat` : `not committed; the ${sw.from} occupant holds the seat`}, ${sw.phase}`);
+    if (sw.attention) console.log(`  Needs attention: ${sw.attention} Finish it with rig seat set-runtime ${status.seat_ref} --recover.`);
+  }
 }
 
 function printHumanHandoverPlan(plan: SeatHandoverPlan): void {
@@ -234,6 +325,7 @@ function printHumanHandoverResult(result: SeatHandoverMutationResult): void {
     if (result.sourceOutcome.forkId === "pending") console.log(`Fork id: PENDING. ${result.sourceOutcome.limit ?? ""}`.trim());
   } else if (result.sourceOutcome?.mode === "rebuild") {
     const outcome = result.sourceOutcome;
+    if (outcome.permissions) console.log(`Codex rebuild permissions: ${outcome.permissions.state}. ${outcome.permissions.detail}`);
     if (outcome.primedArtifacts.length > 0) {
       console.log(`Rebuild primed from ${outcome.primedArtifacts.length} durable artifact${outcome.primedArtifacts.length === 1 ? "" : "s"}:`);
       for (const artifact of outcome.primedArtifacts) console.log(`  - ${artifact.address} — ${artifact.label}`);
@@ -251,6 +343,11 @@ function printHumanHandoverResult(result: SeatHandoverMutationResult): void {
       // live successor agent.
       console.log("The captured startup context (restore packet) was delivered to the successor.");
     }
+    console.log("No conversation continuity, provenance markdown, or session stop was performed.");
+  } else if (result.restorePacket?.status === "unconfirmed") {
+    // The packet was pasted and Enter pressed: the successor may already be working on it, so don't send it again.
+    console.log(`The captured startup context (restore packet) was sent to the successor, but its submission is unconfirmed: ${result.restorePacket.reason}.`);
+    console.log("Check the successor's screen before sending the context again; it may already be working on it.");
     console.log("No conversation continuity, provenance markdown, or session stop was performed.");
   } else if (result.source.mode === "fork") {
     console.log("No packet delivery: fork context rides the native conversation itself.");
@@ -284,7 +381,8 @@ function printSeatError(error: SeatStatusError, fallback: string): void {
   }
 }
 
-export function seatCommand(depsOverride?: SeatDeps & { readStdin?: () => Promise<string> }): Command {
+/** Build seat lifecycle commands, requiring acknowledged plans before isolated account-home changes. */
+export function seatCommand(depsOverride?: SeatDeps & { readStdin?: () => Promise<string>; host?: RunOnHostDeps }): Command {
   const cmd = new Command("seat")
     .description("Inspect OpenRig seat observability state");
   const getDeps = (): SeatDeps => depsOverride ?? {
@@ -301,9 +399,38 @@ export function seatCommand(depsOverride?: SeatDeps & { readStdin?: () => Promis
     console.log(JSON.stringify(result.data, null, json ? undefined : 2));
     if (result.status >= 400) process.exitCode = result.status >= 500 ? 2 : 1;
   };
+  cmd.command("history")
+    .requiredOption("--rig <id>", "Exact rig ID")
+    .requiredOption("--node-id <id>", "Exact durable node ID")
+    .option("--snapshot-id <id>", "Validate a reference returned by this list")
+    .option("--history-session-id <id>", "Validate a reference returned by this list")
+    .option("--json", "Print the daemon response as JSON")
+    .description("List or validate captured histories eligible for a resume attempt (read-only)")
+    .action(async (opts: { rig: string; nodeId: string; snapshotId?: string; historySessionId?: string; json?: boolean }) => {
+      if (!!opts.snapshotId !== !!opts.historySessionId) {
+        console.error("Supply both --snapshot-id and --history-session-id to validate a history.");
+        process.exitCode = 1;
+        return;
+      }
+      const deps = getDeps(); const daemon = await getDaemonStatus(deps.lifecycleDeps, { cleanupStaleState: false });
+      if (!daemonStatusGuard(daemon)) return;
+      const client = deps.clientFactory(getDaemonUrl(daemon));
+      const path = `/api/startup/${encodeURIComponent(opts.rig)}/nodes/${encodeURIComponent(opts.nodeId)}/history`;
+      const response = opts.snapshotId && opts.historySessionId
+        ? await client.post<Record<string, unknown>>(`${path}/validate`, { snapshotId: opts.snapshotId, historySessionId: opts.historySessionId }, { headers: terminalAuthHeaders() })
+        : await client.get<Record<string, unknown>>(path, { headers: terminalAuthHeaders() });
+      if (opts.json || response.status >= 400) console.log(JSON.stringify(response.data, null, 2));
+      else {
+        const body = response.data as { snapshotId?: string; history?: { historySessionId: string; resumeType: string; tokenState: string }; histories?: Array<{ historySessionId: string; resumeType: string; tokenState: string }> };
+        console.log(`Current snapshot: ${body.snapshotId ?? "none"}`);
+        for (const item of body.history ? [body.history] : body.histories ?? []) console.log(`${item.historySessionId}  ${item.resumeType}  token: ${item.tokenState}`);
+        if (!body.history && !body.histories?.length) console.log("No eligible captured histories.");
+      }
+      if (response.status >= 400) process.exitCode = response.status >= 500 ? 2 : 1;
+    });
   cmd.command("set-typing-guard").argument("<seat>")
     .option("--enabled <boolean>", "Compatibility: true selects hold; false selects off")
-    .option("--mode <mode>", "off, draft-aware or hold; choose this or --enabled")
+    .option("--mode <mode>", "off, draft-aware, openrig-urgent, urgent-only, sends-only or hold; choose this or --enabled")
     .requiredOption("--reason <text>").option("--json").description("Choose how this seat's typing guard handles automatic input")
     .addHelpText("after", `
 This one persistent guard defaults off. Hold pauses ALL automatic input, including
@@ -311,6 +438,19 @@ at an empty prompt; --enabled true keeps that existing behavior. Draft-aware hol
 when the current input contains a draft or cannot be read. It returns the exact
 reason and held message ID immediately, without automatic retry.
 Off (--enabled false) permits new automatic sends.
+
+Between off (always interrupt) and hold (full quiet):
+  openrig-urgent  OpenRig's own messages (watchdogs, scheduled wakes, notices) and
+                  anything marked urgent type; other agents' messages are held.
+  urgent-only     only messages marked urgent type (rig send --urgent, or a queue
+                  item at priority urgent or critical).
+  sends-only      deliberate sends from people and agents type; OpenRig's own
+                  notices are held. A terminal member defaults to this.
+What openrig-urgent and urgent-only let through never types over a draft.
+sends-only types like off: a terminal member's typing isn't protected, as today
+(its shell input can't be read). Everything else is held, the sender is told, and
+held messages stay readable. Lifecycle work is refused at openrig-urgent and
+urgent-only, as at hold.
 Messages use the existing outbox. Uncertain writes never replay automatically.
 Direct human input remains available. Other seats keep their own guard mode.
 
@@ -330,13 +470,14 @@ on an active pane; freshly created or respawned lifecycle shells have separate p
 
 Examples:
   rig seat set-typing-guard dev-impl@my-rig --mode draft-aware --reason "preserve my draft"
+  rig seat set-typing-guard review-r1@my-rig --mode urgent-only --reason "reviewing by hand"
   rig seat set-typing-guard dev-impl@my-rig --enabled true --reason "manual terminal"
 `)
     .action(async (seat: string, opts: { enabled?: string; mode?: string; reason: string; json?: boolean }) => {
       if ((opts.enabled === undefined) === (opts.mode === undefined)
         || opts.enabled !== undefined && !["true", "false"].includes(opts.enabled)
-        || opts.mode !== undefined && !["off", "draft-aware", "hold"].includes(opts.mode)) {
-        console.error("Choose --enabled true|false or --mode off|draft-aware|hold.");
+        || opts.mode !== undefined && !["off", "draft-aware", "openrig-urgent", "urgent-only", "sends-only", "hold"].includes(opts.mode)) {
+        console.error("Choose --enabled true|false or --mode off|draft-aware|openrig-urgent|urgent-only|sends-only|hold.");
         process.exitCode = 1; return;
       }
       await guardRequest("POST", `/api/seat/set-typing-guard/${encodeURIComponent(seat)}`, {
@@ -474,7 +615,7 @@ rig seat handover, THEN retarget the view. Examples:
   cmd
     .command("clear-attention")
     .argument("<session>", "Canonical session name (e.g. dev-impl@my-rig)")
-    .option("--reason <text>", "Attest startup or subset-restore attention; cannot bypass full-restore or pane-identity checks")
+    .option("--reason <text>", "Attest startup or subset-restore attention, or that a prompt the latest hook names is gone; cannot bypass full-restore or pane-identity checks")
     .option("--json", "JSON output for agents")
     .description("Reconcile seat attention using the checks for its attention class")
     .addHelpText("after", `
@@ -483,7 +624,11 @@ Examples:
   rig seat clear-attention dev-impl@my-rig --reason "founder re-authed, confirmed live"
   rig seat clear-attention dev-impl@my-rig --json
 
---reason can acknowledge startup-status and subset-restore attention. It does
+--reason can acknowledge startup-status and subset-restore attention. It can
+also say a prompt is gone: when the seat's latest hook still says it waits on a
+person (a permission prompt declined or answered with no hook after) and sends
+are refused, --reason "<what you saw>" records the prompt cleared. Each send
+still checks the pane for a prompt it recognizes. It does
 not bypass full-restore continuity or pane-identity checks. Acknowledgment alone
 does not prove that the original conversation resumed.
 If the recorded native token needs correction and you know the actual token:
@@ -528,7 +673,7 @@ identity remains unverified; a version number alone cannot clear it.
   // Thin CLI over the daemon's SeatLifecycleService; refusals print message +
   // guidance + match list exactly as the daemon named them.
   const runLifecycleVerb = async (
-    path: "set-model" | "set-cwd" | "set-effort" | "set-permissions" | "launch" | "launch-plan" | "continue" | "stop" | "clean" | "restart" | "restart-plan" | "restart-verify",
+    path: "set-terminal-policy" | "set-model" | "set-cwd" | "set-effort" | "set-permissions" | "launch" | "launch-plan" | "continue" | "stop" | "clean" | "restart" | "restart-plan" | "restart-verify",
     seat: string,
     body: Record<string, unknown>,
     opts: { json?: boolean },
@@ -545,8 +690,9 @@ identity remains unverified; a version number alone cannot clear it.
         ? await client.post<Record<string, unknown>>(route, body, { timeoutMs: 120_000 })
         // #260: a dynamic Claude mode waits up to 5 s for the capability query before the
         // daemon answers, so the 5 s default deadline would abort before its refusal arrives.
+        // A Codex profile change runs the native profile check (up to 10 s) before answering.
         : path === "set-permissions"
-          ? await client.post<Record<string, unknown>>(route, body, { timeoutMs: 10_000 })
+          ? await client.post<Record<string, unknown>>(route, body, { timeoutMs: (body as Record<string, unknown>)["codexProfile"] !== undefined ? 30_000 : 10_000 })
           : await client.post<Record<string, unknown>>(route, body);
     } catch (err) {
       if ((path !== "launch" && path !== "launch-plan" && path !== "continue" && path !== "restart" && path !== "set-cwd") || !(err instanceof DaemonTimeoutError)) throw err;
@@ -598,17 +744,73 @@ identity remains unverified; a version number alone cannot clear it.
     printOk(res.data);
   };
 
+  const terminalPolicy = cmd.command("set-terminal-policy")
+    .argument("<seat>", "Canonical session name or logical seat ref")
+    .requiredOption("--preset <preset>", "no-peer-interventions, help-within-instructions, full-control")
+    .option("--helper <addresses...>", "Named helpers covered by the delegated instruction")
+    .option("--rig-default", "Set this rig's default for newly added seats only, leaving existing seats unchanged")
+    .requiredOption("--reason <text>", "Delegating instruction and audit reason")
+    .option("--operator <address>", "Audit attribution outside a managed seat")
+    .option("--json", "JSON output for agents")
+    .description("Choose terminal interventions; managed compaction and saved model/effort changes are checked")
+    .addHelpText("after", "\nReplaces the complete choice. Exceptions take allow or deny; model covers effort too.\nPeer presets never change self/OpenRig authority unless its exception is supplied. No native permissions or interruption levels change.\nOther interventions are guidance-only. The existing dangerous send override and its guards are unchanged.");
+  for (const scope of ["peer", "self", "openrig"]) for (const action of ["compaction", "model"])
+    terminalPolicy.option(`--${scope}-${action} <decision>`, `Explicit ${scope} ${action} exception: allow or deny`);
+  terminalPolicy.action(async (seat: string, opts: Record<string, unknown> & { json?: boolean }) => {
+    const exceptions: Record<string, Record<string, unknown>> = {};
+    for (const scope of ["peer", "self", "openrig"]) for (const action of ["compaction", "model"]) {
+      const value = opts[scope + action[0]!.toUpperCase() + action.slice(1)];
+      if (value !== undefined) (exceptions[scope] ??= {})[action] = value;
+    }
+    await runLifecycleVerb("set-terminal-policy", seat, { preset: opts.preset, helpers: opts.helper ?? [],
+      exceptions, rigDefault: opts.rigDefault === true, reason: opts.reason, operator: opts.operator }, opts,
+      data => { console.log(String(data["effect"])); console.log(`Read the account: rig seat status ${shellQuote(seat)}`); });
+  });
+
   cmd
     .command("set-permissions")
     .argument("<seat>", "Canonical session name or logical seat ref")
-    .requiredOption("--mode <mode>", "floor, full_bypass, inherit, or a Claude mode supported by the bound managed launch context")
+    .option("--mode <mode>", "floor, full_bypass, inherit, or a Claude mode supported by the bound managed launch context")
+    .option("--rules <file>", "JSON allow/deny lists for this Claude seat; replaces its recorded rules without changing its mode")
+    .option("--codex-permissions <file>", "JSON sandbox/approval envelope for this Codex seat; replaces its recorded mode")
+    .option("--codex-profile <name>", "Codex config profile for this seat, or inherit to clear it; approval stays with the envelope or session")
     .requiredOption("--reason <text>", "Reason for the audited future-launch selection")
     .option("--operator <address>", "Operator recorded on the audit event when no session identity is present")
     .option("--json", "JSON output for agents")
     .description("Select native permissions for future managed launches; no relaunch or work-posture change")
-    .addHelpText("after", "\nUse inherit to clear this seat's explicit selection. Current native processes, history, rules and hooks remain unchanged. A later lifecycle action needs its own authorization.")
-    .action(async (seat: string, opts: { mode: string; reason: string; operator?: string; json?: boolean }) => {
-      await runLifecycleVerb("set-permissions", seat, { mode: opts.mode, reason: opts.reason, operator: opts.operator }, opts, data => {
+    .addHelpText("after", "\nUse inherit to clear this seat's explicit selection. Current native processes, history, rules and hooks remain unchanged. A later lifecycle action needs its own authorization.\n--rules takes a JSON object with allow and deny lists only. Use empty lists to clear the seat rules. It does not remove inherited grants or change the running process.\n--codex-permissions takes a JSON object: sandbox (workspace-write or read-only), approval (never, on-request or untrusted), and for workspace-write network_access, writable_roots (absolute paths), exclude_tmpdir_env_var and exclude_slash_tmp. It replaces a recorded mode; --mode replaces the envelope. Full access stays --mode full_bypass.\n--codex-profile reports an absent, changed or unchecked profile file without refusing; a profile that fails to load is refused.")
+    .action(async (seat: string, opts: { mode?: string; rules?: string; codexPermissions?: string; codexProfile?: string; reason: string; operator?: string; json?: boolean }) => {
+      if ([opts.mode, opts.rules, opts.codexPermissions, opts.codexProfile].filter(value => value !== undefined).length !== 1) {
+        console.error("Choose exactly one of --mode, --rules <file>, --codex-permissions <file> or --codex-profile <name>."); process.exitCode = 1; return;
+      }
+      let rules: unknown;
+      if (opts.rules !== undefined) {
+        try { rules = JSON.parse(readFileSync(opts.rules, "utf8")); }
+        catch { console.error(`Cannot read JSON rules from ${opts.rules}; provide an allow/deny mapping.`); process.exitCode = 1; return; }
+      }
+      let codexPermissions: unknown;
+      if (opts.codexPermissions !== undefined) {
+        try { codexPermissions = JSON.parse(readFileSync(opts.codexPermissions, "utf8")); }
+        catch { console.error(`Cannot read JSON from ${opts.codexPermissions}; provide a sandbox/approval mapping.`); process.exitCode = 1; return; }
+      }
+      const choice = opts.rules !== undefined ? { rules } : codexPermissions !== undefined ? { codexPermissions }
+        : opts.codexProfile !== undefined ? { codexProfile: opts.codexProfile } : { mode: opts.mode };
+      await runLifecycleVerb("set-permissions", seat, { ...choice, reason: opts.reason, operator: opts.operator }, opts, data => {
+        if (opts.rules !== undefined) {
+          console.log(`Claude tool rules ${data["changed"] === false ? "unchanged" : "recorded and audited"}.`);
+          console.log(String(data["effect"])); return;
+        }
+        if (codexPermissions !== undefined) {
+          const replaced = data["replaced"] as { mode?: { mode?: string } } | undefined;
+          console.log(`Codex permission envelope ${data["changed"] === false ? "unchanged" : "recorded and audited"}${replaced?.mode?.mode ? `; it replaces the recorded ${replaced.mode.mode} mode` : ""}.`);
+          console.log(String(data["effect"])); return;
+        }
+        if (opts.codexProfile !== undefined) {
+          const observed = data["observation"] as { file?: string; detail?: string; changedSinceRecorded?: boolean } | undefined;
+          console.log(`Codex profile: ${(data["to"] as string | null) ?? "inherit"}${data["changed"] === false ? " (unchanged)" : " (audited)"}`);
+          if (observed?.detail) console.log(`Profile file: ${observed.file ?? "unverified"}${observed.changedSinceRecorded ? ", changed since last recorded" : ""}. ${observed.detail}`);
+          console.log(String(data["effect"])); return;
+        }
         const selection = data["to"] as { mode: string } | null;
         console.log(`Permission mode: ${selection?.mode ?? "inherit"}${data["changed"] === false ? " (unchanged)" : " (audited)"}`);
         console.log(String(data["effect"]));
@@ -714,6 +916,184 @@ resume/successor launch reads it at call time. Examples:
     });
 
   cmd
+    .command("set-runtime")
+    .argument("<seat>", "Canonical session name or logical seat ref")
+    .option("--runtime <runtime>", "codex or claude-code")
+    .option("--reason <text>", "Why the seat moves; recorded with the switch")
+    .option("--model <id>", "Target model; otherwise the seat's agent spec for the target, else the target's default")
+    .option("--effort <level>", "Target effort, the target runtime's own level (not translated)")
+    .option("--codex-config-profile <name>", "Codex configuration profile for a Codex successor")
+    .option("--clear-account-home", "Return to member/rig/daemon/native login selection through a fresh successor")
+    .option("--account-home <path>", "Isolated target CODEX_HOME or CLAUDE_CONFIG_DIR; also permits a fresh successor on the same runtime")
+    .option("--token-file <path>", "With a Claude account home, its required subscription token reference")
+    .option("--account-label <label>", "With --token-file, the selected account's label")
+    .option("--permission-mode <mode>", "Target native permission choice; default: inherit the seat's member and rig policy")
+    .option("--confirm-timeout <seconds>", "How long the successor has to confirm the handover (default 180)")
+    .option("--dry-run", "Show the plan (settings, what is cleared, costs) without changing anything")
+    .option("--confirm <switch-id>", "For the staged successor only: confirm the handover (with --note)")
+    .option("--note <text>", "With --confirm: what you'll do first")
+    .option("--recover", "Finish an interrupted switch from its record")
+    .option("--json", "JSON output for agents")
+    .description("Move a live Codex or Claude Code seat to the other runtime, successor first")
+    .addHelpText("after", `
+The seat keeps its address, connections, queue rows and claims. Its successor
+starts on the target runtime beside the current occupant, reads a handover, and
+confirms it; only then does the seat move to it and the old runtime retire.
+Without a confirmation in time, nothing changes and the current occupant keeps
+the seat.
+
+Costs: a new conversation (history isn't converted, only the handover carries
+over); the seat's pane and scrollback change; the team file isn't rewritten (a
+later converge reports a deferred change_runtime); the source runtime's model,
+effort, Codex profile and native permission choice are cleared, not mapped; two
+processes run until cutover; messages sent to the seat during the switch are
+held, not typed, and need sending again afterwards.
+Codex and Claude Code, single-pane seats only. --dry-run lists the details.
+--clear-account-home returns to configured member/rig/daemon/native selection; it does not restore historical credentials.
+It uses a fresh successor and clears an account-home token reference only after confirmation. Do not combine it with
+--account-home or a new token reference. Anthropic's global active/default profile is not isolated by CLAUDE_CONFIG_DIR.
+
+A seat can switch itself (its CLI may end when it retires; the daemon finishes).
+  rig seat set-runtime dev-impl@my-rig --runtime claude-code --reason "Codex limit" --dry-run
+  rig seat set-runtime dev-impl@my-rig --runtime claude-code --reason "Codex limit"
+  rig seat status dev-impl@my-rig            # an open or interrupted switch shows here
+  rig seat set-runtime dev-impl@my-rig --recover`)
+    .action(async (seat: string, opts: { runtime?: string; reason?: string; model?: string; effort?: string; codexConfigProfile?: string;
+      permissionMode?: string; accountHome?: string; clearAccountHome?: boolean; tokenFile?: string; accountLabel?: string; confirmTimeout?: string; dryRun?: boolean; confirm?: string; note?: string; recover?: boolean; json?: boolean }) => {
+      if (opts.clearAccountHome && (opts.accountHome !== undefined || opts.tokenFile !== undefined || opts.accountLabel !== undefined || opts.runtime === undefined)) {
+        console.error("Use --clear-account-home with --runtime and without --account-home, --token-file or --account-label.");
+        process.exitCode = 1; return;
+      }
+      const modes = [opts.confirm !== undefined, opts.recover === true, opts.runtime !== undefined].filter(Boolean).length;
+      if (modes !== 1) {
+        console.error("Pass exactly one of --runtime <runtime> (with --reason), --confirm <switch-id> (with --note), or --recover.");
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.runtime !== undefined && !opts.reason?.trim()) {
+        console.error("Pass --reason with --runtime; it is recorded with the switch.");
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.confirm !== undefined && !opts.note?.trim()) {
+        console.error('Pass --note with --confirm, saying what you\'ll do first.');
+        process.exitCode = 1;
+        return;
+      }
+      let confirmTimeoutSeconds: number | undefined;
+      if (opts.confirmTimeout !== undefined) {
+        confirmTimeoutSeconds = Number(opts.confirmTimeout);
+        if (!Number.isInteger(confirmTimeoutSeconds) || confirmTimeoutSeconds < 10 || confirmTimeoutSeconds > 3600) {
+          console.error("--confirm-timeout must be a whole number of seconds from 10 to 3600.");
+          process.exitCode = 1;
+          return;
+        }
+      }
+      const deps = getDeps();
+      const daemon = await getDaemonStatus(deps.lifecycleDeps);
+      if (!daemonStatusGuard(daemon)) return;
+      const client = deps.clientFactory(getDaemonUrl(daemon));
+      const base = `/api/seat/set-runtime/${encodeURIComponent(seat)}`;
+      let res;
+      let switchRequested = false;
+      try {
+        res = opts.confirm !== undefined
+          ? await client.post<Record<string, unknown>>(`${base}/confirm`, { switchId: opts.confirm, note: opts.note })
+          : opts.recover
+            ? await client.post<Record<string, unknown>>(`${base}/recover`, {}, { timeoutMs: 60_000 })
+            : await (async () => {
+              const body = {
+                runtime: opts.runtime, reason: opts.reason, dryRun: opts.dryRun === true,
+                ...(opts.model !== undefined ? { model: opts.model } : {}), ...(opts.effort !== undefined ? { effort: opts.effort } : {}),
+                ...(opts.codexConfigProfile !== undefined ? { codexConfigProfile: opts.codexConfigProfile } : {}),
+                ...(opts.permissionMode !== undefined ? { permissionMode: opts.permissionMode } : {}),
+                ...(opts.accountHome !== undefined ? { accountHome: opts.accountHome } : {}),
+                ...(opts.clearAccountHome ? { clearAccountHome: true } : {}),
+                ...(opts.tokenFile !== undefined ? { tokenFile: opts.tokenFile, accountLabel: opts.accountLabel ?? "selected-account" } : {}),
+                ...(confirmTimeoutSeconds !== undefined ? { confirmTimeoutSeconds } : {}),
+              };
+              if (opts.accountHome !== undefined || opts.clearAccountHome) {
+                const preview = await client.post<Record<string, unknown>>(base, { ...body, dryRun: true }, { timeoutMs: 30_000 });
+                const token = opts.tokenFile ? { label: opts.accountLabel ?? "selected-account", tokenFile: opts.tokenFile } : undefined;
+                if (!accountHomePlanMatches(preview.data, opts.clearAccountHome ? null : opts.accountHome!, token)) {
+                  return { status: 409, data: { ok: false, code: "account_home_switch_unavailable",
+                    message: preview.data["message"] ?? "The daemon did not acknowledge the selected account home and token. No switch was requested." } };
+                }
+                if (opts.dryRun) return preview;
+              }
+              switchRequested = true;
+              return client.post<Record<string, unknown>>(base, body,
+                { timeoutMs: opts.dryRun ? 30_000 : ((confirmTimeoutSeconds ?? 180) + 120) * 1000 });
+            })();
+      } catch (err) {
+        if ((opts.accountHome !== undefined || opts.clearAccountHome) && !switchRequested) {
+          const refusal = { ok: false, code: "account_home_preflight_failed", message: "The read-only account-home preflight failed; no switch was requested." };
+          if (opts.json) console.log(JSON.stringify(refusal)); else console.error(refusal.message);
+          process.exitCode = 1; return;
+        }
+        if (!(err instanceof DaemonTimeoutError) || opts.dryRun) throw err;
+        const unknown = { ok: false as const, code: "runtime_switch_outcome_unknown", status: "unknown",
+          message: "The CLI stopped waiting; the daemon may still be switching the seat.",
+          guidance: `Check it before anything else: rig seat status ${shellQuote(seat)}` };
+        if (opts.json) console.log(JSON.stringify(unknown, null, 2));
+        else printSeatError(unknown, unknown.message);
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.json) {
+        console.log(JSON.stringify(res.data, null, 2));
+        process.exitCode = res.status >= 500 ? 2 : res.status >= 400 || res.data["recoveryPending"] === true ? 1 : 0;
+        return;
+      }
+      if (res.status >= 400) {
+        printSeatError(res.data as unknown as SeatStatusError, `Runtime switch failed (HTTP ${res.status})`);
+        process.exitCode = res.status >= 500 ? 2 : 1;
+        return;
+      }
+      const data = res.data;
+      if (opts.confirm !== undefined || opts.recover) {
+        console.log(String(data["message"] ?? data["outcome"] ?? "Done."));
+        return;
+      }
+      const seatInfo = data["seat"] as { ref?: string } | undefined;
+      const name = seatInfo?.ref ?? seat;
+      if (data["changed"] === false) {
+        console.log(`${name} already runs ${String(data["to"])}. Nothing changed.`);
+        return;
+      }
+      const label = (source: string) => source === "explicit" ? "as given" : source === "agent_spec" ? "from the seat's agent spec" : "the runtime's default";
+      const settings = (data["settings"] ?? {}) as Record<string, { value: string | null; source: string }>;
+      if (data["dryRun"]) console.log(`Runtime switch plan for ${name}: ${String(data["from"])} -> ${String(data["to"])}. Nothing changes until you run it without --dry-run.`);
+      else if (data["recoveryPending"] === true) console.log(`Recovery is still pending for ${name} (switch ${String(data["switchId"])}); the runtime switch is not complete.`);
+      else console.log(`Switched ${name} from ${String(data["from"])} to ${String(data["to"])} (switch ${String(data["switchId"])}).`);
+      if (data["accountHome"] === null) console.log("Selected account home: configured defaults (member/rig, then daemon, then native)");
+      else if (data["accountHome"]) console.log(`Selected account home: ${String(data["accountHome"])}`);
+      const accountToken = data["accountToken"] as { label: string; tokenFile: string } | undefined;
+      if (accountToken) console.log(`Claude token reference: ${accountToken.label}, read from ${accountToken.tokenFile} at launch`);
+      console.log(`Settings on ${String(data["to"])}:`);
+      for (const [key, title] of [["model", "model"], ["effort", "effort"], ["advisor", "advisor"], ["codexConfigProfile", "Codex profile"]] as const) {
+        const setting = settings[key];
+        if (!setting || (key === "advisor" && data["to"] !== "claude-code") || (key === "codexConfigProfile" && data["to"] !== "codex")) continue;
+        console.log(`  ${title}: ${setting.value ?? "none"} (${label(setting.source)})`);
+      }
+      const permission = data["permission"] as { mode: string; source: string } | undefined;
+      if (permission) console.log(`  permissions: ${permission.source === "explicit" ? `${permission.mode} (as given)` : "the seat's member and rig policy"}`);
+      const dropped = (data["dropped"] as Array<{ setting: string; value: string }> | undefined) ?? [];
+      if (dropped.length) console.log(`Cleared from ${String(data["from"])}: ${dropped.map((d) => `${d.setting} ${d.value}`).join("; ")}.`);
+      for (const line of (data["notRun"] as string[] | undefined) ?? []) console.log(`Not run: ${line}`);
+      if (data["dryRun"]) {
+        console.log("Costs:");
+        for (const cost of (data["costs"] as string[] | undefined) ?? []) console.log(`  - ${cost}`);
+      } else {
+        const confirmation = data["confirmation"] as { note: string } | undefined;
+        if (confirmation) console.log(`The successor confirmed the handover: "${confirmation.note}"`);
+        console.log(`Queue: ${String(data["openRows"] ?? 0)} open rows stay addressed to the seat; ${String(data["claimsMoved"] ?? 0)} claims moved to the successor.`);
+      }
+      for (const warning of (data["warnings"] as string[] | undefined) ?? []) console.warn(`Warning: ${warning}`);
+      if (data["recoveryPending"] === true) process.exitCode = 1;
+    });
+
+  cmd
     .command("set-cwd")
     .argument("<seat>", "Canonical session name or logical seat ref")
     .requiredOption("--cwd <directory>", "Absolute working directory on the daemon's host; created if missing")
@@ -812,6 +1192,8 @@ Examples:
           const startup = data["startup"] as { projectionCount: number; fileCount: number; actionCount: number };
           console.log(`Startup: ${startup.projectionCount} projections, ${startup.fileCount} files, ${startup.actionCount} actions.`);
           for (const sibling of data["siblings"] as Array<{ logicalId: string }>) console.log(`Sibling ${sibling.logicalId}: unchanged.`);
+          // OPR.0.7.0.9: the seat's own launch additions, as the seat view shows them.
+          for (const line of seatLaunchAdditionLines(data["launchAdditions"] as SeatLaunchAdditionsView | null | undefined)) console.log(line);
           return;
         }
         const s = data["seat"] as { logicalId?: string; rigName?: string } | undefined;
@@ -832,6 +1214,7 @@ Examples:
     .option("--verify", "After a real tool-using turn, check whether the restarted seat can be reported as moved")
     .option("--expect-account <text>", "With --verify: the account Codex's /status Account line must name")
     .option("--operator <address>", "Operator recorded on the audit event")
+    .option("--host <id>", "Restart a seat on this registered machine, over its SSH entry, as this seat")
     .option("--json", "JSON output for agents")
     .description("Restart one Codex seat in place so it reads its Codex home's current account")
     .addHelpText("after", `
@@ -860,11 +1243,13 @@ Results: restarted_account_unverified, not_started (the original is still runnin
 incomplete (it exited; the resume was not proven; the pane may be held for recovery),
 native_unknown (what happened could not be observed). Only --verify reports moved,
 and only with a completed tool turn since the restart AND --expect-account matched.
+With --host, the same restart runs on that machine against its daemon, over its SSH entry; the audit names this
+seat as the operator unless --operator does, and the result is that machine's, as it reports it.
 Examples:
   rig seat restart dev.impl --keep-conversation --plan --json
   rig seat restart dev-impl@my-rig --keep-conversation --reason "take the home's new account"
   rig seat restart dev.impl --keep-conversation --verify --expect-account me@example.com`)
-    .action(async (seat: string, opts: { keepConversation: boolean; reason?: string; plan?: boolean; verify?: boolean; expectAccount?: string; operator?: string; json?: boolean }) => {
+    .action(async (seat: string, opts: { keepConversation: boolean; reason?: string; plan?: boolean; verify?: boolean; expectAccount?: string; operator?: string; host?: string; json?: boolean }) => {
       if (opts.plan && opts.verify) {
         const error = { ok: false, code: "invalid_options", message: "--plan and --verify are separate steps; pass one." };
         if (opts.json) console.log(JSON.stringify(error, null, 2));
@@ -877,6 +1262,26 @@ Examples:
         if (opts.json) console.log(JSON.stringify(error, null, 2));
         else console.error(error.message);
         process.exitCode = 1;
+        return;
+      }
+      if (opts.host) {
+        const seatName = readOpenRigEnv("OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME")?.trim() || undefined;
+        const origin = await originFor(seatName, depsOverride?.host?.selfHostId ?? (() => localSelfHostId(getDeps().lifecycleDeps)));
+        const changes = !opts.plan && !opts.verify;
+        const operator = opts.operator ?? (changes ? origin : undefined);
+        await runOnSshHost(opts.host, "seat restart", [
+          "seat", "restart", seat, "--keep-conversation",
+          ...(opts.plan ? ["--plan"] : []),
+          ...(opts.verify ? ["--verify"] : []),
+          ...(opts.expectAccount !== undefined ? ["--expect-account", opts.expectAccount] : []),
+          ...(opts.reason !== undefined ? ["--reason", opts.reason] : []),
+          ...(operator ? ["--operator", operator] : []),
+          ...(opts.json ? ["--json"] : []),
+        ], {
+          origin,
+          json: opts.json,
+          ...(changes ? { changes: { check: `rig seat restart ${seat} --keep-conversation --plan --host ${opts.host} (its lastRestart says whether this restart ran); don't restart it again on this result alone` } } : {}),
+        }, depsOverride?.host);
         return;
       }
       if (opts.verify) {
@@ -1154,11 +1559,8 @@ function printRestartReport(data: Record<string, unknown>): void {
   const settings = data["settings"] as { note?: string } | undefined;
   if (settings?.note) console.log(`Settings: ${settings.note}`);
   console.log(`Codex home: ${String(data["codexHome"])}.`);
-  console.log(`Billing route: ${(data["billingRoute"] as { detail: string }).detail}`);
   const noDaemon = data["codexNoDaemonFlag"] as { detail: string } | undefined;
   if (noDaemon) console.log(noDaemon.detail);
-  const processMode = data["processMode"] as { detail: string } | undefined;
-  if (processMode) console.log(processMode.detail);
   const account = data["account"] as { credentialStore: { detail: string }; authFile: { detail: string }; startupGate: string | null; startupGateKind?: string | null };
   console.log(`Account: unverified. ${account.credentialStore.detail} ${account.authFile.detail}`);
   if (account.startupGate) console.log(`Codex startup gate${account.startupGateKind ? ` (${account.startupGateKind})` : ""}: ${account.startupGate}`);

@@ -13,6 +13,7 @@ import { EventBus } from "../src/domain/event-bus.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import type { NativeProcessRow } from "../src/domain/native-process-lineage.js";
 import { SeatLifecycleService } from "../src/domain/seat-lifecycle-service.js";
+import { getNodeInventory } from "../src/domain/node-inventory.js";
 import {
   LATEST_WINS_EFFORT_PRECEDENCE, UNDECIDED_EFFORT_PRECEDENCE, effortPrecedence, emittedEffortFromArgv, KNOWN_EFFORT_LEVELS, unknownLevelWarning, readNativeEffort, readSeatEffort, resolveSeatEffort,
 } from "../src/domain/seat-effort.js";
@@ -48,6 +49,36 @@ describe("resolveSeatEffort: the one resolver for managed continuations", () => 
     expect(readSeatEffort(db, "missing")).toBeNull();
     db.exec("ALTER TABLE nodes DROP COLUMN effort_choice");
     expect(readSeatEffort(db, node.id)).toMatchObject({ effective: "low", source: "authored" });
+    db.close();
+  });
+});
+
+describe("node inventory: the configured effort and its provenance", () => {
+  it("serves the seat choice first, then the authored value, and runtime_default when neither exists", () => {
+    const db = createFullTestDb();
+    const repo = new RigRepository(db);
+    const rig = repo.createRig("eff-inventory");
+    const chosen = repo.addNode(rig.id, "dev.choice", { runtime: "codex", effort: "low" });
+    repo.setNodeEffortChoice(chosen.id, "high");
+    repo.addNode(rig.id, "dev.authored", { runtime: "codex", effort: "medium" });
+    repo.addNode(rig.id, "dev.default", { runtime: "codex" });
+
+    const byId = Object.fromEntries(getNodeInventory(db, rig.id).map((entry) => [entry.logicalId, entry]));
+    expect(byId["dev.choice"]).toMatchObject({ effort: "high", effortSource: "seat_choice" });
+    expect(byId["dev.authored"]).toMatchObject({ effort: "medium", effortSource: "authored" });
+    expect(byId["dev.default"]).toMatchObject({ effort: null, effortSource: "runtime_default" });
+    db.close();
+  });
+
+  it("resolves an older database without the choice column from the authored value", () => {
+    const db = createFullTestDb();
+    const repo = new RigRepository(db);
+    const rig = repo.createRig("eff-inventory-old");
+    repo.addNode(rig.id, "dev.a", { runtime: "codex", effort: "low" });
+    db.exec("ALTER TABLE nodes DROP COLUMN effort_choice");
+
+    const [entry] = getNodeInventory(db, rig.id);
+    expect(entry).toMatchObject({ effort: "low", effortSource: "authored" });
     db.close();
   });
 });
@@ -232,7 +263,7 @@ describe("SeatLifecycleService.effortReport: four values, each from its own sour
         readCodexTranscriptPath: () => transcript,
       },
       inPlaceRestartIo: {
-        readProcess: async () => ({ cwd: "/w", exe: "/usr/local/bin/codex", env: { CODEX_HOME: "/scratch/.codex" }, apiKeyEnvNames: [] }),
+        readProcess: async () => ({ cwd: "/w", exe: "/usr/local/bin/codex", env: { CODEX_HOME: "/scratch/.codex" } }),
         readThreadId: async () => logsThread,
       },
     });
@@ -248,10 +279,10 @@ describe("SeatLifecycleService.effortReport: four values, each from its own sour
     sessionRegistry.updateResumeToken(session.id, "codex_id", "019a-thread", "scrape");
     return node;
   }
-  function running(args: string) {
+  function running(args: string, argv = ["/usr/local/bin/codex", ...args.split(" ")]) {
     rows = [
       { pid: 100, ppid: 1, pgid: 100, tpgid: 200, executableName: "bash", command: "-bash", startedAt: LSTART },
-      { pid: 200, ppid: 100, pgid: 200, tpgid: 200, executableName: "codex", command: `/usr/local/bin/codex ${args}`, startedAt: LSTART },
+      { pid: 200, ppid: 100, pgid: 200, tpgid: 200, executableName: "codex", command: `/usr/local/bin/codex ${args}`, argv, startedAt: LSTART },
     ];
   }
 
@@ -307,6 +338,53 @@ describe("SeatLifecycleService.effortReport: four values, each from its own sour
     expect(await service.effortReport("dev-codex@eff")).toMatchObject({ observed: { state: "observed", value: "low", outcome: "accepted" } });
     logsThread = undefined;
     expect(await service.effortReport("dev-codex@eff")).toMatchObject({ observed: { state: "not_verified" } });
+  });
+
+  it("joins the exact Codex argv after a spaced profile without attributing an option value as the conversation", async () => {
+    codexSeat({ authored: "low" });
+    transcript = file("rollout-spaced.jsonl", [
+      { type: "turn_context", timestamp: at(5), payload: { turn_id: "a1", effort: "low" } },
+      { type: "event_msg", timestamp: at(7), payload: { type: "task_complete", turn_id: "a1" } },
+    ]);
+    const expected = "019a-thread";
+    const correct = ["/usr/local/bin/codex", "-p", "managed work", "resume", expected];
+    running(correct.slice(1).join(" "), correct);
+    expect(await service.effortReport("dev-codex@eff")).toMatchObject({ observed: { state: "observed", value: "low" } });
+    const wrong = ["/usr/local/bin/codex", "resume", "--add-dir", `/tmp/${expected}`, "019b-other"];
+    running(wrong.slice(1).join(" "), wrong);
+    expect(await service.effortReport("dev-codex@eff")).toMatchObject({ observed: { state: "not_verified" } });
+  });
+
+  it.each([null, undefined, [], ["codex", "resume", "019a-thread", "bad\0argument"], ["node", "resume", "019a-thread"]])(
+    "keeps effort unknown when the selected Codex has no usable exact argv: %j", async argv => {
+      codexSeat({ authored: "high" });
+      running(`-c model_reasoning_effort="high" resume 019a-thread`);
+      rows[1]!.argv = argv;
+      logsThread = "019a-thread";
+      transcript = file("opaque-rollout.jsonl", [
+        { type: "turn_context", timestamp: at(5), payload: { turn_id: "a1", effort: "high" } },
+        { type: "event_msg", timestamp: at(7), payload: { type: "task_complete", turn_id: "a1" } },
+      ]);
+      expect(await service.effortReport("dev-codex@eff")).toMatchObject({
+        ok: true, emitted: { state: "unknown" }, observed: { state: "not_verified" },
+      });
+    });
+
+  it("keeps native effort unverified when a readable child sits below an opaque Codex launcher", async () => {
+    codexSeat({ authored: "high" });
+    running(`-c model_reasoning_effort="high" resume 019a-thread`);
+    rows[0]!.tpgid = 200;
+    rows[1]!.ppid = 150;
+    rows.splice(1, 0, { pid: 150, ppid: 100, pgid: 200, tpgid: 200, executableName: "codex",
+      command: "codex -m configured-model", argv: null, startedAt: LSTART });
+    logsThread = "019a-thread";
+    transcript = file("opaque-launcher-rollout.jsonl", [
+      { type: "turn_context", timestamp: at(5), payload: { turn_id: "a1", effort: "high" } },
+      { type: "event_msg", timestamp: at(7), payload: { type: "task_complete", turn_id: "a1" } },
+    ]);
+    expect(await service.effortReport("dev-codex@eff")).toMatchObject({
+      ok: true, emitted: { state: "unknown" }, observed: { state: "not_verified" },
+    });
   });
 
   it("joins a Claude process to its sidecar session by argv, or by a recorded resume rotation", async () => {

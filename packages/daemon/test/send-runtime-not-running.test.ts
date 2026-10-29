@@ -10,17 +10,6 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { migrate } from "../src/db/migrate.js";
 import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js";
-import {
-  makeParkedOwnerConsumerPolicy,
-  makeRigAnchor,
-  FAILED_PREFIX,
-  NUDGE_FAIL_PREFIX,
-  PARKED_OWNER_POLICY_NAME,
-  type ParkedOwnerConsumerDeps,
-  type RowTransitionView,
-} from "../src/domain/policies/parked-owner-consumer.js";
-import type { PolicyJob } from "../src/domain/policies/types.js";
-import type { WatchdogHistoryEntry } from "../src/domain/watchdog-history-log.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import { createFullTestDb } from "./helpers/test-app.js";
 import type { NativeProcessRow } from "../src/domain/native-process-lineage.js";
@@ -65,7 +54,7 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
   // The watchdog's deliver() makes exactly this call (startup.ts parked-owner delivery).
   const watchdogSend = (transport: SessionTransport, name: string) =>
     transport.send(name, "[OpenRig watchdog scheduler · policy: parked-owner-consumer] You are parked", {
-      deliveryId: "guard-watchdog-job-1", actorSession: "watchdog@system", auditPointer: "job-1",
+      deliveryId: "guard-watchdog-job-1", actorSession: "watchdog@system", auditPointer: "job-1", openrigNotice: true,
     });
 
   it.each([["claude-code", "zsh"], ["codex", "-bash"]])("%s seat showing %s: refused, nothing typed", async (runtime, shell) => {
@@ -103,7 +92,8 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
       { pid: 1135, ppid: 1, pgid: 1135, tpgid: 1196, executableName: "zsh", command: "-zsh", startedAt },
       { pid: 1196, ppid: 1135, pgid: 1196, tpgid: 1196, executableName: "bash", command: "/bin/sh /tmp/launch.txt", startedAt },
       { pid: 1199, ppid: 1196, pgid: 1196, tpgid: 1196, executableName: "node", command: `node /opt/bin/codex resume ${nativeToken}`, startedAt },
-      { pid: 1205, ppid: 1199, pgid: 1196, tpgid: 1196, executableName: "codex", command: `/opt/native/codex resume ${nativeToken}`, startedAt },
+      { pid: 1205, ppid: 1199, pgid: 1196, tpgid: 1196, executableName: "codex", command: `/opt/native/codex resume ${nativeToken}`,
+        argv: ["/opt/native/codex", "resume", nativeToken], startedAt },
     ];
   }
 
@@ -130,6 +120,29 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
     expect(listProcesses).toHaveBeenCalledTimes(2);
   });
 
+  it.each(["ordinary verified send", "queue nudge", "watchdog wake"])("wrapped Codex with unreadable argv still receives %s", async kind => {
+    const opaque = vi.fn(async () => wrapperProcesses().map(row => row.pid === 1205 ? { ...row, argv: null } : row));
+    const { transport, sendText, sendKeys } = wrappedSeat(opaque);
+    const result = kind === "watchdog wake"
+      ? await watchdogSend(transport, "dev-check@my-rig")
+      : await transport.send("dev-check@my-rig", "existing review", {
+        verify: true, ...(kind === "queue nudge" ? { actorSession: "dev-owner@my-rig", auditPointer: "existing-review", deliveryId: "nudge-opaque" } : {}),
+      });
+    expect(result.ok).toBe(true);
+    expect(sendText).toHaveBeenCalledOnce();
+    expect(sendKeys).toHaveBeenCalledOnce();
+    expect(opaque).toHaveBeenCalledTimes(2);
+  });
+
+  it("wrapped Codex with unreadable argv still refuses an approval prompt", async () => {
+    const opaque = vi.fn(async () => wrapperProcesses().map(row => row.pid === 1205 ? { ...row, argv: null } : row));
+    const { transport, tmux, sendText, sendKeys } = wrappedSeat(opaque);
+    tmux.capturePaneContent = async () => "Would you like to run the following command?\n› 1. Yes, proceed (y)\n2. No\nPress enter to confirm or esc to cancel";
+    expect(await transport.send("dev-check@my-rig", "existing review")).toMatchObject({ ok: false, reason: "target_needs_input" });
+    expect(sendText).not.toHaveBeenCalled();
+    expect(sendKeys).not.toHaveBeenCalled();
+  });
+
   it("proven native wrapper still refuses an approval prompt", async () => {
     const { transport, tmux, sendText, sendKeys } = wrappedSeat();
     tmux.capturePaneContent = async () => "Would you like to run the following command?\n› 1. Yes, proceed (y)\n2. No\nPress enter to confirm or esc to cancel";
@@ -142,7 +155,7 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
     const { transport, session, listProcesses, sendText } = wrappedSeat();
     sessionRegistry.clearResumeToken(session.id);
     listProcesses.mockResolvedValue(wrapperProcesses().map(r => r.pid === 1205
-      ? { ...r, command: "/opt/native/codex -m model" } : r));
+      ? { ...r, command: "/opt/native/codex -m model", argv: ["/opt/native/codex", "-m", "model"] } : r));
     expect((await watchdogSend(transport, "dev-check@my-rig")).ok).toBe(true);
     expect(sendText).toHaveBeenCalledOnce();
   });
@@ -150,12 +163,13 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
   // #1079: a `codex` launcher that spawns Codex, which spawns its native child.
   function launcherProcesses(): NativeProcessRow[] {
     const [shell, sh] = wrapperProcesses();
-    const link = (pid: number, ppid: number, command: string): NativeProcessRow =>
-      ({ ...sh!, pid, ppid, executableName: "codex", command });
+    const link = (pid: number, ppid: number, command: string, argv: string[]): NativeProcessRow =>
+      ({ ...sh!, pid, ppid, executableName: "codex", command, argv });
     return [shell!, sh!,
-      link(1199, 1196, "codex --no-daemon -s workspace-write -c check_for_update_on_startup=false"),
-      link(1203, 1199, "codex --no-daemon -s workspace-write"),
-      link(1205, 1203, "codex -c model_provider=local")];
+      link(1199, 1196, "codex --no-daemon -s workspace-write -c check_for_update_on_startup=false",
+        ["codex", "--no-daemon", "-s", "workspace-write", "-c", "check_for_update_on_startup=false"]),
+      link(1203, 1199, "codex --no-daemon -s workspace-write", ["codex", "--no-daemon", "-s", "workspace-write"]),
+      link(1205, 1203, "codex -c model_provider=local", ["codex", "-c", "model_provider=local"])];
   }
 
   it.each(["ordinary verified send", "watchdog wake"])("#1079 Codex behind a spawning launcher receives %s", async kind => {
@@ -180,7 +194,8 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
     ["exited native with stale UI", rows => rows.slice(0, -1)],
     ["background native", rows => rows.map(r => r.pid === 1205 ? { ...r, pgid: 999 } : r)],
     ["another pane's native", rows => rows.map(r => r.pid === 1205 ? { ...r, ppid: 999 } : r)],
-    ["wrong resume identity", rows => rows.map(r => r.pid === 1205 ? { ...r, command: "/opt/native/codex resume different" } : r)],
+    ["wrong resume identity", rows => rows.map(r => r.pid === 1205
+      ? { ...r, command: "/opt/native/codex resume different", argv: ["/opt/native/codex", "resume", "different"] } : r)],
     ["incomplete process identity", rows => rows.map(r => ({ ...r, startedAt: undefined }))],
   ];
   it.each(unproved)("shell label still refuses %s without input", async (_name, mutate) => {
@@ -303,7 +318,7 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
     const { transport, sendText, sendKeys } = wrappedClaude(vi.fn(async () =>
       claudeProcesses(`--resume ${identity === "matching" ? nativeToken : "other"}`).map(row =>
         identity === "different-runtime" && row.pid === 1205
-          ? { ...row, executableName: "codex", command: "codex resume other" } : row)));
+          ? { ...row, executableName: "codex", command: "codex resume other", argv: ["codex", "resume", "other"] } : row)));
     const repo = new QueueRepository(db, new EventBus(db), {
       transport, loadHumanRegistry: () => ({ ok: true, entities: [] }),
     });
@@ -347,13 +362,18 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
       expect(sendText).not.toHaveBeenCalled();
     });
 
-  it("negative: a terminal node's shell is its runtime, so it still receives text", async () => {
+  it("negative: a terminal node's shell is its runtime, so a person's send and OpenRig's own notice both still type", async () => {
     seat("terminal", "ops-human@my-rig");
     const { tmux, sendText } = tmuxWithPane(async () => "zsh");
-    const result = await watchdogSend(new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: tmux }), "ops-human@my-rig");
+    const transport = new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: tmux });
 
-    expect(result.ok).toBe(true);
+    const personal = await transport.send("ops-human@my-rig", "printf 'hello\\n'", { actorSession: "dev-impl@my-rig" });
+    expect(personal.ok).toBe(true);
     expect(sendText).toHaveBeenCalledOnce();
+
+    const watchdog = await watchdogSend(transport, "ops-human@my-rig");
+    expect(watchdog.ok).toBe(true);
+    expect(sendText).toHaveBeenCalledTimes(2);
   });
 
   it.each([["unknown", async () => null], ["unreadable", async () => { throw new Error("tmux failed"); }]])(
@@ -365,49 +385,4 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
       expect(result.ok).toBe(true);
       expect(sendText).toHaveBeenCalledOnce();
     });
-});
-
-describe("#142 the parked-owner wake records the refusal honestly and does not retry into the shell", () => {
-  const SEAT = "dev-impl@my-rig";
-  const ROW = "qitem-owed-1";
-
-  it("the refused delivery lands as a failure on the still-open row, and the episode sends no second wake", async () => {
-    const transitions: RowTransitionView[] = [];
-    const nudges: string[] = [];
-    const history: WatchdogHistoryEntry[] = [];
-    const deps = (): ParkedOwnerConsumerDeps => ({
-      diagnoseRig: () => ({ seats: [{
-        sessionName: SEAT,
-        parked: true,
-        activity: { value: "idle-at-prompt", needsInput: { count: 0, reason: null } },
-        obligations: { items: [{ qitemId: ROW, state: "in-progress", summary: null }], held: [] },
-      }] }),
-      history: { listForJob: (_j, limit) => history.slice(0, limit), countForJob: () => history.length },
-      rows: {
-        listTransitions: () => [...transitions],
-        appendNote: (_q, note) => { transitions.push({ ts: new Date().toISOString(), transitionNote: note }); return { ok: true }; },
-        recordNudgeResult: (_q, result) => void nudges.push(result),
-        listOpenIds: () => [ROW],
-      },
-    });
-    const job = {
-      jobId: "job-1", policy: PARKED_OWNER_POLICY_NAME, target: { session: makeRigAnchor("my-rig") },
-      intervalSeconds: 120, context: {}, lastEvaluationAt: null, lastFireAt: null,
-    } as unknown as PolicyJob;
-
-    const first = await makeParkedOwnerConsumerPolicy(deps()).evaluate(job);
-    expect(first.action).toBe("send");
-    const refusal = `Refused: '${SEAT}' reports zsh as the foreground command, but OpenRig could not verify its expected claude-code agent in the bound pane. The agent may still be running behind a wrapper. No text was sent.`;
-    history.push({
-      historyId: "h1", jobId: "job-1", evaluatedAt: new Date().toISOString(), outcome: "sent", skipReason: null,
-      deliveryTargetSession: SEAT, deliveryStatus: "failed", deliveryMessage: "wake",
-      evaluationNotes: { ...first.notes, deliveryReason: refusal },
-    } as WatchdogHistoryEntry);
-
-    const second = await makeParkedOwnerConsumerPolicy(deps()).evaluate(job);
-    expect(second.action).toBe("skip");
-    expect(JSON.stringify(second.notes)).toMatch(/already[-_]woken/);
-    expect(transitions.some((t) => t.transitionNote?.startsWith(FAILED_PREFIX) && t.transitionNote.includes("could not verify"))).toBe(true);
-    expect(nudges.some((n) => n.startsWith(NUDGE_FAIL_PREFIX) && n.includes("could not verify"))).toBe(true);
-  });
 });

@@ -1,3 +1,4 @@
+import { physicalSessionName } from "./session-registry.js";
 import { resolveNodeFile } from "./scope/node-file.js";
 import { belongsToProject, belongsToProjectMission } from "./workspace/project-catalog.js";
 import { inspectGraph } from "./workflow-reconciliation.js";
@@ -45,6 +46,7 @@ import { resolveWorkNodeDirs } from "./current-work.js";
 import { resolveLegacyTopologyRigsRoot } from "./user-settings/settings-store.js";
 import { BUILD_INFO, type BuildInfo } from "../build-info.js";
 import { validateMissionComposition } from "./lifecycle-manifest.js";
+import { cooperativeReadFile, readRowsCooperatively } from "./execution-candidate-reader.js";
 
 export const INDETERMINATE = "INDETERMINATE" as const;
 export type Indeterminate = typeof INDETERMINATE;
@@ -335,11 +337,10 @@ function hasColumn(db: Database.Database, table: string, column: string): boolea
 function lifecycleProjectAction(input: {
   instanceId: string;
   packetId: string;
-  owner: string;
   acceptance: Record<string, unknown> | null;
   receiptRequired?: boolean;
 }): string {
-  const base = `rig workflow project --instance ${input.instanceId} --current-packet ${input.packetId} --exit <handoff|waiting|done|failed> --actor-session ${input.owner}${input.receiptRequired ? " --evidence-ref <agent-judged-receipt>" : ""}`;
+  const base = `rig workflow project --instance ${input.instanceId} --current-packet ${input.packetId} --exit <handoff|waiting|done|failed>${input.receiptRequired ? " --evidence-ref <agent-judged-receipt>" : ""}`;
   if (!input.acceptance) return base;
   const verdicts = Array.isArray(input.acceptance["verdicts"])
     ? input.acceptance["verdicts"].filter((value): value is string => typeof value === "string")
@@ -419,7 +420,7 @@ function readLifecycleExecutions(db: Database.Database, mission: string, project
         gate: step && isRecord(step["gate"]) ? step["gate"] : null,
         acceptance,
         targeted_action: matches.length === 1 && packet
-          ? lifecycleProjectAction({ instanceId, packetId, owner: String(packet.destination_session), acceptance, receiptRequired: stepId !== null && requiredLifecycleSteps(binding).includes(stepId) })
+          ? lifecycleProjectAction({ instanceId, packetId, acceptance, receiptRequired: stepId !== null && requiredLifecycleSteps(binding).includes(stepId) })
           : INDETERMINATE,
       };
     });
@@ -439,7 +440,7 @@ function readLifecycleExecutions(db: Database.Database, mission: string, project
             failure["status"] === "unresolved" &&
             row["status"] !== "completed" &&
             row["status"] !== "aborted"
-            ? `rig workflow resume ${instanceId} --occurrence ${String(failure["occurrence_id"])} --actor-session <you>`
+            ? `rig workflow resume ${instanceId} --occurrence ${String(failure["occurrence_id"])}`
             : null,
         }))
       : [];
@@ -760,21 +761,27 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
   const missionRefs = mission === INDETERMINATE ? [] : missionReferences(missionsRoot, mission);
   const missionLikes = mission === INDETERMINATE ? ["%"] : missionRefs.map((reference) => `%${reference}%`);
   const missionWhere = missionLikes.map(() => "(tags LIKE ? OR body LIKE ?)").join(" OR ");
-  const candidateRows = deps.db
-    .prepare(
-      `SELECT qitem_id, source_session, destination_session, state, tags, body, summary, claimed_at,
+  // post_claim_motion feeds only derivePickup's legacy fallback, which pending and in-progress rows reach: a blocked row
+  // returns parked and a closed row terminal before the count is read. Every row and body is still selected here (the
+  // ladder, EC-3 and wave-map evidence need historical rows); only their unused history count is skipped.
+  const candidateSql = `SELECT qitem_id, source_session, destination_session, state, tags, body, summary, claimed_at,
               last_heartbeat, blocked_on, ts_created, ts_updated,
-              (SELECT COUNT(*) FROM queue_transitions t
+              CASE WHEN queue_items.state IN ('pending','in-progress') THEN (SELECT COUNT(*) FROM queue_transitions t
                  WHERE t.qitem_id = queue_items.qitem_id
                    AND t.ts > queue_items.claimed_at
-                   AND t.transition_note IS NOT 'claimed') AS post_claim_motion
+                   AND t.transition_note IS NOT 'claimed') ELSE 0 END AS post_claim_motion
          FROM queue_items
-        WHERE (${missionWhere})`,
-    )
-    .all(...missionLikes.flatMap((like) => [like, like])) as QueueRowLite[];
+        WHERE (${missionWhere})`;
+  const candidateBinds = missionLikes.flatMap((like) => [like, like]);
+  // On a WAL database file this full scan runs on its own readonly cursor and yields between slices so unrelated
+  // work can run; a native open, prepare or step can still block, since the slice budget is soft. It sees committed
+  // data as of its first step. Inside a transaction, or for a memory or non-WAL database, it stays a synchronous
+  // read on the main handle (no await on that branch).
+  const cooperativeFile = cooperativeReadFile(deps.db);
+  const candidateRows = cooperativeFile === null
+    ? deps.db.prepare(candidateSql).all(...candidateBinds) as QueueRowLite[]
+    : await readRowsCooperatively<QueueRowLite>(cooperativeFile, candidateSql, candidateBinds);
 
-  // Confirm broad SQL matches belong to this mission, then apply the project
-  // boundary using explicit tags or the project's claimed rigs.
   const rows = candidateRows
     .filter(row => mission === INDETERMINATE || rowBindsToMission(row.tags, missionRefs))
     .filter(row => !opts?.project || belongsToProjectMission(row, opts.project, opts.projectRigs ?? []));
@@ -849,8 +856,9 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     const arbitrated = deps.seatActivity?.getSeatStateBySession(r.destination_session) ?? null;
     const pickup = derivePickup({
       state: r.state,
-      lastMeaningfulAt: lastMeaningfulTransition(deps.db, r.qitem_id)?.at,
-      activity: arbitrated?.activity, needsInput: arbitrated?.needsInput.count,
+      // A blocked row's pickup is parked before it reads its history, so that history is not read at all.
+      lastMeaningfulAt: r.state === "blocked" ? undefined : lastMeaningfulTransition(deps.db, r.qitem_id)?.at,
+      activity: arbitrated?.activity, needsInput: arbitrated?.needsInput.count, needsInputReason: arbitrated?.needsInput.reason,
       claimedAt: r.claimed_at,
       lastHeartbeat: r.last_heartbeat,
       postClaimMotionCount: Number(r.post_claim_motion ?? 0),
@@ -1019,10 +1027,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
             excluded,
           };
     }
-    // The selected project has no binding to the OpenRig daemon's source.
-    // Missing Git objects cannot establish applicability. Keep daemon ancestry
-    // only on the legacy unscoped view, with its existing unknown/false rules.
-    // The lead's status.yaml record is the fallback evidence when no queue row carries candidate:*.
+    // The lead's status.yaml record is fallback evidence only when no queue row supplies a candidate tag.
     const recItems = statusItemsFor(facts);
     const recHashed = recItems.filter(i => i.hash && i.state !== "excluded");
     const proof = recItems.length ? { accepted: recItems.filter(i => i.state === "accepted").length, total: recItems.length, basis: `status.yaml items for slice ${facts.dir}` } : null;
@@ -1044,9 +1049,9 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
             for (const ih of integ) {
               const target = await resolveCommit(exec, repo, ih, commitCache);
               if (!target) continue;
-              const r = await gitAncestor(exec, repo, sha, target);
-              if (r.value === true) { verdict = true; break; }
-              if (r.value === false) { verdict = false; seen = true; }
+              const ancestry = await gitAncestor(exec, repo, sha, target);
+              if (ancestry.value === true) { verdict = true; break; }
+              if (ancestry.value === false) { verdict = false; seen = true; }
             }
             if (verdict === true || seen) break;
           }
@@ -1245,8 +1250,9 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     .map((r) => {
       const activity = deps.seatActivity?.getSeatStateBySession(r.destination_session);
       const pickup = derivePickup({
-        lastMeaningfulAt: lastMeaningfulTransition(deps.db, r.qitem_id)?.at,
-        activity: activity?.activity, needsInput: activity?.needsInput.count,
+        // As in Q1: a blocked row is parked before its history is read; its armed wake is still looked up below.
+        lastMeaningfulAt: r.state === "blocked" ? undefined : lastMeaningfulTransition(deps.db, r.qitem_id)?.at,
+        activity: activity?.activity, needsInput: activity?.needsInput.count, needsInputReason: activity?.needsInput.reason,
         state: r.state,
         claimedAt: r.claimed_at,
         lastHeartbeat: r.last_heartbeat,
@@ -1262,7 +1268,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
       let parkKind: "deliberate-with-wake" | "stalled" | "indeterminate";
       if (pickup.state === "parked" && wake) {
         parkKind = "deliberate-with-wake";
-      } else if (pickup.state === "stalled-after-claim") {
+      } else if (pickup.state === "stalled-after-claim" || pickup.stall) {
         parkKind = "stalled";
       } else {
         parkKind = "indeterminate";
@@ -1272,6 +1278,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
         qitem_id: r.qitem_id,
         pickup_state: pickup.state,
         ...(pickup.evidence ? { pickup_evidence: pickup.evidence } : {}),
+        ...(pickup.stall ? { pickup_stall: pickup.stall } : {}),
         park_kind: parkKind,
         park_kind_basis: wake
           ? `armed wake ${wake.wake_ref} on queue_transition_wakes`
@@ -1283,7 +1290,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     });
 
   // ---- Q6 parallelism health ----
-  const inProgressSeats = new Set(rows.filter((r) => r.state === "in-progress").map((r) => r.destination_session));
+  const inProgressSeats = new Set(rows.filter((r) => r.state === "in-progress").map((r) => physicalSessionName(deps.db, r.destination_session)));
   // Idle capacity: the ROSTER comes from sessions (names only); idleness comes
   // from the ACTIVITY ORACLE — sessions.status is not consulted (it labeled
   // live working lanes `superseded` on the real board).

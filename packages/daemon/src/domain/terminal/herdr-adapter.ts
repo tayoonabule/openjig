@@ -1,3 +1,6 @@
+import type { HerdrViewer, ViewerKey, ViewerResult } from "./herdr-viewer.js";
+import type { HerdrFollowView } from "./herdr-follow-view.js";
+import type { FollowControls } from "./terminal-follow-policy.js";
 // OPR.0.4.6.02 C2+FB4 — the herdr TerminalProvider (the proof-gated primary
 // provider). Arm's-length AGPL: it drives the installed herdr's local control
 // SOCKET through the injected `HerdrTransport` (see herdr-transport.ts) and
@@ -28,7 +31,7 @@
 //    to shell anyway).
 //  - The composer's `paneCommand` is a SHELL string (`tmux attach -r -t 's'`,
 //    `ssh 'dest' tmux attach …`); the pane node's `command` is an ARGV array —
-//    it is carried through `sh -c` with Herdr's fixed Claude/Codex detection
+//    it is carried through `sh -c` with Herdr's fixed Claude/Codex/Pi detection
 //    hint when the live runtime is known, without re-parsing shell quoting.
 //  - Liveness/availability = the socket `ping` (is the multiplexer's OWN
 //    control socket answering — NOT a daemon server ping; HERDR-FINDINGS #3's
@@ -73,8 +76,8 @@ import type {
   HerdrTransport,
   HerdrTransportFactory,
 } from "./herdr-transport.js";
+import { buildTileGrid, planTileLabels, type TileGrid, type TileNodes } from "./tile-layout.js";
 import type { HerdrAgentBridge } from "./jcode-herdr-agent-bridge.js";
-import { autoGridCols } from "../cmux-layout-service.js";
 
 /** Sentinel host for herdr-surface degrades (a pane herdr itself failed to render). */
 const HERDR_SURFACE_HOST = "herdr";
@@ -82,8 +85,8 @@ const HERDR_SURFACE_HOST = "herdr";
 /** The degrade reason for a seat whose pane was already gone right after its page applied (#707). */
 export const HERDR_PANE_EXITED_REASON = "the pane had already exited when OpenRig checked right after herdr opened it";
 
-/** The note when the pane listing can't confirm a page's panes; its seats stay listed as opened. */
-export const HERDR_PANES_UNCONFIRMED_NOTE = "herdr's pane list couldn't confirm the panes after layout, so those seats are listed as opened without that check.";
+/** The note for accepted layouts whose seat panes cannot be confirmed. */
+export const HERDR_PANES_UNCONFIRMED_NOTE = "herdr could not confirm these panes after layout; unconfirmed seats are reported as degraded. Inspect the terminal before retrying.";
 
 const normalLabel = (label: string): string => label.trim().replace(/\s+/g, " ");
 
@@ -104,10 +107,10 @@ function labelMatches(listed: string, composed: string): boolean {
  * the workspace's panes right after a page applies finds seats whose pane is already gone. There is
  * no wait, so only a pane that exited before this read is seen.
  *
- * It fails safe: a seat is degraded only when the listing positively shows the page's tab, and
+ * A seat is known gone only when the listing positively shows the page's tab, and
  * either another seat's label from the same apply is matched there (so labels compare) or the tab
  * holds nothing but blank filler panes. A missing tab, an empty or unreadable listing, or labels
- * that match nothing keep today's `opened`, with a note.
+ * that match nothing are explicitly unconfirmed rather than counted as opened.
  */
 export async function exitedSeats(
   transport: HerdrTransport,
@@ -116,9 +119,11 @@ export async function exitedSeats(
   pagePanes: ComposedPane[],
   blanks: number,
   notes: string[],
+  unknown = new Set<string>(),
 ): Promise<Set<string>> {
   const gone = new Set<string>();
-  const unconfirmed = (): Set<string> => {
+  const unconfirmed = (seats = pagePanes): Set<string> => {
+    for (const pane of seats) unknown.add(pane.seat);
     if (!notes.includes(HERDR_PANES_UNCONFIRMED_NOTE)) notes.push(HERDR_PANES_UNCONFIRMED_NOTE);
     return gone;
   };
@@ -132,12 +137,7 @@ export async function exitedSeats(
   const live = listed.filter((p): p is Record<string, unknown> =>
     p !== null && typeof p === "object" && (p as Record<string, unknown>)["tab_id"] === tabId);
   if (live.length === 0) return unconfirmed();
-  if (!live.every((p) => typeof p["label"] === "string")) {
-    // Panes without labels can't be told apart, so a loss is only counted.
-    const missing = pagePanes.length + blanks - live.length;
-    if (missing > 0) notes.push(`${missing} pane(s) exited right after opening. herdr's pane list doesn't say which, so those seats stay listed as opened.`);
-    return gone;
-  }
+  if (!live.every((p) => typeof p["label"] === "string")) return unconfirmed();
   const liveLabels = live.map((p) => p["label"] as string);
   // A seat whose label is blank can't be matched, and can't be told apart from a filler pane.
   const blankSeats = pagePanes.filter((pane) => normalLabel(pane.label) === "");
@@ -148,7 +148,7 @@ export async function exitedSeats(
     for (const pane of pagePanes) gone.add(pane.seat);
     return gone;
   }
-  if (blankSeats.length > 0) unconfirmed();
+  if (blankSeats.length > 0) unconfirmed(blankSeats);
   if (!pagePanes.some((pane) => liveLabels.some((l) => labelMatches(l, pane.label)))) return unconfirmed();
   const perLabel = new Map<string, ComposedPane[]>();
   for (const pane of pagePanes) {
@@ -156,17 +156,32 @@ export async function exitedSeats(
     if (key === "") continue; // never attributed; the note above says so
     perLabel.set(key, [...(perLabel.get(key) ?? []), pane]);
   }
+  // A short label may be another seat's truncated label, even when it is exact for one seat.
+  // Resolve overlapping candidates only when exact occurrences account for every candidate seat.
+  const exactLiveCounts = new Map<string, number>();
+  for (const liveLabel of liveLabels) {
+    const exact = normalLabel(liveLabel);
+    exactLiveCounts.set(exact, (exactLiveCounts.get(exact) ?? 0) + 1);
+  }
+  const liveMatches = liveLabels.map(liveLabel => [...perLabel.keys()].filter(label => labelMatches(liveLabel, label)));
+  for (const matches of liveMatches) {
+    if (matches.length > 1 && !matches.every(label => exactLiveCounts.get(label) === perLabel.get(label)!.length)) {
+      unconfirmed(matches.flatMap(label => perLabel.get(label)!));
+    }
+  }
   const shared: string[] = [];
   for (const [label, seats] of perLabel) {
-    const alive = liveLabels.filter((l) => labelMatches(l, label)).length;
+    const alive = liveLabels.filter((liveLabel, index) => normalLabel(liveLabel) === label
+      || (liveMatches[index]!.length === 1 && liveMatches[index]![0] === label)).length;
     if (seats.length === 1) {
-      if (alive === 0) gone.add(seats[0]!.seat);
+      if (alive === 0 && !unknown.has(seats[0]!.seat)) gone.add(seats[0]!.seat);
     } else if (alive < seats.length) {
       shared.push(label);
+      unconfirmed(seats);
     }
   }
   if (shared.length > 0) {
-    notes.push(`A pane labelled ${shared.map((l) => `"${l}"`).join(", ")} exited right after opening. Several seats share that label, so they stay listed as opened.`);
+    notes.push(`A pane labelled ${shared.map((l) => `"${l}"`).join(", ")} exited right after opening. Several seats share that label, so their panes are unconfirmed.`);
   }
   return gone;
 }
@@ -189,13 +204,9 @@ export interface HerdrSplitNode {
 
 export type HerdrLayoutNode = HerdrPaneNode | HerdrSplitNode;
 
-/**
- * Combine N nodes into an equal N-way strip along one direction. PURE.
- * Equal N-way BSP is first-vs-rest at ratio 1/N, recursively 1/(N-1) —
- * NOT midpoint 0.5 (the VM-reproduced defect: alternating 0.5 splits gave
- * N=7 a 4×2 layout with one double-width cell instead of the promised 3×3).
- */
+/** Build an equal first-vs-rest strip for managed observer layouts. */
 export function equalStrip(nodes: HerdrLayoutNode[], direction: "right" | "down"): HerdrLayoutNode {
+  if (nodes.length === 0) throw new Error("Cannot build a Herdr strip without nodes");
   if (nodes.length === 1) return nodes[0]!;
   return {
     type: "split",
@@ -206,43 +217,46 @@ export function equalStrip(nodes: HerdrLayoutNode[], direction: "right" | "down"
   };
 }
 
-/** An inert blank pane — pads an incomplete grid rectangle (cmux's blank-surface precedent). */
-function blankPane(): HerdrPaneNode {
-  return { type: "pane", label: "", command: ["sh"] };
+/** Herdr's own agent label for a seat's runtime, or null when Herdr doesn't recognise it. */
+function herdrAgent(pane: ComposedPane): "claude" | "codex" | "pi" | null {
+  return pane.runtime === "claude-code" ? "claude" : pane.runtime === "codex" ? "codex" : pane.runtime === "pi" ? "pi" : null;
 }
 
 function herdrPaneCommand(pane: ComposedPane): string {
-  const agent = pane.runtime === "claude-code" ? "claude" : pane.runtime === "codex" ? "codex" : null;
+  const agent = herdrAgent(pane);
   return agent ? `env HERDR_AGENT=${agent} ${pane.paneCommand}` : pane.paneCommand;
 }
 
 /**
- * Build an equal grid for one page. Explicit columns are capped to its pane
- * count, as in cmux; otherwise use the UI TerminalLauncher `suggestLayout` —
- * cols = ceil(sqrt(N)), rows = ceil(N/cols): N=2 → 2×1, N=5 → 3×2, N=7 → 3×3
- * (cols×rows). An incomplete rectangle is padded with inert blank panes so
- * every cell is the same size; blanks are layout filler only — they are never
- * reported as opened seats. Each real leaf runs the composer's shell
- * `paneCommand` via `["sh","-c",…]` so the composed quoting (read-only `-r`,
- * ssh-wrap) is preserved; a known Claude/Codex runtime adds Herdr's detection
- * hint. Rows are built as equal `right` strips,
- * then combined with equal `down` strips.
+ * The command Herdr reruns in a restored pane after a Herdr server restart, so the tile reattaches to
+ * its seat. Herdr takes it only for an agent it recognises, as an argv whose first element is a plain
+ * command and with no apostrophe or control character. `OPENRIG_TILE` makes each tile's command
+ * distinct: Herdr keeps one restore per identical command, so two views of one seat would otherwise
+ * lose one. Null when there is none to give: an ssh tile, a runtime Herdr doesn't recognise, or a name
+ * Herdr would refuse. Those tiles come back as shells.
  */
-export function buildGridRoot(panes: ComposedPane[], columns?: number): { root: HerdrLayoutNode; blanks: number; columns: number; rows: number } {
-  const cols = Math.min(columns ?? autoGridCols(panes.length), panes.length || 1);
-  const rows = Math.ceil(panes.length / cols);
-  const blanks = rows * cols - panes.length;
-  const leaves: HerdrLayoutNode[] = panes.map((pane) => ({
-    type: "pane",
-    label: pane.label,
-    command: ["sh", "-c", herdrPaneCommand(pane)],
-  }));
-  for (let i = 0; i < blanks; i++) leaves.push(blankPane());
-  const rowStrips: HerdrLayoutNode[] = [];
-  for (let r = 0; r < rows; r++) {
-    rowStrips.push(equalStrip(leaves.slice(r * cols, (r + 1) * cols), "right"));
-  }
-  return { root: equalStrip(rowStrips, "down"), blanks, columns: cols, rows };
+function herdrResumeArgv(pane: ComposedPane, tile: string): string[] | null {
+  const agent = herdrAgent(pane);
+  if (!agent || !pane.attachArgv) return null;
+  const argv = ["env", `HERDR_AGENT=${agent}`, `OPENRIG_TILE=${tile}`, ...pane.attachArgv];
+  return argv.some((arg) => /['\u0000-\u001f\u007f]/.test(arg)) ? null : argv;
+}
+
+/** Rounds of the restart-command report, half a second apart: about 3 s for Herdr to detect each tile's agent. */
+const RESUME_REPORT_ROUNDS = 7;
+const RESUME_REPORT_INTERVAL_MS = 500;
+
+/** Herdr's spelling of the shared grid: `right`/`down` splits, and inert `sh` blanks (cmux's blank-surface precedent). */
+const HERDR_TILE_NODES: TileNodes<HerdrLayoutNode> = {
+  // `sh -c` keeps the composed quoting (read-only `-r`, ssh-wrap); a known runtime adds Herdr's detection hint.
+  tile: (pane) => ({ type: "pane", label: pane.label, command: ["sh", "-c", herdrPaneCommand(pane)] }),
+  blank: () => ({ type: "pane", label: "", command: ["sh"] }),
+  split: (direction, ratio, first, second) => ({ type: "split", direction: direction === "across" ? "right" : "down", ratio, first, second }),
+};
+
+/** The equal grid for one page (see `buildTileGrid`): N=2 → 2×1, N=5 → 3×2, N=7 → 3×3 (cols×rows). */
+export function buildGridRoot(panes: ComposedPane[], columns?: number): TileGrid<HerdrLayoutNode> {
+  return buildTileGrid(panes, columns, HERDR_TILE_NODES);
 }
 
 /** The per-page socket request plan — pure, so it is asserted directly in tests. */
@@ -264,37 +278,25 @@ export interface HerdrLayoutPlan {
   pages: HerdrPagePlan[];
 }
 
-/** A named view's tab: its panes' names in reading order, such as "dashboard · operator". */
-export function namedTabLabel(page: ComposedPane[]): string {
-  return page.map((pane) => pane.label).join(" · ");
-}
-
 /**
  * Build the herdr socket plan for a composed view. PURE — no I/O. Each page
  * gets a fresh tab labeled `${tabPrefix}:${view.id}#<plan>#${launchToken}/<pageIndex>`;
  * two calls with different `launchToken`s produce DIFFERENT labels, which is
- * exactly the fresh-tab-on-relaunch (not-replace) invariant.
+ * exactly the fresh-tab-on-relaunch (not-replace) invariant. A named view's
+ * tabs carry their panes' names instead; the CLI confirms reuse by live
+ * attachments, not labels.
  */
 export function planHerdrLayout(
   view: ComposedView,
   launchToken: string,
   tabPrefix: string = "openrig",
 ): HerdrLayoutPlan {
-  // Older callers without a preview fingerprint still get fresh, non-reusable tabs.
-  const base = `${tabPrefix}:${view.id}${view.planId ? `#${view.planId.slice(0, 16)}` : ""}#${launchToken}`;
-  // The workspace is named for people: a named view's own label, the rig name for a rig view, else the view id.
-  // Tab labels keep the launch token, so every open is still a fresh, distinct space. A named view's
-  // tabs carry their panes' names instead; the CLI confirms reuse by live attachments, not labels.
-  const workspaceLabel = view.spaceLabel ?? (view.id.startsWith("rig:") ? view.id.slice("rig:".length) : view.id);
+  const labels = planTileLabels(view, launchToken, tabPrefix);
   const pages: HerdrPagePlan[] = view.pages.map((page, pageIndex) => {
     const grid = buildGridRoot(page, view.columns);
-    return {
-      tabLabel: view.spaceLabel ? namedTabLabel(page) : view.pages.length > 1 ? `${base}/${pageIndex + 1}` : base,
-      root: grid.root,
-      blanks: grid.blanks,
-    };
+    return { tabLabel: labels.pages[pageIndex]!, root: grid.root, blanks: grid.blanks };
   });
-  return { workspaceLabel: readableWorkspaceLabel(view.id), pages };
+  return { workspaceLabel: labels.space, pages };
 }
 
 /**
@@ -322,7 +324,10 @@ export function extractWorkspaceId(result: HerdrResult): string | null {
   return null;
 }
 
+/** The default tab `workspace.create` makes (`result.tab.tab_id`), or null on older builds. */
 export interface HerdrAdapterDeps {
+  following?: HerdrFollowView;
+  viewer?: HerdrViewer;
   transportFactory: HerdrTransportFactory;
   launch?: ProviderStatus["launch"];
   /**
@@ -333,6 +338,8 @@ export interface HerdrAdapterDeps {
   newLaunchToken?: () => string;
   /** Tab-name prefix (default `openrig`). */
   tabPrefix?: string;
+  /** The wait between restart-command report rounds. Injectable for tests. */
+  sleep?: (ms: number) => Promise<void>;
   /** Optional best-effort external agent reporter for panes created by this adapter. */
   agentBridge?: Pick<HerdrAgentBridge, "registerLayout">;
   /**
@@ -341,6 +348,83 @@ export interface HerdrAdapterDeps {
    * instead of building a second one beside it.
    */
   managedRigSpaces?: () => { reconcile(): Promise<void> } | undefined;
+}
+
+/** The applied pane ids of a page, in its leaf order, when Herdr's reply echoes exactly the requested tree. */
+function appliedPaneIds(requested: HerdrLayoutNode, applied: unknown): string[] | null {
+  if (!applied || typeof applied !== "object") return null;
+  const node = applied as Record<string, unknown>;
+  if (requested.type === "pane") {
+    const command = node["command"];
+    const same = node["type"] === "pane" && Array.isArray(command) && command.length === requested.command.length
+      && command.every((arg, i) => arg === requested.command[i]);
+    return same && typeof node["pane_id"] === "string" && node["pane_id"] ? [node["pane_id"] as string] : null;
+  }
+  if (node["type"] !== "split") return null;
+  const first = appliedPaneIds(requested.first, node["first"]);
+  const second = first && appliedPaneIds(requested.second, node["second"]);
+  return first && second ? [...first, ...second] : null;
+}
+
+/** A tile whose reattach command is reported to Herdr once its page has applied. */
+interface ResumeReport { seat: string; paneId: string; agent: string; argv: string[] }
+
+/** The reports a page's tiles get, matched to their panes by the tree Herdr's reply echoes. */
+function pageResumeReports(applied: HerdrResult, requested: HerdrLayoutNode, pagePanes: ComposedPane[], gone: Set<string>, unmatched: string[]): ResumeReport[] {
+  const wanted = pagePanes.filter((pane) => !gone.has(pane.seat) && herdrAgent(pane) && pane.attachArgv);
+  if (wanted.length === 0) return [];
+  const layout = applied["layout"];
+  const paneIds = layout && typeof layout === "object" ? appliedPaneIds(requested, (layout as Record<string, unknown>)["root"]) : null;
+  if (!paneIds) {
+    unmatched.push(...wanted.map((pane) => pane.seat));
+    return [];
+  }
+  const reports: ResumeReport[] = [];
+  for (const [index, pane] of pagePanes.entries()) {
+    const argv = wanted.includes(pane) ? herdrResumeArgv(pane, paneIds[index]!) : null;
+    if (argv) reports.push({ seat: pane.seat, paneId: paneIds[index]!, agent: herdrAgent(pane)!, argv });
+  }
+  return reports;
+}
+
+/**
+ * Give Herdr each tile's reattach command, so a Herdr server restart brings the tile back instead of an
+ * empty shell. It's a session-only report under the runtime's own label: it leaves Herdr's screen
+ * detection in charge of the tile's state (a held `pane.report_agent` would replace it), and Herdr
+ * reruns the command only for an agent label it recognises. Herdr accepts it only after its detector has
+ * recognised that agent in the pane (`resume_not_accepted` until then), so a refused report is retried
+ * in rounds while detection catches up. Herdr before 0.9.2 ignores the command. Whatever stays
+ * unreported is a note, never a failed seat.
+ */
+async function reportResumeCommands(
+  transport: HerdrTransport,
+  reports: ResumeReport[],
+  unmatched: string[],
+  sleep: (ms: number) => Promise<void>,
+  notes: string[],
+): Promise<void> {
+  let pending = reports;
+  const refused: string[] = [];
+  for (let round = 1; pending.length > 0 && round <= RESUME_REPORT_ROUNDS; round++) {
+    if (round > 1) await sleep(RESUME_REPORT_INTERVAL_MS);
+    const waiting: ResumeReport[] = [];
+    for (const report of pending) {
+      try {
+        await transport.request("pane.report_agent_session", {
+          pane_id: report.paneId, source: "openrig", agent: report.agent, resume_argv: report.argv,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (/resume_not_accepted/.test(message)) waiting.push(report);
+        else refused.push(`${report.seat} (${message})`);
+      }
+    }
+    pending = waiting;
+  }
+  const reopen = "after a Herdr restart, reopen this view.";
+  if (unmatched.length > 0) notes.push(`herdr's reply didn't show which pane is which, so these tiles have no restart command: ${unmatched.join(", ")}; ${reopen}`);
+  if (pending.length > 0) notes.push(`herdr hadn't recognised the agent in ${pending.map((r) => r.seat).join(", ")} yet, so those tiles have no restart command; ${reopen}`);
+  if (refused.length > 0) notes.push(`herdr didn't take the restart command for ${refused.join(", ")}; ${reopen}`);
 }
 
 /** Herdr lays out 4×4 per tab (OPR.0.6.0.8); cmux keeps the composer default. */
@@ -414,6 +498,19 @@ export class HerdrAdapter implements TerminalProvider {
     }
   }
 
+  async ensureViewer(key: ViewerKey, pane: ComposedPane, stillCurrent?: () => Promise<boolean>): Promise<ViewerResult> {
+    return this.deps.viewer?.ensure(key, pane, stillCurrent) ?? { ok: false, code: "viewer_unsupported", error: "This Herdr endpoint has no qualified viewer allocator." };
+  }
+  async lookupViewer(key: ViewerKey, pane: ComposedPane): Promise<ViewerResult> {
+    return this.deps.viewer?.lookup(key, pane) ?? { ok: false, code: "viewer_not_provisioned", error: "No qualified viewer mapping." };
+  }
+
+  async followView(viewId: string, view: ComposedView | null, controls: FollowControls, stillCurrent: () => Promise<boolean>, membershipError?: string): Promise<OpenViewResult> {
+    return this.deps.following?.follow(viewId, view, controls, stillCurrent, membershipError)
+      ?? { provider: "herdr", ok: false, opened: [], absent: [], degraded: [], pages: 0,
+        code: "follow_unsupported", error: "This endpoint has no qualified following allocator." };
+  }
+
   async openView(view: ComposedView): Promise<OpenViewResult> {
     const absent: AbsentSeat[] = [...view.absent];
     const degraded: DegradedSeat[] = [...view.degraded];
@@ -453,11 +550,8 @@ export class HerdrAdapter implements TerminalProvider {
       };
     }
 
-    // Already open: focus that workspace instead of stacking a duplicate beside it.
-    // The reuse key is the tab label (`<prefix>:<view.id>#…`), which Herdr persists and
-    // lists with its workspace id, so the sidebar label is free to stay readable.
-    // Workspaces from older builds also carry the key in their own label, so that is the
-    // fallback. Reuse (re)applies the readable label, which migrates old workspaces.
+    // Retries carrying the exact launch token are idempotent. A new open gets a
+    // fresh token and therefore a fresh workspace unless the existing roster grew.
     try {
       const prefix = `${this.tabPrefix}:${view.id}#`;
       const keyed = (rows: unknown) =>
@@ -465,21 +559,45 @@ export class HerdrAdapter implements TerminalProvider {
           (r) => typeof r.label === "string" && r.label.startsWith(prefix) && r.workspace_id,
         );
       const tabs = await this.transport.request("tab.list", {}).catch(() => ({}) as HerdrResult);
+      const exactLabel = plan.pages[0]?.tabLabel;
+      const exact = ((tabs["tabs"] as Array<{ workspace_id?: string; label?: string }> | undefined) ?? [])
+        .find((tab) => tab.label === exactLabel && tab.workspace_id);
+      if (exact?.workspace_id) {
+        await this.transport
+          .request("workspace.rename", { workspace_id: exact.workspace_id, label: plan.workspaceLabel })
+          .catch(() => undefined);
+        await this.transport.request("workspace.focus", { workspace_id: exact.workspace_id });
+        // Reuse the same pane confirmation/degradation path as roster growth. A failed
+        // pane.list must not turn a known exact-token retry into a duplicate workspace.
+        return this.fillExisting(exact.workspace_id, view, launchToken, { absent, degraded });
+      }
       const existingId =
         keyed(tabs["tabs"])?.workspace_id ??
         keyed((await this.transport.request("workspace.list", {}))["workspaces"])?.workspace_id;
       if (existingId) {
-        await this.transport
-          .request("workspace.rename", { workspace_id: existingId, label: plan.workspaceLabel })
-          .catch(() => undefined);
-        await this.transport.request("workspace.focus", { workspace_id: existingId });
-        return this.fillExisting(existingId, view, launchToken, { absent, degraded });
+        const panes = await this.transport.request("pane.list", { workspace_id: existingId });
+        const labels = new Set(
+          ((panes["panes"] as Array<{ label?: unknown }> | undefined) ?? [])
+            .map((pane) => pane.label)
+            .filter((label): label is string => typeof label === "string"),
+        );
+        if (view.opened.some((pane) => !labels.has(pane.label))) {
+          await this.transport
+            .request("workspace.rename", { workspace_id: existingId, label: plan.workspaceLabel })
+            .catch(() => undefined);
+          await this.transport.request("workspace.focus", { workspace_id: existingId });
+          return this.fillExisting(existingId, view, launchToken, { absent, degraded });
+        }
       }
     } catch {
       // An older Herdr without workspace.list keeps the open-fresh behaviour.
     }
 
     // A fresh workspace per open (BR-5 fresh-on-relaunch, strongest form).
+    // Herdr accepts a duplicate label, so a re-open would otherwise sit beside the earlier
+    // view under the same name. The existing labels are read first: when this rig's view is
+    // already open, the new workspace takes the next numbered suffix and the result says so.
+    // An unreadable list keeps the plain label.
     // The labeled create is tried first. If herdr refuses it and a workspace with
     // that label already exists, retry once with a numbered suffix and say so;
     // otherwise fall back ONCE to a bare create before degrading.
@@ -489,13 +607,22 @@ export class HerdrAdapter implements TerminalProvider {
     // the user never lands on a stray blank shell tab beside the view.
     let defaultTabId: string | null = null;
     let createErr: unknown = null;
+    let label = plan.workspaceLabel;
     try {
-      const created = await this.transport.request("workspace.create", {
-        focus: false,
-        label: plan.workspaceLabel,
-      });
+      const open = extractWorkspaceLabels(await this.transport.request("workspace.list", {}));
+      if (open.includes(label)) {
+        let n = 2;
+        while (open.includes(`${plan.workspaceLabel} (${n})`)) n++;
+        label = `${plan.workspaceLabel} (${n})`;
+      }
+    } catch { /* unknown → the plain label */ }
+    try {
+      const created = await this.transport.request("workspace.create", { focus: false, label });
       workspaceId = extractWorkspaceId(created);
       defaultTabId = extractTabId(created);
+      if (workspaceId != null && label !== plan.workspaceLabel) {
+        notes.push(`A view named "${plan.workspaceLabel}" is already open, so this one is "${label}".`);
+      }
     } catch (err) {
       createErr = err;
     }
@@ -561,6 +688,8 @@ export class HerdrAdapter implements TerminalProvider {
     // The starting tab is known blank only if every page applied AND reported its tab id:
     // an id-less reply or a failed (possibly still effective) apply may have used it.
     let everyPageKnown = true;
+    const resumeReports: ResumeReport[] = [];
+    const unmatchedResume: string[] = [];
     for (let pageIndex = 0; pageIndex < plan.pages.length; pageIndex++) {
       const pagePlan = plan.pages[pageIndex]!;
       const pagePanes = view.pages[pageIndex]!;
@@ -578,15 +707,22 @@ export class HerdrAdapter implements TerminalProvider {
         });
         const tabId = extractTabId(layoutResult);
         // Without a tab id the page's panes can't be told apart from other tabs, so no check runs.
+        const uncertain = new Set<string>();
         const gone = tabId
-          ? await exitedSeats(this.transport, workspaceId, tabId, pagePanes, pagePlan.blanks, notes)
+          ? await exitedSeats(this.transport, workspaceId, tabId, pagePanes, pagePlan.blanks, notes, uncertain)
           : new Set<string>();
+        if (!tabId) {
+          for (const pane of pagePanes) uncertain.add(pane.seat);
+          if (!notes.includes(HERDR_PANES_UNCONFIRMED_NOTE)) notes.push(HERDR_PANES_UNCONFIRMED_NOTE);
+        }
+        resumeReports.push(...pageResumeReports(layoutResult, pagePlan.root, pagePanes, new Set([...gone, ...uncertain]), unmatchedResume));
         if (tabId) {
           appliedTabIds.push(tabId);
-          if (pagePanes.some((pane) => !gone.has(pane.seat))) firstPopulatedTabId ??= tabId;
+          if (pagePanes.some((pane) => !gone.has(pane.seat) && !uncertain.has(pane.seat))) firstPopulatedTabId ??= tabId;
         } else everyPageKnown = false;
         for (const pane of pagePanes) {
           if (gone.has(pane.seat)) degraded.push({ seat: pane.seat, host: HERDR_SURFACE_HOST, reason: HERDR_PANE_EXITED_REASON });
+          else if (uncertain.has(pane.seat)) degraded.push({ seat: pane.seat, host: HERDR_SURFACE_HOST, code: "pane_unconfirmed", reason: HERDR_PANES_UNCONFIRMED_NOTE });
           else opened.push(pane.seat);
         }
         // Reporting is deliberately out-of-band from rendering. A reporter
@@ -612,22 +748,25 @@ export class HerdrAdapter implements TerminalProvider {
 
     // Land on a known populated tab, then remove the create's starting tab (#26) only when it is
     // known to be blank. When that is uncertain the tab is kept: closing it could remove seats.
-    if (opened.length > 0) {
+    if (opened.length > 0 || degraded.some(seat => seat.code === "pane_unconfirmed")) {
       if (firstPopulatedTabId) {
         try { await this.transport.request("tab.focus", { tab_id: firstPopulatedTabId }); }
         catch (err) { notes.push(`herdr did not focus the first tab: ${err instanceof Error ? err.message : String(err)}`); }
-      } else {
+      } else if (appliedTabIds.length === 0) {
         notes.push("herdr returned no tab id for any page, so no tab was focused explicitly.");
       }
       if (defaultTabId) {
         if (!everyPageKnown) {
           notes.push("The starting tab was kept because it could not be confirmed empty.");
-        } else if (!appliedTabIds.includes(defaultTabId)) {
+        } else if (opened.length > 0 && !appliedTabIds.includes(defaultTabId)) {
           try { await this.transport.request("tab.close", { tab_id: defaultTabId }); }
           catch (err) { notes.push(`herdr kept the blank starting tab: ${err instanceof Error ? err.message : String(err)}`); }
         }
       }
     }
+
+    // After the view is on screen: Herdr needs a moment to detect each tile's agent before it takes the command.
+    await reportResumeCommands(this.transport, resumeReports, unmatchedResume, this.deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))), notes);
 
     return {
       provider: this.name,
@@ -722,11 +861,14 @@ export class HerdrAdapter implements TerminalProvider {
     await managed.reconcile().catch(() => undefined);
     let workspaceId: string | undefined;
     let tiled: Set<string>;
+    let focusNote = `Focused the rig's managed space "${label}".`;
     try {
       const rows = ((await this.transport.request("workspace.list", {}))["workspaces"] as Array<{ workspace_id?: string; label?: string }> | undefined) ?? [];
       workspaceId = rows.find((w) => w.label === label && w.workspace_id)?.workspace_id;
       if (!workspaceId) return fail(`the daemon has not opened a Herdr space for ${label} yet; see GET /api/terminal/managed-views`);
-      await this.transport.request("workspace.focus", { workspace_id: workspaceId }).catch(() => undefined);
+      await this.transport.request("workspace.focus", { workspace_id: workspaceId }).catch((err: unknown) => {
+        focusNote = `herdr did not focus the rig's managed space "${label}": ${err instanceof Error ? err.message : String(err)}`;
+      });
       const panes = ((await this.transport.request("pane.list", { workspace_id: workspaceId }))["panes"] as Array<{ label?: string }> | undefined) ?? [];
       tiled = new Set(panes.map((p) => p.label).filter((l): l is string => typeof l === "string"));
     } catch (err) {
@@ -738,6 +880,6 @@ export class HerdrAdapter implements TerminalProvider {
       if (tiled.has(pane.seat.split("@")[0]!) || tiled.has(pane.label)) opened.push(pane.seat);
       else degraded.push({ seat: pane.seat, host: HERDR_SURFACE_HOST, reason: "no tile yet; the daemon adds it to the rig's space within about 10s" });
     }
-    return { provider: this.name, ok: opened.length > 0 || view.opened.length === 0, opened, absent, degraded, pages: 0, notes: [`Focused the rig's managed space "${label}".`] };
+    return { provider: this.name, ok: opened.length > 0 || view.opened.length === 0, opened, absent, degraded, pages: 0, notes: [focusNote] };
   }
 }

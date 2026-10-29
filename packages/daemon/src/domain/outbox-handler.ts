@@ -14,17 +14,9 @@ import type Database from "better-sqlite3";
  */
 export const WAKE_INTENT_PREFIX = "wake-intent-";
 
-// W1 (transactional closure): `indeterminate` is the ambiguous-delivery outcome —
-// a send that landed on the wire but whose render could not be CONFIRMED (transport
-// res.ok && !verified). It is never silently promoted to `delivered` (unconfirmed)
-// nor demoted to `failed` (it may have landed); the CAS transitions gate on 'pending',
-// so an indeterminate row is TERMINAL-BY-CAS (reconciliation is an out-of-scope
-// follow-on, not a W1 transition).
-// `sending` (MF3) is a transient CLAIM state: a drainer atomically moves a wake
-// intent pending→sending BEFORE the external send, so an overlapping drainer finds
-// nothing to claim and cannot double-send. A crash mid-send leaves the row visibly
-// `sending`; the recovery boundary (`reconcileAbandonedSending`, run once at
-// startup) reconciles it to `indeterminate` — the send is never blindly re-driven.
+// Outcomes retain unresolved uncertainty. Wake recovery can claim failed/indeterminate
+// work again; it never steals a live sending claim or interprets unknown as unsent.
+// Startup marks abandoned sending claims indeterminate before the bounded recovery pass.
 export const OUTBOX_DELIVERY_STATES = ["pending", "sending", "delivered", "failed", "indeterminate", "retained", "retired"] as const;
 export type OutboxDeliveryState = (typeof OUTBOX_DELIVERY_STATES)[number];
 
@@ -91,6 +83,8 @@ export interface OutboxRecordInput {
   /** P21 §4 era-stamp: the route passes `transport:v1` (senderSession derived from the transport
    *  header chokepoint). Written onto the outbox row; absence = claimed-era. */
   identityProvenance?: string | null;
+  /** With `principal:v1`: the caller the local MCP adapter named (resolveRecordedIdentity). */
+  identityPrincipal?: string | null;
 }
 
 export class OutboxHandlerError extends Error {
@@ -119,12 +113,13 @@ export class OutboxHandler {
   /** P21 §4: detected once — a curated-migration test DB (or a pre-067 daemon) may lack the
    *  era-stamp column, so the writer degrades (omits it) instead of throwing. */
   private readonly hasIdentityProvenanceColumn: boolean;
+  private readonly hasIdentityPrincipalColumn: boolean;
 
   constructor(db: Database.Database) {
     this.db = db;
-    this.hasIdentityProvenanceColumn = (
-      this.db.prepare("PRAGMA table_info(outbox_entries)").all() as Array<{ name: string }>
-    ).some((col) => col.name === "identity_provenance");
+    const columns = (this.db.prepare("PRAGMA table_info(outbox_entries)").all() as Array<{ name: string }>).map((col) => col.name);
+    this.hasIdentityProvenanceColumn = columns.includes("identity_provenance");
+    this.hasIdentityPrincipalColumn = columns.includes("identity_principal");
   }
 
   record(input: OutboxRecordInput): OutboxEntry {
@@ -137,11 +132,14 @@ export class OutboxHandler {
     const urgency = input.urgency ?? "routine";
 
     if (this.hasIdentityProvenanceColumn) {
+      // A principal is kept only beside principal:v1; a schema without the column records today's stamp instead.
+      const principal = input.identityProvenance === "principal:v1" && this.hasIdentityPrincipalColumn ? input.identityPrincipal ?? null : null;
+      const provenance = input.identityProvenance === "principal:v1" && !principal ? "transport:v1" : input.identityProvenance ?? null;
       this.db
         .prepare(
           `INSERT INTO outbox_entries (
-            outbox_id, sender_session, destination_session, body, tags, urgency, ts_dispatched, audit_pointer, identity_provenance
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            outbox_id, sender_session, destination_session, body, tags, urgency, ts_dispatched, audit_pointer, identity_provenance${principal ? ", identity_principal" : ""}
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?${principal ? ", ?" : ""})`
         )
         .run(
           id,
@@ -152,7 +150,8 @@ export class OutboxHandler {
           urgency,
           ts,
           input.auditPointer ?? null,
-          input.identityProvenance ?? null
+          provenance,
+          ...(principal ? [principal] : []),
         );
     } else {
       this.db
@@ -294,16 +293,14 @@ export class OutboxHandler {
   }
 
   /**
-   * MF3: atomically CLAIM a pending wake intent for delivery (pending→sending)
-   * BEFORE the external send. Returns true iff this caller won the claim. An
-   * overlapping drainer's claim finds the row no longer `pending` and returns
-   * false, so exactly one caller performs the external send.
+   * Atomically claim a fresh or previously unsuccessful notification attempt.
+   * Live sending claims, known delivery and deliberately held/retired work stay untouched.
    */
   claimForDelivery(outboxId: string): boolean {
     const result = this.db
       .prepare(
         `UPDATE outbox_entries SET delivery_state = 'sending'
-          WHERE outbox_id = ? AND delivery_state = 'pending'`
+          WHERE outbox_id = ? AND delivery_state IN ('pending','failed','indeterminate')`
       )
       .run(outboxId);
     return result.changes === 1;
@@ -336,12 +333,12 @@ export class OutboxHandler {
     return row ? this.rowToEntry(row) : null;
   }
 
-  listForSender(senderSession: string, limit = 100): OutboxEntry[] {
+  listForSender(senderSession: string, limit = 100, addresses = [senderSession]): OutboxEntry[] {
     const rows = this.db
       .prepare(
-        `SELECT * FROM outbox_entries WHERE sender_session = ? ORDER BY ts_dispatched DESC, rowid DESC LIMIT ?`
+        `SELECT * FROM outbox_entries WHERE sender_session IN (${addresses.map(() => "?").join(",")}) ORDER BY ts_dispatched DESC, rowid DESC LIMIT ?`
       )
-      .all(senderSession, limit) as OutboxEntryRow[];
+      .all(...addresses, limit) as OutboxEntryRow[];
     return rows.map((r) => this.rowToEntry(r));
   }
 

@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import path from "node:path";
+import fs from "node:fs";
+import os from "node:os";
+import { seatSkillPaths } from "../src/domain/seat-skill-storage.js";
+import { prepareSeatLaunchAdditions } from "../src/domain/seat-launch-additions.js";
 import type Database from "better-sqlite3";
 import { createFullTestDb } from "./helpers/test-app.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
@@ -49,6 +53,7 @@ describe("SeatLifecycleService.launchFresh", () => {
   let harnessResult: Awaited<ReturnType<RuntimeAdapter["launchHarness"]>>;
   let paneCommand: string;
   let adapter: RuntimeAdapter;
+  let runtimeAdapters: Record<string, RuntimeAdapter>;
   let invalidations: Array<Record<string, unknown>>;
   let activitySwaps: Array<{ nodeId: string; generation: string }>;
   let service: SeatLifecycleService;
@@ -123,7 +128,9 @@ describe("SeatLifecycleService.launchFresh", () => {
     invalidations = [];
     activitySwaps = [];
     listProcesses = async () => [{ pid: 4242, ppid: 1, pgid: 4242, tpgid: 4242,
-      executableName: "codex", command: "/opt/native/codex -m model", startedAt: "Sat Jan  1 12:00:00 2000" }];
+      executableName: "codex", command: "/opt/native/codex -m model", argv: ["/opt/native/codex", "-m", "model"],
+      startedAt: "Sat Jan  1 12:00:00 2000" }];
+    runtimeAdapters = { "claude-code": adapter, codex: { ...adapter, runtime: "codex" } };
     service = new SeatLifecycleService({
       db,
       rigRepo,
@@ -133,13 +140,36 @@ describe("SeatLifecycleService.launchFresh", () => {
       listProcesses: () => listProcesses(),
       nodeLauncher,
       startupOrchestrator,
-      runtimeAdapters: { "claude-code": adapter, codex: { ...adapter, runtime: "codex" } },
+      runtimeAdapters,
       occupantInvalidator: { invalidateRetiringOccupant: (input) => invalidations.push(input) },
       activityOracle: { declareOccupantSwap: (nodeId, generation) => activitySwaps.push({ nodeId, generation }) },
     });
   });
 
   afterEach(() => db.close());
+
+  it.each([
+    { runtime: "terminal" as const, fail: false },
+    { runtime: "claude-code" as const, fail: false },
+    { runtime: "claude-code" as const, fail: true },
+  ])("#1939: reports view recovery after replacement: $runtime, startup failure=$fail", async ({ runtime, fail }) => {
+    if (runtime === "terminal") runtimeAdapters.terminal = { ...adapter, runtime };
+    const seat = seedSeat({ runtime });
+    if (fail) adapter.launchHarness = async () => ({ ok: false, error: "fixture startup failure" });
+    const result = await service.launchFresh({ seatRef: seat.sessionName, fresh: true, stop: true, reason: "replace occupant" });
+    expect(result.ok).toBe(!fail);
+    expect(result.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining(`Replacing the tmux session for "${seat.sessionName}" detaches its open terminal clients.`),
+    ]));
+    expect(result.warnings?.join("\n")).toContain("rig terminal open 'rig:fresh-rig' --window");
+    expect(result.warnings?.join("\n")).toContain("--provider cmux");
+  });
+
+  it("#1939: a clean seat launch does not claim that it replaced an open tile", async () => {
+    const seat = seedSeat({ clean: true });
+    const result = await service.launchFresh({ seatRef: seat.sessionName, fresh: true, reason: "first occupant" });
+    expect(result.warnings?.some(warning => warning.includes("open terminal clients"))).not.toBe(true);
+  });
 
   it.each([true, false])("#729: retains warnings independently of fresh identity (verified=%s)", async verified => {
     const seat = seedSeat();
@@ -150,7 +180,7 @@ describe("SeatLifecycleService.launchFresh", () => {
     ]), seat.node.id);
     const result = await service.launchFresh({ seatRef: seat.sessionName, fresh: true, stop: true, reason: "explicit fresh" });
     expect(result.ok).toBe(verified);
-    expect(result.warnings).toEqual(["Existing projection warning", expect.stringContaining("Startup submission unverified")]);
+    expect(result.warnings).toEqual(["Existing projection warning", expect.stringContaining("Startup submission unverified"), expect.stringContaining("open terminal clients")]);
     if (verified) expect(new SeatIdentityStore(db).getForNode(seat.node.id)?.verdict).toBe("verified");
     else expect(result).toMatchObject({ code: "runtime_identity_unverified", status: "attention_required" });
   });
@@ -298,7 +328,7 @@ describe("SeatLifecycleService.launchFresh", () => {
     expect(deriveRehydrateSessionIdByNode(history, [seat.node.id], readFreshOccupantRelations(db, seat.rig.id))[seat.node.id]).toBeNull();
   });
 
-  function seedSeat(opts?: { clean?: boolean; adopted?: boolean; model?: string; withContext?: boolean; runtime?: "claude-code" | "codex" }) {
+  function seedSeat(opts?: { clean?: boolean; adopted?: boolean; model?: string; withContext?: boolean; runtime?: "claude-code" | "codex" | "terminal" }) {
     const runtime = opts?.runtime ?? "claude-code";
     const rig = rigRepo.createRig("fresh-rig");
     const node = rigRepo.addNode(rig.id, "dev.impl", {
@@ -330,6 +360,28 @@ describe("SeatLifecycleService.launchFresh", () => {
     }
     return { rig, node, session, sessionName };
   }
+
+  // OPR.0.7.0.9: the fresh-launch plan lists the seat's own launch additions (what its launch will pass), and null for
+  // a seat without any. It writes nothing.
+  it("lists the seat's launch additions, and none for a seat without them", async () => {
+    const seat = seedSeat({ clean: true });
+    const src = fs.mkdtempSync(path.join(os.tmpdir(), "fresh-plan-additions-"));
+    try {
+      fs.writeFileSync(path.join(src, "prompt.md"), "Short answers.\n");
+      const paths = seatSkillPaths({ rigId: seat.rig.id, logicalId: "dev.impl", runtime: "claude-code" });
+      const peer = rigRepo.addNode(seat.rig.id, "dev.peer", { runtime: "claude-code", cwd: "/project" });
+      sessionRegistry.registerSession(peer.id, "dev-peer@fresh-rig");
+      db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, '[]', '[]', '[]', 'claude-code')").run(peer.id);
+      const prepared = prepareSeatLaunchAdditions(paths, { appendSystemPromptFile: path.join(src, "prompt.md") });
+      if (!prepared.ok) throw new Error(prepared.message);
+      const result = await service.planFresh({ seatRef: seat.sessionName, fresh: true });
+      expect(result).toMatchObject({ ok: true, launchAdditions: { appendSystemPromptFile: prepared.additions.appendSystemPromptFile, pluginDirs: [], missing: [], refused: [] } });
+      const none = await service.planFresh({ seatRef: "dev-peer@fresh-rig", fresh: true });
+      expect(none).toMatchObject({ ok: true, launchAdditions: null });
+    } finally {
+      fs.rmSync(src, { recursive: true, force: true });
+    }
+  });
 
   it.each([false, true])("previews fresh launch without changing target, siblings or startup state (live=%s)", async live => {
     const seat = seedSeat({ clean: !live });
@@ -812,6 +864,7 @@ describe("SeatLifecycleService.launchFresh", () => {
 
   it("stops exactly the managed pod-aware occupant, launches fresh, and preserves sibling/work state", async () => {
     const seat = seedSeat();
+    rigRepo.setNodeAdvisor(seat.node.id, "opus");
     const retiringGeneration = sessionRegistry.currentOccupantTenure(seat.node.id)!.generationUuid;
     const sibling = rigRepo.addNode(seat.rig.id, "dev.qa", { runtime: "claude-code", cwd: "/project" });
     const siblingName = "dev-qa@fresh-rig";
@@ -835,6 +888,7 @@ describe("SeatLifecycleService.launchFresh", () => {
     if (!result.ok) throw new Error(result.message);
     expect(result.sessionName).toBe(seat.sessionName);
     expect(result.model).toBe("claude-current");
+    expect(result.advisor).toBe("opus");
     expect(result.generation).not.toBe(retiringGeneration);
     expect(killed).toEqual([seat.sessionName]);
     expect(alive.has(seat.sessionName)).toBe(true);
@@ -842,7 +896,7 @@ describe("SeatLifecycleService.launchFresh", () => {
     expect((db.prepare("SELECT status FROM sessions WHERE id = ?").get(siblingSession.id) as { status: string }).status).toBe("running");
     expect((db.prepare("SELECT state FROM queue_items WHERE qitem_id = 'q-fresh'").get() as { state: string }).state).toBe("pending");
     expect(sessionRegistry.getBindingForNode(seat.node.id)?.tmuxPane).toBe("%fresh");
-    expect(launchBinding).toMatchObject({ model: "claude-current", tmuxSession: seat.sessionName, tmuxPane: "%fresh" });
+    expect(launchBinding).toMatchObject({ model: "claude-current", advisor: "opus", tmuxSession: seat.sessionName, tmuxPane: "%fresh" });
     expect(launchOpts).toEqual({ name: seat.sessionName, resumeToken: undefined });
     expect(projectedPlan?.entries.map((entry) => entry.effectiveId)).toEqual(["live-guidance"]);
     expect(invalidations).toEqual([{ retiringSessionName: seat.sessionName, successorSessionName: seat.sessionName, retiringGeneration }]);
@@ -855,6 +909,7 @@ describe("SeatLifecycleService.launchFresh", () => {
       newGeneration: result.generation,
       nativeSessionId: "fresh-native-uuid",
       model: "claude-current",
+      advisor: "opus",
       status: "ready",
     });
     expect(new SeatIdentityStore(db).getForNode(seat.node.id)).toMatchObject({

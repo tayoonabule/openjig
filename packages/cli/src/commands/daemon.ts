@@ -167,6 +167,7 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
     .option("--port <port>", "Port to listen on")
     .option("--host <host>", "Host to bind on")
     .option("--db <path>", "Database path")
+    .option("--allow-db-conflict", "Proceed for this start when another live daemon is confirmed using the database")
     // V0.3.1 slice 05 kernel-rig-as-default — skip the kernel auto-boot
     // path. Used by test fixtures, headless CI, and operators who want
     // a no-kernel daemon for ad-hoc topology work. The daemon proceeds
@@ -181,7 +182,7 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
     // weaker "daemon-ready". Default 60s; override with --wait-for-kernel-ms.
     .option("--wait-for-kernel", "After daemon binds, also wait for kernel-agent readiness (default timeout 60s)")
     .option("--wait-for-kernel-ms <ms>", "Override --wait-for-kernel timeout in milliseconds")
-    .action(async (opts: { port?: string; host?: string; db?: string; kernel?: boolean; waitForKernel?: boolean; waitForKernelMs?: string }) => {
+    .action(async (opts: { port?: string; host?: string; db?: string; allowDbConflict?: boolean; kernel?: boolean; waitForKernel?: boolean; waitForKernelMs?: string }) => {
       try {
         const { ConfigStore } = await import("../config-store.js");
         const { SystemPreflight, quietPreflightExec } = await import("../system-preflight.js");
@@ -251,6 +252,7 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
             // OPENRIG_NO_KERNEL env var so the daemon's kernel-boot
             // check in startup.ts honors the flag.
             skipKernelBoot: skipKernel,
+            allowDbConflict: opts.allowDbConflict,
           },
           getDeps(),
         );
@@ -262,7 +264,7 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
         // know whether the kernel itself reached ready. Operators who
         // need a kernel-ready signal opt in here.
         if (opts.waitForKernel) {
-          const { waitForKernelReady } = await import("../daemon-lifecycle.js");
+          const { waitForKernelReady, skippedKernelMessage } = await import("../daemon-lifecycle.js");
           const timeoutMs = opts.waitForKernelMs && /^\d+$/.test(opts.waitForKernelMs)
             ? parseInt(opts.waitForKernelMs, 10)
             : 60_000;
@@ -270,6 +272,10 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
           const result = await waitForKernelReady(baseUrl, timeoutMs);
           if (result.ok) {
             console.log(`Kernel ${result.kernelState}; variant=${result.variant ?? "(none)"}`);
+          } else if (result.kernelState === "skipped") {
+            // Skipped on purpose, so neither a timeout nor an auth problem: say why, and the way back.
+            console.error(skippedKernelMessage(result.detail));
+            process.exitCode = 1;
           } else {
             // Honest 3-part error per banked discipline.
             console.error(

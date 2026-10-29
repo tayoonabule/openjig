@@ -13,8 +13,15 @@ export function readFreshOccupantRelations(db: Database.Database, rigId: string)
       (SELECT MAX(t2.generation_ordinal) FROM occupant_tenures t2 WHERE t2.node_id = t.node_id)
   `).all(rigId) as Array<{ nodeId: string; generation: string }>;
   const current = new Map(generations.map((row) => [row.nodeId, row.generation]));
-  const events = db.prepare("SELECT payload FROM events WHERE rig_id = ? AND type = 'seat.fresh_launched' ORDER BY seq")
-    .all(rigId) as Array<{ payload: string }>;
+  // Through the rig's nodes into each node's fresh launches (idx_events_node_type_seq): by rig_id alone SQLite reads every
+  // event the rig ever recorded to test its type. node_id is the event's own nodeId (EventBus), and a node outside this rig
+  // has no current tenure here, so the rows used are the same.
+  const events = db.prepare(`
+    SELECT e.payload AS payload FROM nodes n
+    CROSS JOIN events e ON e.node_id = n.id AND e.type = 'seat.fresh_launched'
+    WHERE n.rig_id = ? AND e.rig_id = ?
+    ORDER BY e.seq
+  `).all(rigId, rigId) as Array<{ payload: string }>;
   const relation: Record<string, string | null> = {};
   for (const row of events) {
     const event = JSON.parse(row.payload) as Record<string, unknown>;
@@ -37,11 +44,12 @@ export function readFreshOccupantRelations(db: Database.Database, rigId: string)
 export function readReadyFreshLaunchFences(db: Database.Database, rigId?: string): Map<string, number> {
   // Indexed: from each node's current tenure into that node's fresh-launch events
   // (idx_events_node_type_seq), not every event of the type. `rig ps` runs this on every call.
+  // CROSS JOIN keeps events the inner table: left to choose, SQLite scans every event first.
   const events = db.prepare(`
     SELECT e.seq AS seq, e.payload AS payload, t.node_id AS nodeId, t.generation_uuid AS generation
     FROM occupant_tenures t
     JOIN nodes n ON n.id = t.node_id
-    JOIN events e ON e.node_id = t.node_id AND e.type = 'seat.fresh_launched'
+    CROSS JOIN events e ON e.node_id = t.node_id AND e.type = 'seat.fresh_launched'
     WHERE t.generation_ordinal =
       (SELECT MAX(t2.generation_ordinal) FROM occupant_tenures t2 WHERE t2.node_id = t.node_id)${rigId ? " AND n.rig_id = ?" : ""}
     ORDER BY e.seq

@@ -63,7 +63,20 @@ describe("FR-6 restore-plan token state", () => {
     } } as unknown as Snapshot;
     const result = buildRestorePlanPreview(rig, snapshot, rows, fresh ? ["a"] : undefined).nodes[0]!;
     expect(result.intendedAction).toBe("awaiting-decision");
-    expect(result.reason).toBe("No session was started for this seat. Restore a snapshot whose saved startup runtime matches the seat's current runtime.");
+    expect(result.reason).toBe("No session was started for this seat. Restore a snapshot whose saved seat and startup runtimes match the seat's current runtime.");
+  });
+
+  it("refuses a snapshot node runtime mismatch even when startup context matches the live seat", () => {
+    const rig = rigWith([{ id: "n1", logicalId: "a", runtime: "codex" }]);
+    const rows = [row("n1", { resumeType: "claude_id" })];
+    const snapshot = { id: "snap", kind: "manual", createdAt: "now", data: {
+      nodes: [{ id: "n1", logicalId: "a", runtime: "claude-code" }],
+      sessions: rows, activeSessionIdByNode: { n1: "s-n1" },
+      nodeStartupContext: { n1: { runtime: "codex" } },
+    } } as unknown as Snapshot;
+    const result = buildRestorePlanPreview(rig, snapshot, rows).nodes[0]!;
+    expect(result.intendedAction).toBe("awaiting-decision");
+    expect(result.reason).toBe("No session was started for this seat. Restore a snapshot whose saved seat and startup runtimes match the seat's current runtime.");
   });
 
   it.each([undefined, null, { runtime: null }, { runtime: "claude-code" }])("does not refuse legacy token with missing, unknown, or matching startup context: %j", (context) => {
@@ -105,6 +118,18 @@ describe("FR-6 restore-plan token state", () => {
     });
   });
 
+  it.each([false, true])("forecasts a seat joined with rig attach as an external CLI as leave-attached, as restore leaves it, with fresh=%s", (fresh) => {
+    const rig = {
+      rig: { id: "rig-1", name: "test-rig" },
+      nodes: [{ id: "n1", logicalId: "desk", runtime: "claude-code", binding: { attachmentType: "external_cli", externalSessionName: "desk-app@test-rig" } }],
+      edges: [],
+    } as unknown as RigWithRelations;
+    const node = buildRestorePlanPreview(rig, null, [row("n1", { resumeType: null, resumeToken: null })], fresh ? ["desk"] : undefined).nodes[0]!;
+    expect(node).toMatchObject({ intendedAction: "leave-attached", freshRequired: false });
+    expect(node.reason).toContain("rig unclaim desk-app@test-rig");
+    expect(node.runtimePrompt).toBeUndefined();
+  });
+
   it("presents a never-occupied current seat as new, without a history warning", () => {
     const rig = rigWith([{ id: "n1", logicalId: "a", runtime: "codex" }]);
     const result = buildRestorePlanPreview(rig, null, []).nodes[0]!;
@@ -136,6 +161,13 @@ describe("FR-6 restore-plan token state", () => {
     const p = buildRestorePlanPreview(rig, null, [row("n1", { resumeLastVerified: null, resumeLastProbeStatus: null })], undefined, NOW);
     expect(p.nodes[0]!.tokenState).toBe("unverified");
     expect(p.nodes[0]!.freshRequired).toBe(false);
+  });
+
+  it("degrades malformed saved verification metadata to unverified without changing valid token rules", () => {
+    const rig = rigWith([{ id: "n1", logicalId: "a", runtime: "codex" }]);
+    const malformed = buildRestorePlanPreview(rig, null, [row("n1", { resumeType: "codex_id",
+      resumeLastProbeStatus: "resumable", resumeLastVerified: 123 as never })]);
+    expect(malformed.nodes[0]).toMatchObject({ intendedAction: "resume-original", tokenState: "unverified" });
   });
 
   it("present: probe resumable + verified within the freshness threshold", () => {

@@ -25,6 +25,9 @@ export interface QueueTransition {
   /** P21 §4 era-stamp: how actorSession was established. `transport:v1` = derived from the
    *  transport chokepoint; null/absent = claimed-era (pre-verification), never re-labeled. */
   identityProvenance: string | null;
+  /** With `principal:v1`: the caller the local MCP adapter checked a grant for (JSON: source, id, and for a
+   *  grant-service grant its id and version). Null on every other row. */
+  identityPrincipal: string | null;
   ownerNotificationKind: string | null;
   ownerNotificationLevel: OwnerNotificationLevel;
 }
@@ -39,6 +42,8 @@ export interface QueueTransitionInput {
   /** P21 §4 era-stamp: the route passes `transport:v1` when actorSession came from the transport
    *  header chokepoint; omit (null) for system/claimed-era transitions — absence is the marker. */
   identityProvenance?: string | null;
+  /** Recorded only with identityProvenance `principal:v1` (resolveRecordedIdentity). */
+  identityPrincipal?: string | null;
   ownerNotificationKind?: string | null;
   ownerNotificationLevel?: OwnerNotificationLevel | null;
 }
@@ -79,6 +84,7 @@ interface QueueTransitionRow {
   closure_reason: string | null;
   closure_target: string | null;
   identity_provenance?: string | null;
+  identity_principal?: string | null;
   owner_notification_kind?: string | null;
   owner_notification_level?: string | null;
 }
@@ -175,6 +181,7 @@ export class QueueTransitionLog {
    *  era-stamp column, so the writer degrades (omits it) instead of throwing. */
   private readonly hasIdentityProvenanceColumn: boolean;
   private readonly hasOwnerNotificationColumns: boolean;
+  private readonly hasIdentityPrincipalColumn: boolean;
   private readonly historySource: string;
   /** The history tables this schema has: the live table, and the archive where it exists. */
   private readonly historyTables: string[];
@@ -188,10 +195,11 @@ export class QueueTransitionLog {
       (this.db.prepare("PRAGMA table_info(queue_transitions)").all() as Array<{ name: string }>).map((c) => c.name),
     );
     this.hasOwnerNotificationColumns = columns.has("owner_notification_kind") && columns.has("owner_notification_level");
+    this.hasIdentityPrincipalColumn = columns.has("identity_principal");
     // One explicit projection for all history readers, including old nullable schemas.
     // SELECT * cannot union the archive's extra archived_at column with the live table.
     const fields = ["transition_id", "qitem_id", "ts", "state", "transition_note", "actor_session",
-      "closure_reason", "closure_target", "identity_provenance", "owner_notification_kind", "owner_notification_level"];
+      "closure_reason", "closure_target", "identity_provenance", "identity_principal", "owner_notification_kind", "owner_notification_level"];
     this.historyTables = [];
     const sources = ["queue_transitions", "queue_transitions_archive"].flatMap((table) => {
       const available = new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name));
@@ -220,9 +228,15 @@ export class QueueTransitionLog {
       input.closureReason ?? null,
       input.closureTarget ?? null,
     ];
+    // A principal is kept only beside principal:v1; a schema without the column records today's stamp instead.
+    const principal = input.identityProvenance === "principal:v1" && this.hasIdentityPrincipalColumn ? input.identityPrincipal ?? null : null;
     if (this.hasIdentityProvenanceColumn) {
       columns.push("identity_provenance");
-      values.push(input.identityProvenance ?? null);
+      values.push(input.identityProvenance === "principal:v1" && !principal ? "transport:v1" : input.identityProvenance ?? null);
+    }
+    if (principal) {
+      columns.push("identity_principal");
+      values.push(principal);
     }
     if (this.hasOwnerNotificationColumns) {
       columns.push("owner_notification_kind", "owner_notification_level");
@@ -322,9 +336,7 @@ export class QueueTransitionLog {
     if (rigNames.length === 0) return [];
     const knownRigs = new Set(rigNames);
     const sessionPatterns = rigNames.map((rig) => `%@${rig.replace(/%/g, "\\%").replace(/_/g, "\\_")}`);
-    const scopeSql = sessionPatterns.map(() => "(q.destination_session LIKE ? ESCAPE '\\' OR q.source_session LIKE ? ESCAPE '\\')").join(" OR ");
-    const scopeParams = sessionPatterns.flatMap((pattern) => [pattern, pattern]);
-    const rows = this.newestQualifying(scopeSql, scopeParams, limit);
+    const rows = this.newestQualifying(sessionPatterns, limit);
 
     return rows.reverse().flatMap((row) => {
       const change = recentChange(row);
@@ -353,11 +365,19 @@ export class QueueTransitionLog {
    * without reading its row, and the walk stops at the limit. A candidate's predecessor is the same
    * item's greatest earlier transition_id across both tables: the value LAG over the item's full
    * history gave, so a same-state note never qualifies. */
-  private newestQualifying(scopeSql: string, scopeParams: string[], limit: number): RecentQueueTransitionRow[] {
+  private newestQualifying(sessionPatterns: string[], limit: number): RecentQueueTransitionRow[] {
+    // The scope is the items whose destination or source session matches a pattern. Each column is
+    // matched on its own index and the ids are read from the primary-key index, so resolving the scope
+    // never reads queue_items' rows, which carry every body. UNION ALL, not UNION: a merged UNION
+    // wants rowid order, which SQLite gets by scanning the table; a duplicate is harmless in IN.
+    const matches = (column: string) => sessionPatterns.map(() => `q.${column} LIKE ? ESCAPE '\\'`).join(" OR ");
     // `+t.qitem_id` keeps the scope list from driving a per-item index lookup (which would then sort);
     // the walk order comes from the (ts, transition_id, qitem_id) index, and the two tables merge.
     const walk = this.db.prepare(`
-      WITH scope_items(qitem_id) AS MATERIALIZED (SELECT q.qitem_id FROM queue_items q WHERE ${scopeSql})
+      WITH scope_rows(rid) AS MATERIALIZED (
+        SELECT q.rowid FROM queue_items q WHERE ${matches("destination_session")}
+        UNION ALL SELECT q.rowid FROM queue_items q WHERE ${matches("source_session")}
+      ), scope_items(qitem_id) AS MATERIALIZED (SELECT q.qitem_id FROM queue_items q WHERE +q.rowid IN (SELECT rid FROM scope_rows))
       ${this.historyTables.map((table) => `
       SELECT t.transition_id, t.qitem_id, t.ts, t.state, t.actor_session, t.closure_reason, t.closure_target
       FROM ${table} t
@@ -382,7 +402,7 @@ export class QueueTransitionLog {
     const rows: RecentQueueTransitionRow[] = [];
     // Reads inside the loop are allowed while the walk's iterator is open, and they see the walk's
     // snapshot; leaving the loop releases it.
-    for (const row of walk.iterate(...scopeParams) as Iterable<WalkedRow>) {
+    for (const row of walk.iterate(...sessionPatterns, ...sessionPatterns) as Iterable<WalkedRow>) {
       const previous = row.state === "in-progress" || row.state === "blocked" ? previousState(row) : null;
       if (!qualifiesAsRecent(row, previous)) continue;
       const item = metadata.get(TRIM_CHARS, BODY_HEAD_CODE_POINTS, row.qitem_id) as Pick<RecentQueueTransitionRow, "tags" | "summary" | "destination_session" | "source_session" | "body_head">;
@@ -435,13 +455,80 @@ export class QueueTransitionLog {
   }
 
   hasOwnerNotificationReceipt(qitemId: string, notificationKey: string): boolean {
+    return this.getOwnerNotificationReceipt(qitemId, notificationKey) !== null;
+  }
+
+/** The latest owner-notification episode per ACTIVE queue row, in queue order. One query
+ *  joins every eligibility rule into the selection — the row is active, it carries an owner
+ *  notification, and (when `includePosted` is false, the alert sweep's path) no posted
+ *  receipt exists for that notification's key — so rows that cannot matter never reach a
+ *  per-row lookup. There is no row cap: an eligible item older than any window still comes
+ *  back, and `posted` reports the receipt state for callers that list both.
+ *
+ *  The eligible set is restricted to active queue items before any ranking happens, so a
+ *  large notification archive never adds scan or ranking work to a sweep with no active item. */
+  activeOwnerNotificationEpisodes(includePosted: boolean): Array<{ qitemId: string; transition: QueueTransition; posted: boolean }> {
+    if (!this.hasOwnerNotificationColumns) return [];
+    // Exact token match with no wildcard risk: pad both ends so a key at the note's
+    // start or end still matches, and instr() compares literally (qitem ids may
+    // contain characters LIKE would treat as wildcards).
+    const receipt = (qitemIdExpr: string, transitionIdExpr: string) =>
+      `EXISTS (
+         SELECT 1 FROM ${this.historySource} r
+         WHERE r.qitem_id = ${qitemIdExpr}
+           AND r.transition_note LIKE 'slack-owner-notification-posted %'
+           AND instr(' ' || r.transition_note || ' ', ' notification_key=' || ${qitemIdExpr} || ':' || ${transitionIdExpr} || ' ') > 0
+       )`;
+    const postedFilter = includePosted ? "" : `AND NOT ${receipt("latest.qitem_id", "latest.transition_id")}`;
+    const rows = this.db
+      .prepare(
+        `WITH active_ids AS (
+           SELECT qitem_id FROM queue_items WHERE state IN ('pending', 'in-progress', 'blocked')
+         ),
+         active AS (
+           SELECT qitem_id, ts_created FROM queue_items WHERE state IN ('pending', 'in-progress', 'blocked')
+         ),
+         history_active AS (
+           SELECT h.* FROM ${this.historySource} h
+           WHERE h.qitem_id IN (SELECT qitem_id FROM active_ids)
+             AND h.owner_notification_level IS NOT NULL
+         ),
+         ranked AS (
+           SELECT h.*, ROW_NUMBER() OVER (PARTITION BY h.qitem_id ORDER BY h.transition_id DESC) AS rn
+           FROM history_active h
+         ),
+         latest AS (
+           SELECT * FROM ranked WHERE rn = 1
+         )
+         SELECT latest.*, ${receipt("latest.qitem_id", "latest.transition_id")} AS posted
+           FROM active
+           JOIN latest ON latest.qitem_id = active.qitem_id
+          ${postedFilter}
+           ORDER BY active.ts_created DESC`,
+      )
+      .all() as Array<QueueTransitionRow & { posted: 0 | 1 }>;
+    return rows.map((row) => ({
+      qitemId: row.qitem_id,
+      transition: this.rowToTransition(row),
+      posted: row.posted === 1,
+    }));
+  }
+
+  getOwnerNotificationReceipt(qitemId: string, notificationKey: string): { messageTs: string | null; threadTs: string | null; digest: string | null } | null {
     const rows = this.db
       .prepare(
         `SELECT transition_note FROM ${this.historySource}
-          WHERE qitem_id = ? AND transition_note LIKE 'slack-owner-notification-posted %'`,
+          WHERE qitem_id = ? AND transition_note LIKE 'slack-owner-notification-posted %'
+          ORDER BY transition_id DESC`,
       )
       .all(qitemId) as Array<{ transition_note: string }>;
-    return rows.some((row) => row.transition_note.split(/\s+/).includes(`notification_key=${notificationKey}`));
+    for (const row of rows) {
+      const fields = row.transition_note.split(/\s+/);
+      if (!fields.includes(`notification_key=${notificationKey}`)) continue;
+      const value = (name: string) => fields.find((field) => field.startsWith(`${name}=`))?.slice(name.length + 1) ?? null;
+      return { messageTs: value("message_ts"), threadTs: value("thread_ts"), digest: value("digest") };
+    }
+    return null;
   }
 
   private rowToTransition(row: QueueTransitionRow): QueueTransition {
@@ -455,6 +542,7 @@ export class QueueTransitionLog {
       closureReason: row.closure_reason as ClosureReason | null,
       closureTarget: row.closure_target,
       identityProvenance: row.identity_provenance ?? null,
+      identityPrincipal: row.identity_principal ?? null,
       ownerNotificationKind: row.owner_notification_kind ?? null,
       ownerNotificationLevel: OWNER_NOTIFICATION_LEVELS.includes(row.owner_notification_level as OwnerNotificationLevel)
         ? row.owner_notification_level as OwnerNotificationLevel

@@ -5,7 +5,7 @@ import type { SliceIndexer } from "../domain/slices/slice-indexer.js";
 import type { EventBus } from "../domain/event-bus.js";
 import { JudgmentError, evidenceAt, readSliceReadiness, readMissionReadiness, readProjectReadiness, recordJudgment, resolveProofScope, resolveProjectRoot, type JudgeInput } from "../domain/proof/judgments.js";
 import { requireSenderIdentity, resolveRecordedProvenance, transportSenderSession } from "./require-sender-identity.js";
-import { projectById, projectCatalogPaths, selectedProject } from "../domain/workspace/project-read.js";
+import { projectById, projectCatalogPaths, sameProjectRoot, selectedProject } from "../domain/workspace/project-read.js";
 import { inferCatalogProject, ProjectReadError, rigFromSession, selectCatalogProject } from "../domain/workspace/project-catalog.js";
 
 // #132 — `<project-id>:<scope>` names a scope inside one workspace-catalog project. Project ids share the
@@ -54,9 +54,7 @@ export function proofRoutes(): Hono {
     try {
       const { catalog } = projectCatalogPaths(c);
       try {
-        // Preserve the long-standing selected workspace for single-project and
-        // uncatalogued setups. Rig inference is needed only when the catalog
-        // requires a project choice.
+        // Preserve the selected workspace for single-project and uncatalogued setups.
         selectCatalogProject(catalog);
         return null;
       } catch (error) {
@@ -65,8 +63,7 @@ export function proofRoutes(): Hono {
         return inferCatalogProject(catalog, error, { rigName: rigFromSession(session) }, []).id;
       }
     } catch {
-      // Missing, stale, or ambiguous catalog signals do not change the legacy
-      // fallback: callers still read the daemon's configured slices root.
+      // Missing, stale or ambiguous catalog signals keep the legacy selected-root fallback.
       return null;
     }
   };
@@ -98,7 +95,7 @@ export function proofRoutes(): Hono {
     catch (e) { throw catalogError(e); }
     // A judgment carries the root its prepared read resolved: if the catalog now maps the id elsewhere, refuse
     // rather than record against a different project.
-    if (typeof expectedRoot === "string" && expectedRoot !== p.root) throw new JudgmentError("project_changed", `Project ${id} now resolves to ${p.root}, not the ${expectedRoot} the prepared read used; read the proof again`, 409);
+    if (typeof expectedRoot === "string" && !sameProjectRoot(expectedRoot, p.root)) throw new JudgmentError("project_changed", `Project ${id} now resolves to ${p.root}, not the ${expectedRoot} the prepared read used; read the proof again`, 409);
     let projectScope = scope;
     if (scope && !path.isAbsolute(scope)) {
       const missionsPrefix = path.relative(p.root, p.missionsRoot);

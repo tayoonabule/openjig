@@ -301,6 +301,92 @@ describe("rig watchdog CLI (PL-004 Phase C)", () => {
     expect((request?.body as { specYaml: string }).specYaml).toContain("Prepare continuity now");
   });
 
+  it("registers token and percent context thresholds without a spec or transcript", async () => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ watchdogDeps: deps });
+    program.exitOverride();
+    await program.parseAsync([
+      "node",
+      "rig",
+      "watchdog",
+      "register",
+      "--policy",
+      "context-usage-threshold",
+      "--target-session",
+      "alice@rig",
+      "--threshold-tokens",
+      "600000",
+      "--interval-seconds",
+      "60",
+      "--registered-by",
+      "ops@kernel",
+      "--json",
+    ]);
+    const request = calls.find((call) => call.path === "/api/watchdog/register");
+    expect(request?.body).toMatchObject({
+      policy: "context-usage-threshold",
+      targetSession: "alice@rig",
+      thresholdTokens: 600_000,
+      thresholdBytes: undefined,
+    });
+    expect((request?.body as { specYaml: string }).specYaml).toContain("threshold_tokens: 600000");
+
+    const percentDeps = makeDeps();
+    const percentProgram = createProgram({ watchdogDeps: percentDeps.deps });
+    percentProgram.exitOverride();
+    await percentProgram.parseAsync([
+      "node",
+      "rig",
+      "watchdog",
+      "register",
+      "--policy",
+      "context-usage-threshold",
+      "--target-session",
+      "alice@rig",
+      "--threshold-percent",
+      "70",
+      "--interval-seconds",
+      "60",
+      "--registered-by",
+      "ops@kernel",
+      "--json",
+    ]);
+    const percentRequest = percentDeps.calls.find((call) => call.path === "/api/watchdog/register");
+    expect(percentRequest?.body).toMatchObject({ thresholdPercent: 70 });
+  });
+
+  it("rejects mixing threshold units", async () => {
+    const { deps, calls } = makeDeps();
+    const program = createProgram({ watchdogDeps: deps });
+    program.exitOverride();
+    const previousExitCode = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      await program.parseAsync([
+        "node",
+        "rig",
+        "watchdog",
+        "register",
+        "--policy",
+        "context-usage-threshold",
+        "--target-session",
+        "alice@rig",
+        "--threshold-tokens",
+        "600000",
+        "--threshold-percent",
+        "70",
+        "--interval-seconds",
+        "60",
+        "--registered-by",
+        "ops@kernel",
+      ]);
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+    }
+    expect(calls.find((call) => call.path === "/api/watchdog/register")).toBeUndefined();
+  });
+
   it("teaches conservative calibration and the margin rationale in register help", () => {
     const { deps } = makeDeps();
     const program = createProgram({ watchdogDeps: deps });
@@ -452,5 +538,49 @@ describe("rig watchdog CLI (PL-004 Phase C)", () => {
     const call = calls.find((c) => c.path === "/api/watchdog/job-1/stop");
     expect(call).toBeDefined();
     expect((call!.body as { reason: string }).reason).toBe("tester stop");
+  });
+
+  describe("update", () => {
+    async function runUpdate(args: string[], response: StubResponse = { status: 200, data: { job: { jobId: "job-1" } } }) {
+      const { deps, calls } = makeDeps({ routes: { "POST /api/watchdog/job-1/update": response } });
+      const program = createProgram({ watchdogDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "watchdog", "update", "job-1", ...args]);
+      return calls.filter((c) => c.path === "/api/watchdog/job-1/update");
+    }
+
+    it("sends only the interval it was given", async () => {
+      const calls = await runUpdate(["--interval-seconds", "600", "--json"]);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.body).toEqual({ intervalSeconds: 600 });
+    });
+
+    it("sends the message and the spec file contents when given", async () => {
+      const spec = join(mkdtempSync(join(tmpdir(), "wd-cli-")), "spec.yaml");
+      writeFileSync(spec, "policy: periodic-reminder\nmessage: hi\n");
+      const calls = await runUpdate(["--message", "new words", "--spec", spec, "--json"]);
+      expect(calls[0]!.body).toEqual({ message: "new words", specYaml: "policy: periodic-reminder\nmessage: hi\n" });
+    });
+
+    it("sends nothing and fails when no field is given", async () => {
+      expect(await runUpdate(["--json"])).toEqual([]);
+      expect(errors.join("\n")).toMatch(/--interval-seconds|--message|--spec/);
+      expect(process.exitCode).toBe(1);
+    });
+
+    it("says on the command what it cannot change and when the interval takes effect", () => {
+      const { deps } = makeDeps();
+      const update = createProgram({ watchdogDeps: deps }).commands.find((c) => c.name() === "watchdog")!
+        .commands.find((c) => c.name() === "update");
+      expect(update).toBeDefined();
+      const help = update!.helpInformation() + (update!.description() ?? "");
+      expect(help).toMatch(/last evaluation/i);
+      expect(help).toMatch(/stopped|finished/i);
+    });
+
+    it("exits non-zero when the daemon refuses", async () => {
+      await runUpdate(["--interval-seconds", "5", "--json"], { status: 409, data: { error: "job_stopped" } });
+      expect(process.exitCode).toBe(1);
+    });
   });
 });

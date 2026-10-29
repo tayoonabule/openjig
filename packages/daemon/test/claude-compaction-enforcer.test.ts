@@ -10,7 +10,7 @@
 // Plus runtime-filter (claude-code only), below-threshold gating, missing
 // usage data short-circuit, send-failure no-dedup-update semantics.
 
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import { ClaudeCompactionEnforcer as ActualEnforcer, buildPostCompactRestorePrompt } from "../src/domain/claude-compaction-enforcer.js";
 import type { SessionTransport } from "../src/domain/session-transport.js";
 import type { ClaudeCompactionPolicy, SettingsStore } from "../src/domain/user-settings/settings-store.js";
@@ -19,6 +19,11 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 const fixtureHomes: string[] = [];
+// The home these tests pass explicitly (and assert in prompt text). A fixed path such as
+// /tmp/openrig-test-home accumulates files across runs and fails when that path is a file,
+// owned by another user, or shared by a concurrent run, so each run makes its own.
+const TEST_HOME = mkdtempSync(join(tmpdir(), "compaction-enforcer-home-"));
+afterAll(() => { rmSync(TEST_HOME, { recursive: true, force: true }); });
 afterEach(() => { for (const home of fixtureHomes.splice(0)) rmSync(home, { recursive: true, force: true }); });
 // These existing back-half/policy controls model a seat that completes preparation.
 // Missing/partial/late/wrong-occupant maps are exercised separately against actual transport.
@@ -123,6 +128,7 @@ describe("ClaudeCompactionEnforcer", () => {
     expect(send).toHaveBeenLastCalledWith(
       "claude-seat@rig",
       expect.stringContaining("OpenRig automatic compaction preparation is now required"),
+      { openrigNotice: true, beforeWrite: expect.any(Function) },
     );
     expect(send.mock.calls[0]![1]).toContain("Current context usage is 80%; configured compaction threshold is 80%");
     expect(send.mock.calls[0]![1]).toContain("Operator pre-compaction instruction");
@@ -199,7 +205,7 @@ describe("ClaudeCompactionEnforcer", () => {
     const enforcer = new ClaudeCompactionEnforcer(settings, transport, {
       dedupWindowMs: 60_000,
       postCompactRestoreCooldownMs: 0,
-      openrigHome: "/tmp/openrig-test-home",
+      openrigHome: TEST_HOME,
     });
 
     let now = 1_700_000_000_000;
@@ -222,14 +228,6 @@ describe("ClaudeCompactionEnforcer", () => {
     expect(second).toEqual({ triggered: true });
     expect(send.mock.calls[1]![1]).toContain("/compact");
 
-    now += 61_000;
-    const third = await enforcer.maybeAutoCompact({
-      sessionName: "claude-seat@rig",
-      runtime: "claude-code",
-      usedPercentage: 95,
-    });
-    expect(third).toEqual({ triggered: false, reason: "already_triggered_above_threshold" });
-
     const belowBoundary = await enforcer.maybeAutoCompact({
       sessionName: "claude-seat@rig",
       runtime: "claude-code",
@@ -240,7 +238,7 @@ describe("ClaudeCompactionEnforcer", () => {
     expect(send).toHaveBeenLastCalledWith(
       "claude-seat@rig",
       expect.stringContaining("OpenRig post-compaction turn boundary"),
-      { waitForIdleMs: expect.any(Number) },
+      { openrigNotice: true, waitForIdleMs: expect.any(Number), postCompactTurnBoundary: true, beforeWrite: expect.any(Function) },
     );
 
     const belowRestore = await enforcer.maybeAutoCompact({
@@ -252,8 +250,8 @@ describe("ClaudeCompactionEnforcer", () => {
     expect(belowRestore).toEqual({ triggered: true });
     expect(send).toHaveBeenLastCalledWith(
       "claude-seat@rig",
-      expect.stringContaining("/tmp/openrig-test-home/compaction/restore-pending/claude-seat@rig.json"),
-      { waitForIdleMs: expect.any(Number) },
+      expect.stringContaining(`${TEST_HOME}/compaction/restore-pending/claude-seat@rig.json`),
+      { openrigNotice: true, waitForIdleMs: expect.any(Number), beforeWrite: expect.any(Function) },
     );
     expect(send.mock.calls[3]![1]).toContain("/tmp/claude.jsonl");
     expect(send.mock.calls[3]![1]).toContain("Restoration is the current task");
@@ -269,7 +267,7 @@ describe("ClaudeCompactionEnforcer", () => {
     expect(send).toHaveBeenLastCalledWith(
       "claude-seat@rig",
       expect.stringContaining("Now audit your compaction restore"),
-      { waitForIdleMs: expect.any(Number) },
+      { openrigNotice: true, waitForIdleMs: expect.any(Number), beforeWrite: expect.any(Function) },
     );
 
     now += 61_000;
@@ -289,7 +287,7 @@ describe("ClaudeCompactionEnforcer", () => {
     const onPostRestoreComplete = vi.fn(async () => {});
     const enforcer = new ClaudeCompactionEnforcer(settings, transport, {
       postCompactRestoreCooldownMs: 0,
-      openrigHome: "/tmp/openrig-test-home",
+      openrigHome: TEST_HOME,
       resolveOccupantGeneration: () => "target-generation-7",
       onPostRestoreComplete,
     } as never);
@@ -329,7 +327,7 @@ describe("ClaudeCompactionEnforcer", () => {
     const enforcer = new ClaudeCompactionEnforcer(settings, transport, {
       dedupWindowMs: 60_000,
       postCompactRestoreCooldownMs: 0,
-      openrigHome: "/tmp/openrig-test-home",
+      openrigHome: TEST_HOME,
     });
     let now = 1_700_000_000_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -358,7 +356,7 @@ describe("ClaudeCompactionEnforcer", () => {
     const settings = makeSettingsStore(POLICY_ENABLED_AT_80);
     const { transport, send } = makeSessionTransport();
     const enforcer = new ClaudeCompactionEnforcer(settings, transport, {
-      dedupWindowMs: 60_000, postCompactRestoreCooldownMs: 0, openrigHome: "/tmp/openrig-test-home",
+      dedupWindowMs: 60_000, postCompactRestoreCooldownMs: 0, openrigHome: TEST_HOME,
     });
     let now = 1_700_000_000_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -392,7 +390,7 @@ describe("ClaudeCompactionEnforcer", () => {
     const { transport, send } = makeSessionTransport();
     let liveGen = gen;
     const enforcer = new ClaudeCompactionEnforcer(settings, transport, {
-      dedupWindowMs: 60_000, postCompactRestoreCooldownMs: 0, openrigHome: "/tmp/openrig-test-home",
+      dedupWindowMs: 60_000, postCompactRestoreCooldownMs: 0, openrigHome: TEST_HOME,
       resolveOccupantGeneration: () => liveGen,
     });
     let now = 1_700_000_000_000;
@@ -427,13 +425,59 @@ describe("ClaudeCompactionEnforcer", () => {
   it("GHOST-STAGE (b): with NO resolver (backward-compat) the gate is inert — stages drain as before", async () => {
     const settings = makeSettingsStore(POLICY_ENABLED_AT_80);
     const { transport, send } = makeSessionTransport();
-    const enforcer = new ClaudeCompactionEnforcer(settings, transport, { dedupWindowMs: 60_000, postCompactRestoreCooldownMs: 0, openrigHome: "/tmp/h" });
+    const enforcer = new ClaudeCompactionEnforcer(settings, transport, { dedupWindowMs: 60_000, postCompactRestoreCooldownMs: 0, openrigHome: TEST_HOME });
     let now = 1_700_000_000_000; vi.spyOn(Date, "now").mockImplementation(() => now);
     await enforcer.maybeAutoCompact({ sessionName: "claude-seat@rig", runtime: "claude-code", usedPercentage: 90 });
     now += 30_000;
     await enforcer.maybeAutoCompact({ sessionName: "claude-seat@rig", runtime: "claude-code", usedPercentage: 95 });
     void send;
     expect(await belowTick(enforcer)).toEqual({ triggered: true }); // no resolver -> gate inert -> drains
+  });
+
+  it.each(["busy", "retained"])("a fresh high sample retains the exact owed stage after %s", async kind => {
+    const { enforcer, send } = await queueStageWithGen("same-generation");
+    const highTick = () => enforcer.maybeAutoCompact({ sessionName: "claude-seat@rig", runtime: "claude-code",
+      usedPercentage: 95, transcriptPath: "/tmp/c.jsonl" });
+    const deliveredBefore = send.mock.calls.length;
+    // The initial boundary advances while high; the restore must still respect delivery admission.
+    expect(await highTick()).toEqual({ triggered: true });
+    const held = kind === "busy" ? { ok: false, reason: "wait_for_idle_timeout" } : { ok: true, outcome: "retained" };
+    send.mockResolvedValueOnce(held);
+    expect(await highTick()).toEqual({ triggered: false, reason: "send_failed" });
+    expect(send.mock.calls.at(-1)?.[1]).toContain("restoring this Claude session after compaction");
+    expect(send.mock.calls.at(-1)?.[2]).toEqual({ openrigNotice: true, waitForIdleMs: expect.any(Number), readinessFromPaneOnly: true, beforeWrite: expect.any(Function) });
+    expect(await highTick()).toEqual({ triggered: true });
+    expect(send.mock.calls.at(-1)?.[1]).toContain("restoring this Claude session after compaction");
+    expect(await highTick()).toEqual({ triggered: true });
+    expect(send.mock.calls.at(-1)?.[1]).toContain("Now audit your compaction restore");
+    expect(send.mock.calls.slice(deliveredBefore).some(call => String(call[1]).includes("preparation is now required") || String(call[1]).startsWith("/compact"))).toBe(false);
+  });
+
+  it.each(["disabled", "replacement"])("a fresh high sample preserves the pending-stage %s gate", async kind => {
+    const policy = { ...POLICY_ENABLED_AT_80 };
+    const { transport, send } = makeSessionTransport();
+    let generation = "original";
+    const enforcer = new ClaudeCompactionEnforcer(makeSettingsStore(policy), transport, {
+      resolveOccupantGeneration: () => generation,
+    });
+    const tick = () => enforcer.maybeAutoCompact({ sessionName: "claude-seat@rig", runtime: "claude-code", usedPercentage: 95 });
+    await tick(); await tick();
+    const count = send.mock.calls.length;
+    if (kind === "disabled") policy.enabled = false;
+    else generation = "replacement";
+    expect(await tick()).toEqual({ triggered: false, reason: kind === "disabled" ? "disabled" : "stale_generation" });
+    expect(send).toHaveBeenCalledTimes(count);
+  });
+
+  it.each([true, false])("high-usage manual drain keeps the operator exemption actor-gated: %s", async operatorInitiated => {
+    const { transport, send } = makeSessionTransport();
+    const enforcer = new ClaudeCompactionEnforcer(makeSettingsStore(POLICY_DISABLED), transport);
+    expect(await enforcer.triggerManualCompact({ sessionName: "manual@rig", runtime: "claude-code", usedPercentage: 95 },
+      { operatorInitiated })).toEqual({ triggered: true, stage: "compact-sent" });
+    const before = send.mock.calls.length;
+    expect(await enforcer.maybeAutoCompact({ sessionName: "manual@rig", runtime: "claude-code", usedPercentage: 95 }))
+      .toEqual(operatorInitiated ? { triggered: true } : { triggered: false, reason: "disabled" });
+    expect(send).toHaveBeenCalledTimes(before + (operatorInitiated ? 1 : 0));
   });
 
   // A pending post-compact stage drains without a usage sample (ContextMonitor calls this when the
@@ -451,9 +495,11 @@ describe("ClaudeCompactionEnforcer", () => {
     expect(send.mock.calls[queuedSends + 1]?.[1]).toContain("restoring this Claude session after compaction");
     expect(await drainTick(enforcer)).toEqual({ triggered: true });
     expect(send.mock.calls[queuedSends + 2]?.[1]).toContain("Now audit your compaction restore");
-    // Without a sample, every stage's send must read the pane: no hook may stand in for it.
+    // Without a sample, every stage's send must read the pane: no hook may stand in for it. Only the turn boundary, the first
+    // step after /compact, reads past the compaction output above the input box.
     for (let i = 0; i < 3; i++) {
-      expect(send.mock.calls[queuedSends + i]?.[2]).toEqual({ waitForIdleMs: expect.any(Number), readinessFromPaneOnly: true });
+      expect(send.mock.calls[queuedSends + i]?.[2]).toEqual({ openrigNotice: true, waitForIdleMs: expect.any(Number), readinessFromPaneOnly: true,
+        beforeWrite: expect.any(Function), ...(i === 0 ? { postCompactTurnBoundary: true } : {}) });
     }
 
     expect(enforcer.hasPendingPostCompactStage("claude-seat@rig")).toBe(false);
@@ -464,11 +510,12 @@ describe("ClaudeCompactionEnforcer", () => {
   it("the sampled drain keeps ordinary send readiness", async () => {
     const { enforcer, send, queuedSends } = await queueStageWithGen("gen-uuid-1");
     expect(await belowTick(enforcer)).toEqual({ triggered: true });
-    expect(send.mock.calls[queuedSends]?.[2]).toEqual({ waitForIdleMs: expect.any(Number) });
+    // Not pane-only; the first stage is the turn boundary, which also reads past the compaction output.
+    expect(send.mock.calls[queuedSends]?.[2]).toEqual({ openrigNotice: true, waitForIdleMs: expect.any(Number), postCompactTurnBoundary: true, beforeWrite: expect.any(Function) });
   });
 
   it("the restore prompt tells a seat that did not compact to say so and skip the restore reading", () => {
-    const prompt = buildPostCompactRestorePrompt({ sessionName: "claude-seat@rig", openrigHome: "/tmp/openrig-test-home" });
+    const prompt = buildPostCompactRestorePrompt({ sessionName: "claude-seat@rig", openrigHome: TEST_HOME });
     expect(prompt.startsWith("Please respond to this normal user message now by restoring this Claude session after compaction.")).toBe(true);
     expect(prompt).toContain("If you did not compact (your earlier context is still present), say so and skip the restore reading.");
   });
@@ -476,7 +523,7 @@ describe("ClaudeCompactionEnforcer", () => {
   it("a sample-less drain with no pending stage sends nothing and never starts a compaction", async () => {
     const settings = makeSettingsStore(POLICY_ENABLED_AT_80);
     const { transport, send } = makeSessionTransport();
-    const enforcer = new ClaudeCompactionEnforcer(settings, transport, { openrigHome: "/tmp/openrig-test-home" });
+    const enforcer = new ClaudeCompactionEnforcer(settings, transport, { openrigHome: TEST_HOME });
 
     expect(enforcer.hasPendingPostCompactStage("claude-seat@rig")).toBe(false);
     expect(await drainTick(enforcer)).toEqual({ triggered: false, reason: "no_pending_stage" });
@@ -488,7 +535,7 @@ describe("ClaudeCompactionEnforcer", () => {
     const { transport } = makeSessionTransport();
     const onPostRestoreComplete = vi.fn(async () => {});
     const enforcer = new ClaudeCompactionEnforcer(settings, transport, {
-      dedupWindowMs: 60_000, postCompactRestoreCooldownMs: 0, openrigHome: "/tmp/openrig-test-home",
+      dedupWindowMs: 60_000, postCompactRestoreCooldownMs: 0, openrigHome: TEST_HOME,
       resolveOccupantGeneration: () => "gen-uuid-1", onPostRestoreComplete,
     });
     let now = 1_700_000_000_000;
@@ -507,7 +554,7 @@ describe("ClaudeCompactionEnforcer", () => {
     const settings = makeSettingsStore(policy);
     const { transport, send } = makeSessionTransport();
     const enforcer = new ClaudeCompactionEnforcer(settings, transport, {
-      dedupWindowMs: 60_000, postCompactRestoreCooldownMs: 0, openrigHome: "/tmp/openrig-test-home",
+      dedupWindowMs: 60_000, postCompactRestoreCooldownMs: 0, openrigHome: TEST_HOME,
     });
     let now = 1_700_000_000_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -539,7 +586,7 @@ describe("ClaudeCompactionEnforcer", () => {
     const enforcer = new ClaudeCompactionEnforcer(settings, transport, {
       dedupWindowMs: 0,
       postCompactRestoreCooldownMs: 60_000,
-      openrigHome: "/tmp/openrig-test-home",
+      openrigHome: TEST_HOME,
     });
 
     let now = 1_700_000_000_000;
@@ -665,7 +712,7 @@ describe("ClaudeCompactionEnforcer", () => {
     const { transport, send } = makeSessionTransport();
     const enforcer = new ClaudeCompactionEnforcer(settings, transport, {
       dedupWindowMs: 60_000,
-      openrigHome: "/tmp/openrig-test-home",
+      openrigHome: TEST_HOME,
     });
 
     expect(await enforcer.maybeAutoCompact({
@@ -706,7 +753,7 @@ describe("ClaudeCompactionEnforcer", () => {
     const { transport, send } = makeSessionTransport();
     const enforcer = new ClaudeCompactionEnforcer(settings, transport, {
       dedupWindowMs: 60_000,
-      openrigHome: "/tmp/openrig-test-home",
+      openrigHome: TEST_HOME,
     });
 
     expect(await enforcer.maybeAutoCompact({
@@ -746,7 +793,7 @@ describe("ClaudeCompactionEnforcer", () => {
     expect(send).toHaveBeenCalledTimes(5);
     expect(send.mock.calls[2]![1]).toContain("OpenRig post-compaction turn boundary");
     expect(send.mock.calls[3]![1]).toContain("Please respond to this normal user message now");
-    expect(send.mock.calls[4]![1]).toContain("/tmp/openrig-test-home/compaction/restore-pending/claude-seat@rig.json");
+    expect(send.mock.calls[4]![1]).toContain(`${TEST_HOME}/compaction/restore-pending/claude-seat@rig.json`);
     expect(send.mock.calls[4]![1]).toContain("/tmp/claude.jsonl");
   });
 
@@ -754,7 +801,7 @@ describe("ClaudeCompactionEnforcer", () => {
     const settings = makeSettingsStore(POLICY_ENABLED_AT_80);
     const { transport, send } = makeSessionTransport();
     const enforcer = new ClaudeCompactionEnforcer(settings, transport, {
-      openrigHome: "/tmp/openrig-test-home",
+      openrigHome: TEST_HOME,
     });
 
     expect(await enforcer.maybeAutoCompact({
@@ -799,7 +846,7 @@ describe("ClaudeCompactionEnforcer", () => {
     expect(send.mock.calls[3]![1]).toContain("read your newest restore map and use the restore packet as a lookup");
     expect(send.mock.calls[3]![1]).not.toContain("read the restore packet files");
     expect(send.mock.calls[2]![1]).not.toContain("refocusing");
-    expect(send.mock.calls[3]![1]).toContain("/tmp/openrig-test-home/plugins/openrig-core/skills/refocusing/SKILL.md");
+    expect(send.mock.calls[3]![1]).toContain(`${TEST_HOME}/plugins/openrig-core/skills/refocusing/SKILL.md`);
     expect(send.mock.calls[3]![1]).toContain("consume the current topology and work traces delivered with this restore request");
     expect(send.mock.calls[4]![1]).toContain("If no current trace arrived, report that delivery gap");
   });
@@ -812,7 +859,7 @@ describe("ClaudeCompactionEnforcer", () => {
     });
     const { transport, send } = makeSessionTransport();
     const enforcer = new ClaudeCompactionEnforcer(settings, transport, {
-      openrigHome: "/tmp/openrig-test-home",
+      openrigHome: TEST_HOME,
     });
 
     expect(await enforcer.maybeAutoCompact({
@@ -857,7 +904,7 @@ describe("ClaudeCompactionEnforcer", () => {
     });
     const { transport, send } = makeSessionTransport();
     const enforcer = new ClaudeCompactionEnforcer(settings, transport, {
-      openrigHome: "/tmp/openrig-test-home",
+      openrigHome: TEST_HOME,
     });
 
     expect(await enforcer.maybeAutoCompact({
@@ -985,6 +1032,7 @@ describe("ClaudeCompactionEnforcer", () => {
         expect(send).toHaveBeenCalledWith(
           "claude-seat@rig",
           expect.stringContaining("OpenRig automatic compaction preparation"),
+          { openrigNotice: true, beforeWrite: expect.any(Function) },
         );
 
         const compact = await enforcer.maybeAutoCompact({
@@ -1062,7 +1110,7 @@ describe("ClaudeCompactionEnforcer", () => {
   // reorder.
   describe("triggerManualCompact (manual trigger)", () => {
     const SEAT = "claude-seat@rig";
-    const HOME = "/tmp/openrig-test-home";
+    const HOME = TEST_HOME;
 
     it("guided sequence for one seat: below-threshold trigger sends prep → /compact (trust-bridge), then the EXISTING poll drains restore→audit (no second path)", async () => {
       const settings = makeSettingsStore(POLICY_ENABLED_AT_80);
@@ -1080,28 +1128,28 @@ describe("ClaudeCompactionEnforcer", () => {
       // Phase 1 — prep (a normal send, no wait option).
       expect(send.mock.calls[0]![0]).toBe(SEAT);
       expect(send.mock.calls[0]![1]).toContain("OpenRig manual compaction was requested");
-      expect(send.mock.calls[0]![2]).toBeUndefined();
+      expect(send.mock.calls[0]![2]).toEqual({ openrigNotice: true, beforeWrite: expect.any(Function) });
       // Phase 2 — /compact WITH the trust-bridge AND wait-for-idle (two-phase).
       expect(send.mock.calls[1]![1]).toContain("Keep in the summary: OpenRig's later restore request is operator-authorized");
       expect(send.mock.calls[0]![1]).toContain("Trust-channel note: after compaction");
-      expect(send.mock.calls[1]![2]).toEqual({ waitForIdleMs: expect.any(Number), readinessFromPaneOnly: true, beforeWrite: expect.any(Function) });
+      expect(send.mock.calls[1]![2]).toEqual({ openrigNotice: true, waitForIdleMs: expect.any(Number), readinessFromPaneOnly: true, beforeWrite: expect.any(Function) });
       expect(send).toHaveBeenCalledTimes(2);
 
       // The SAME maybeAutoCompact back-half (single restore path) drains it.
       expect(await enforcer.maybeAutoCompact({
         sessionName: SEAT, runtime: "claude-code", usedPercentage: 20, transcriptPath: "/tmp/claude.jsonl",
       })).toEqual({ triggered: true });
-      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("OpenRig post-compaction turn boundary"), { waitForIdleMs: expect.any(Number) });
+      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("OpenRig post-compaction turn boundary"), { openrigNotice: true, waitForIdleMs: expect.any(Number), postCompactTurnBoundary: true, beforeWrite: expect.any(Function) });
 
       expect(await enforcer.maybeAutoCompact({
         sessionName: SEAT, runtime: "claude-code", usedPercentage: 20, transcriptPath: "/tmp/claude.jsonl",
       })).toEqual({ triggered: true });
-      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("Please respond to this normal user message now"), { waitForIdleMs: expect.any(Number) });
+      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("Please respond to this normal user message now"), { openrigNotice: true, waitForIdleMs: expect.any(Number), beforeWrite: expect.any(Function) });
 
       expect(await enforcer.maybeAutoCompact({
         sessionName: SEAT, runtime: "claude-code", usedPercentage: 20,
       })).toEqual({ triggered: true });
-      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("Now audit your compaction restore"), { waitForIdleMs: expect.any(Number) });
+      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("Now audit your compaction restore"), { openrigNotice: true, waitForIdleMs: expect.any(Number), beforeWrite: expect.any(Function) });
 
       expect(send).toHaveBeenCalledTimes(5);
       expect(enforcer.getManualCompactionState(SEAT)?.stage).toBe("audit-sent");
@@ -1115,7 +1163,9 @@ describe("ClaudeCompactionEnforcer", () => {
         // Hold the FIRST send (prep) open so the first trigger is suspended mid-sequence (stage=preparing).
         let releasePrep!: () => void;
         send.mockImplementationOnce(() => new Promise((resolve) => { releasePrep = () => resolve({ ok: true }); }));
-        const enforcer = new ClaudeCompactionEnforcer(settings, transport, { openrigHome: HOME });
+        // This control exercises the in-progress guard, not elapsed preparation time: holding the prep open (and a busy CI)
+        // must not consume its 50ms budget.
+        const enforcer = new ClaudeCompactionEnforcer(settings, transport, { openrigHome: HOME, now: () => 1_700_000_000_000 });
 
         // Start (do NOT await) — runs synchronously up to the held prep send: stage=preparing, send #1 fired.
         const first = enforcer.triggerManualCompact({ sessionName: SEAT, runtime: "claude-code", usedPercentage: 20 });
@@ -1136,7 +1186,8 @@ describe("ClaudeCompactionEnforcer", () => {
         const { transport, send } = makeSessionTransport();
         let releasePrep!: () => void;
         send.mockImplementationOnce(() => new Promise((resolve) => { releasePrep = () => resolve({ ok: true }); }));
-        const enforcer = new ClaudeCompactionEnforcer(settings, transport, { openrigHome: HOME });
+        // Holding the first prep open across the later calls (and a busy CI) must not consume its 50ms budget.
+        const enforcer = new ClaudeCompactionEnforcer(settings, transport, { openrigHome: HOME, now: () => 1_700_000_000_000 });
 
         // First call suspended mid-prep → stage=preparing, send #1 fired.
         const first = enforcer.triggerManualCompact({ sessionName: SEAT, runtime: "claude-code", usedPercentage: 20 });
@@ -1177,7 +1228,8 @@ describe("ClaudeCompactionEnforcer", () => {
       it("after the sequence completes (audit-sent) OR fails (skipped-or-failed), a fresh re-trigger is allowed", async () => {
         const settings = makeSettingsStore(POLICY_ENABLED_AT_80);
         const { transport, send } = makeSessionTransport();
-        const enforcer = new ClaudeCompactionEnforcer(settings, transport, { openrigHome: HOME });
+        // This checks sequence/re-trigger behavior, not elapsed preparation time; CI work must not consume its 50ms budget.
+        const enforcer = new ClaudeCompactionEnforcer(settings, transport, { openrigHome: HOME, now: () => 1_700_000_000_000 });
 
         // Drive one full sequence to audit-sent (the back-half clears the pending maps).
         await enforcer.triggerManualCompact({ sessionName: SEAT, runtime: "claude-code", usedPercentage: 20, transcriptPath: "/tmp/c.jsonl" });
@@ -1193,8 +1245,8 @@ describe("ClaudeCompactionEnforcer", () => {
 
         // And after a FAILED trigger (prep send fails → skipped-or-failed), a retry is allowed too.
         const { transport: t2, send: send2 } = makeSessionTransport();
-        send2.mockImplementationOnce(async () => ({ ok: false, reason: "send_failed" }));
-        const enf2 = new ClaudeCompactionEnforcer(settings, t2, { openrigHome: HOME });
+        send2.mockImplementationOnce(async () => ({ ok: false, reason: "send_failed", inputPhase: "not_reached" }));
+        const enf2 = new ClaudeCompactionEnforcer(settings, t2, { openrigHome: HOME, now: () => 1_700_000_000_000 });
         expect((await enf2.triggerManualCompact({ sessionName: SEAT, runtime: "claude-code", usedPercentage: 20 })).triggered).toBe(false);
         expect(enf2.getManualCompactionState(SEAT)?.stage).toBe("skipped-or-failed");
         // Retry proceeds (not blocked by the guard).
@@ -1220,14 +1272,14 @@ describe("ClaudeCompactionEnforcer", () => {
       expect(await enforcer.maybeAutoCompact({
         sessionName: SEAT, runtime: "claude-code", usedPercentage: 20, transcriptPath: "/tmp/claude.jsonl",
       })).toEqual({ triggered: true });
-      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("OpenRig post-compaction turn boundary"), { waitForIdleMs: expect.any(Number) });
+      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("OpenRig post-compaction turn boundary"), { openrigNotice: true, waitForIdleMs: expect.any(Number), postCompactTurnBoundary: true, beforeWrite: expect.any(Function) });
       expect(await enforcer.maybeAutoCompact({
         sessionName: SEAT, runtime: "claude-code", usedPercentage: 20, transcriptPath: "/tmp/claude.jsonl",
       })).toEqual({ triggered: true });
       expect(await enforcer.maybeAutoCompact({
         sessionName: SEAT, runtime: "claude-code", usedPercentage: 20,
       })).toEqual({ triggered: true });
-      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("Now audit your compaction restore"), { waitForIdleMs: expect.any(Number) });
+      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("Now audit your compaction restore"), { openrigNotice: true, waitForIdleMs: expect.any(Number), beforeWrite: expect.any(Function) });
     });
 
     it("GHOST-STAGE (a) PM-pin: an AUTOMATION-initiated manual trigger is NOT drain-exempt — a disabled tick drains nothing (no laundering bypass)", async () => {
@@ -1280,7 +1332,7 @@ describe("ClaudeCompactionEnforcer", () => {
         return { ok: true, activity: { state: "idle" } as any, attempts: 1, waitedMs: 0 };
       };
       await enforcer.triggerManualCompact({ sessionName: SEAT, runtime: "claude-code", usedPercentage: 20 });
-      expect(callOrder).toEqual(["prep", "idle", `compact:${JSON.stringify({ waitForIdleMs: 1000, readinessFromPaneOnly: true })}`]);
+      expect(callOrder).toEqual(["prep", "idle", `compact:${JSON.stringify({ openrigNotice: true, waitForIdleMs: 1000, readinessFromPaneOnly: true })}`]);
     });
 
     it.each([0, 75])("wait-for-idle failure means /compact never landed: the back-half is NOT seeded (preparation delay=%ims)", async (delayMs) => {
@@ -1347,7 +1399,7 @@ describe("ClaudeCompactionEnforcer", () => {
       expect(enforcer.getManualCompactionState("b@rig")).toBeNull();
     });
 
-    it("forward-fix B1: after a manual trigger, an above-threshold auto tick past the dedup window does NOT start a second prep (dedups); the manual back-half still drains", async () => {
+    it("after a manual trigger, a fresh high tick advances the owed stage without a second preparation", async () => {
       const settings = makeSettingsStore(POLICY_ENABLED_AT_80);
       const { transport, send } = makeSessionTransport();
       const enforcer = new ClaudeCompactionEnforcer(settings, transport, {
@@ -1365,26 +1417,20 @@ describe("ClaudeCompactionEnforcer", () => {
       })).toEqual({ triggered: true, stage: "compact-sent" });
       expect(send).toHaveBeenCalledTimes(2);
 
-      // Advance PAST the short dedup window, then an ABOVE-threshold auto tick.
-      // It must dedup on triggeredAboveThreshold — NOT start a second prep.
+      // Advancing a pending stage is not a new trigger, even past the short dedup window.
       now += 61_000;
       expect(await enforcer.maybeAutoCompact({
         sessionName: SEAT, runtime: "claude-code", usedPercentage: 95,
-      })).toEqual({ triggered: false, reason: "already_triggered_above_threshold" });
-      expect(send).toHaveBeenCalledTimes(2); // no third message
-
-      // The manual restore/audit back-half still drains normally once below threshold.
-      expect(await enforcer.maybeAutoCompact({
-        sessionName: SEAT, runtime: "claude-code", usedPercentage: 20, transcriptPath: "/tmp/claude.jsonl",
-      })).toEqual({ triggered: true }); // turn boundary
-      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("OpenRig post-compaction turn boundary"), { waitForIdleMs: expect.any(Number) });
+      })).toEqual({ triggered: true }); // owed turn boundary, not another prep
+      expect(send).toHaveBeenCalledTimes(3);
+      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("OpenRig post-compaction turn boundary"), { openrigNotice: true, waitForIdleMs: expect.any(Number), readinessFromPaneOnly: true, postCompactTurnBoundary: true, beforeWrite: expect.any(Function) });
       expect(await enforcer.maybeAutoCompact({
         sessionName: SEAT, runtime: "claude-code", usedPercentage: 20, transcriptPath: "/tmp/claude.jsonl",
       })).toEqual({ triggered: true }); // restore
       expect(await enforcer.maybeAutoCompact({
         sessionName: SEAT, runtime: "claude-code", usedPercentage: 20,
       })).toEqual({ triggered: true }); // audit
-      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("Now audit your compaction restore"), { waitForIdleMs: expect.any(Number) });
+      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("Now audit your compaction restore"), { openrigNotice: true, waitForIdleMs: expect.any(Number), beforeWrite: expect.any(Function) });
       expect(enforcer.getManualCompactionState(SEAT)?.stage).toBe("audit-sent");
       expect(send).toHaveBeenCalledTimes(5);
     });
@@ -1392,7 +1438,8 @@ describe("ClaudeCompactionEnforcer", () => {
     it("state surfacing: preparing → compact-sent → restore-sent → audit-sent across the sequence", async () => {
       const settings = makeSettingsStore(POLICY_ENABLED_AT_80);
       const { transport, send } = makeSessionTransport();
-      const enforcer = new ClaudeCompactionEnforcer(settings, transport, { openrigHome: HOME });
+      // Holding phase 1 open (and a busy CI) must not consume the 50ms preparation budget: this checks the stages, not time.
+      const enforcer = new ClaudeCompactionEnforcer(settings, transport, { openrigHome: HOME, now: () => 1_700_000_000_000 });
 
       // Hold phase 1 open so we can observe "preparing".
       let resolvePrep: (v: { ok: boolean }) => void = () => {};
@@ -1452,7 +1499,7 @@ describe("ClaudeCompactionEnforcer", () => {
       expect(enforcer.getManualCompactionState(SEAT)?.stage).toBe("compact-sent"); // busy timeout does NOT advance to restore-sent
       const restoreCall = send.mock.calls.find(isRestore);
       expect(restoreCall, "restore send must be attempted with an idle gate").toBeDefined();
-      expect(restoreCall![2]).toEqual({ waitForIdleMs: expect.any(Number) }); // idle-gated, not a busy-pane fire-and-forget
+      expect(restoreCall![2]).toEqual({ openrigNotice: true, waitForIdleMs: expect.any(Number), beforeWrite: expect.any(Function) }); // idle-gated, not a busy-pane fire-and-forget
       expect(send.mock.calls.some(isAudit)).toBe(false); // audit cannot overtake restore
 
       // Claude goes idle → the SAME restore stage delivers and advances ONCE.

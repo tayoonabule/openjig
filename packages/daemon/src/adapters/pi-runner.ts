@@ -3,7 +3,7 @@
 // The runner is what makes a Pi seat behave like a normal OpenRig tmux seat
 // while everything underneath stays structured RPC:
 //
-//   pane stdin (rig send / human typing)  ──▶ RPC prompt / steer / follow_up
+//   pane stdin (rig send / human typing)  ──▶ RPC prompt (queued as a steer while busy) / follow_up
 //   pi RPC events (typed JSONL)           ──▶ (a) human-readable pane mirror
 //                                             (b) activity + session_identity
 //                                                 POSTs to the daemon
@@ -218,6 +218,8 @@ export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntim
       // Pi keeps main's mapping: turn_end carries no notice.
       return runtime === "omp" ? { mirrorLines: [], ...modelErrorNotice(event, runtime) } : { mirrorLines: [] };
     case "turn_start":
+      // Some turn paths omit agent_start; turn_start still opens a turn, so it reports the seat working.
+      return { mirrorLines: [], activity: { hookEvent: "active", subtype: "turn_start" } };
     case "message_start":
       return { mirrorLines: [] };
     case "message_update": {
@@ -384,6 +386,9 @@ export class RunnerCore {
   private sessionId: string | undefined;
   private lastEntryId: string | undefined;
   private ready = false;
+  private lastHeartbeatMs: number | null = null;
+  /** Hook event of the last activity this runner posted; null until it posts one. */
+  private lastPostedHook: string | null = null;
   private assistantErrorShown = false;
   private started = false;
   /** OMP failures/approvals survive the turn until agent_start, except typed
@@ -528,15 +533,12 @@ export class RunnerCore {
       this.io.mirrorLine(`you (follow-up) ▸ ${message}`);
       return;
     }
-    if (this.streaming) {
-      // Mid-stream: steer delivers after the current turn's tool calls,
-      // before the next model call (Pi's documented semantics).
-      this.io.sendRpc({ type: "steer", message: block });
-      this.io.mirrorLine(`you (steer) ▸ ${block}`);
-      return;
-    }
-    this.io.sendRpc({ type: "prompt", message: block });
-    this.io.mirrorLine(`you ▸ ${block}`);
+    // The runtime decides, not the runner: with streamingBehavior "steer", Pi and OMP run the prompt when idle and,
+    // while busy, queue it as a steer, delivered after the current turn's tool calls and before the next model call.
+    // The runner's `streaming` starts only at agent_start, so it can't tell when a turn is about to start (#1932) or
+    // when a prompt was consumed locally and started none. It labels the mirror line only.
+    this.io.sendRpc({ type: "prompt", message: block, streamingBehavior: "steer" });
+    this.io.mirrorLine(this.streaming ? `you (steer) ▸ ${block}` : `you ▸ ${block}`);
   }
 
   /** Child process exit — honest, loud, durable. */
@@ -569,6 +571,13 @@ export class RunnerCore {
         // OMP cannot provide a resume token without get_state; stop it so the
         // launch fails now instead of waiting out readiness.
         if (this.runtime === "omp") this.io.stopChild?.();
+        return;
+      }
+      if (record.id === CATCH_UP_ID && this.runtime === "pi") {
+        // A refused catch-up (a saved cursor this session's history doesn't hold, such as an older runner's UI-event
+        // id) is history sync, not the seat's resume: say so, and take a confirmed cursor from the history's tail.
+        this.io.mirrorLine(`[pi-runner] History catch-up didn't run (${message}). That's history sync, separate from the seat's resume; reading the history cursor again.`);
+        this.io.sendRpc({ type: "get_entries", id: CURSOR_REFRESH_ID });
         return;
       }
       this.io.mirrorLine(`[${this.runtime}-runner] ERROR rpc: ${message}`);
@@ -703,21 +712,45 @@ export class RunnerCore {
     this.io.postActivity(this.activityPayload("Notification", next === "transient_turn_error" ? "runtime_error" : next));
   }
 
+  /** Idle heartbeat. A Pi runner only reports when something happens, and the daemon reads any hook older than
+   *  its freshness window as `unknown` (`stale_runtime_hook`), so an idle seat read `unknown` five minutes after
+   *  its last turn, and a restored seat read `unknown` (`generation_mismatch`) until its first turn. Re-asserting
+   *  idle while ready, not mid-turn and not waiting on the operator keeps the verdict honest: a runner that dies
+   *  stops beating and the seat goes back to `unknown`. Pi only; the OMP identity handshake has its own retry. */
+  heartbeat(): void {
+    if (this.runtime !== "pi" || !this.ready || this.streaming || this.attention) return;
+    // `streaming` follows only agent_start/agent_end; turn_start, compaction and auto-retry also report the agent
+    // working. Beat only when the last thing posted was a Stop (or nothing yet), so a beat never lands mid-turn.
+    if (this.lastPostedHook !== null && this.lastPostedHook !== "Stop") return;
+    const now = Date.parse(this.io.now());
+    if (this.lastHeartbeatMs !== null && now - this.lastHeartbeatMs < IDLE_HEARTBEAT_MS) return;
+    this.io.postActivity(this.activityPayload("Stop", "idle_heartbeat"));
+  }
+
   private clearAttention(): void {
     this.attention = null;
     this.attentionIsLatest = false;
   }
 
   private handleEvent(event: Record<string, unknown>): void {
-    if (this.runtime === "omp" && event.type === "extension_ui_request") {
+    if ((this.runtime === "omp" || this.runtime === "pi") && event.type === "extension_ui_request") {
       const method = event.method;
+      const dialog = method === "select" || method === "confirm" || method === "input" || method === "editor";
+      const detail = [event.title, event.message].filter((text): text is string => typeof text === "string")
+        .map(stripVTControlCharacters).join(" — ").replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ").slice(0, 400);
+      if (this.runtime === "pi" && !dialog) {
+        if (method === "notify") this.io.mirrorLine(`[pi-runner] ${detail}`);
+        return; // Pi notifications and other fire-and-forget UI requests expect no answer.
+      }
       // RPC does not mount an interactive UI. Reply at once; otherwise the
       // child can wait forever for approval that cannot be given in the pane.
       if (typeof event.id === "string") {
         this.io.sendRpc({ type: "extension_ui_response", id: event.id, cancelled: true });
       }
-      if (method === "select" || method === "confirm" || method === "input" || method === "editor") {
-        this.io.mirrorLine("[omp-runner] Approval/input requested; cancelled because the managed RPC pane cannot answer it. Operator action required: review the denied action and re-send a safe instruction, or change the seat permission policy explicitly.");
+      if (dialog) {
+        this.io.mirrorLine(this.runtime === "pi"
+          ? `[pi-runner] Extension ${method}: ${detail}; cancelled because the managed RPC pane cannot answer it. Operator action required: review the cancelled request and re-send an instruction the extension can complete without a dialog.`
+          : "[omp-runner] Approval/input requested; cancelled because the managed RPC pane cannot answer it. Operator action required: review the denied action and re-send a safe instruction, or change the seat permission policy explicitly.");
         this.raiseAttention("permission_prompt");
       }
       return;
@@ -726,15 +759,17 @@ export class RunnerCore {
     if (event.type === "agent_start" || (event.type === "message_start" && message?.role === "assistant")) {
       this.assistantErrorShown = false;
     }
-    // Durable cursor: any event carrying a session-entry id advances it.
-    const entryId = typeof event.entryId === "string" ? event.entryId : (typeof event.id === "string" ? event.id : undefined);
+    // Durable cursor: any event carrying a session-entry id advances it. A Pi event's own `id` isn't one (Pi's
+    // history ids reach the cursor through get_entries), so on Pi only an explicit `entryId` counts.
+    const entryId = typeof event.entryId === "string" ? event.entryId
+      : (this.runtime !== "pi" && typeof event.id === "string" ? event.id : undefined);
     if (entryId) {
       this.lastEntryId = entryId;
       this.writeSidecar({});
     }
 
+    if (event.type === "agent_start") this.clearAttention();
     if (this.runtime === "omp") {
-      if (event.type === "agent_start") this.clearAttention();
       if (event.type === "agent_start" || event.type === "turn_start"
         || (event.type === "message_start" && message?.role === "assistant")
         || ((event.type === "message_end" || event.type === "turn_end")
@@ -754,7 +789,7 @@ export class RunnerCore {
     // the daemon confirms the token. Pi's get_state identity is final.
     if (event.type === "agent_end" && this.runtime === "omp") this.postSessionIdentity();
     if (event.type === "agent_end") {
-      // QA RED fold (qitem-20260707020922): live events do not reliably carry
+      // QA RED fold: live events do not reliably carry
       // session-entry ids, so the durable cursor starved (lastEntryId stayed
       // null in real runs). Refresh it from the source of truth after every
       // completed turn — get_entries returns append-order entries with stable
@@ -839,14 +874,23 @@ export class RunnerCore {
     ).finally(() => { this.identityInFlight = false; });
   }
 
+  /** Each activity post's place in this runner's event order: posts aren't awaited, so they can arrive out of order. */
+  private activitySequence = 0;
+
   private activityPayload(hookEvent: string, subtype: string | null): Record<string, unknown> {
+    this.lastPostedHook = hookEvent;
+    // Any posted Stop is an idle report, so the next beat is due a full interval after it, not just after a beat.
+    if (hookEvent === "Stop") this.lastHeartbeatMs = Date.parse(this.io.now());
     return {
+      sequence: ++this.activitySequence,
       sessionName: this.identity.sessionName,
       nodeId: this.identity.nodeId ?? null,
       generation: this.identity.generation ?? null,
       runtime: this.runtime,
       hookEvent,
       subtype,
+      // A Pi runner's idle report holds only while it keeps beating; the daemon expires it after two missed beats.
+      ...(this.runtime === "pi" && hookEvent === "Stop" && subtype !== "pi_exited" ? { livenessSeconds: IDLE_HEARTBEAT_MS / 1000 } : {}),
       occurredAt: this.io.now(),
     };
   }
@@ -960,7 +1004,7 @@ function resolveActivityEndpoint(env: NodeJS.ProcessEnv): { baseUrl: string; tok
 }
 
 /** The runner-side sidecar handshake, extracted for hermetic testing (guard
- *  re-verdict, qitem-20260707013815): read the PRIOR record's durable cursor
+ *  re-verdict): read the PRIOR record's durable cursor
  *  FIRST, then stamp the launch-scoped pending record — the write carries the
  *  cursor forward so no reset in the chain can erase it. `catchUpSince` is
  *  only surfaced when resuming: a fresh/fork session has no prior projection
@@ -982,8 +1026,21 @@ export function prepareRunnerSidecar(
   return { catchUpSince: resuming ? prior?.lastEntryId : undefined };
 }
 
+/** Wraps an async send so calls run one after another in call order; a send that rejects doesn't hold up the ones behind it. */
+export function inOrder<A, R>(send: (arg: A) => Promise<R>): (arg: A) => Promise<R> {
+  let tail: Promise<unknown> = Promise.resolve();
+  return (arg) => {
+    const result = tail.then(() => send(arg));
+    tail = result.catch(() => undefined);
+    return result;
+  };
+}
+
 /** How often an OMP runner re-delivers an unconfirmed session identity. */
 const IDENTITY_RETRY_MS = 30_000;
+/** Below the daemon's 5 minute hook freshness window (AGENT_ACTIVITY_FRESHNESS_MS). */
+const IDLE_HEARTBEAT_MS = 3 * 60_000;
+const IDLE_HEARTBEAT_TICK_MS = 15_000;
 
 export interface ExecutableResolverOps {
   isExecutable(path: string): boolean;
@@ -1195,6 +1252,22 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     notice: (line) => { process.stdout.write(`${line}\n`); },
   });
 
+  // One activity post at a time: the daemon reads its newest record by arrival, so a beat still in flight when a turn
+  // starts must not land after the turn's first post. Each post's own 1.5 s timeout bounds the wait behind it.
+  const postInOrder = inOrder((payload: Record<string, unknown>): Promise<Record<string, unknown> | null> => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1500);
+    return fetch(new URL("/api/activity/hooks", endpoint!.baseUrl).toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${endpoint!.token}` },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    })
+      .then(async (response) => response.ok && runtime === "omp" ? await response.json() as Record<string, unknown> : null)
+      .catch(() => null)
+      .finally(() => clearTimeout(timeout));
+  });
+
   const io: RunnerIo = {
     sendRpc: (cmd) => {
       try { child.stdin.write(`${JSON.stringify(cmd)}\n`); } catch { /* exit handler reports */ }
@@ -1203,24 +1276,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     mirrorAppend: (text) => process.stdout.write(text),
     postActivity: (payload) => {
       if (!endpoint || typeof fetch !== "function") return;
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 1500);
-      const request = fetch(new URL("/api/activity/hooks", endpoint.baseUrl).toString(), {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${endpoint.token}` },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-      if (runtime !== "omp") {
-        request.catch(() => { /* best-effort — never blocks the loop */ }).finally(() => clearTimeout(timeout));
-        return;
-      }
+      const result = postInOrder(payload).catch(() => null);
       // OMP reads the acknowledgement so identity delivery can retry; null
       // (transport failure or a non-OK reply) means "not yet persisted".
-      return request
-        .then(async (response) => response.ok ? await response.json() as Record<string, unknown> : null)
-        .catch(() => null)
-        .finally(() => clearTimeout(timeout));
+      if (runtime === "omp") return result;
     },
     writeSidecar: (state) => {
       try {
@@ -1287,6 +1346,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   // Re-deliver OMP identity until the daemon confirms the resume token.
   const identityRetry = runtime === "omp" ? setInterval(() => core.retrySessionIdentity(), IDENTITY_RETRY_MS) : undefined;
   identityRetry?.unref();
+  const idleHeartbeat = runtime === "pi" ? setInterval(() => core.heartbeat(), IDLE_HEARTBEAT_TICK_MS) : undefined;
+  idleHeartbeat?.unref();
   // The last few stderr lines, so an OMP that exits during startup is
   // reported with its own words in the error, not only above it.
   const stderrTail: string[] = [];
@@ -1337,6 +1398,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     if (exited) return;
     exited = true;
     clearInterval(identityRetry);
+    clearInterval(idleHeartbeat);
     if (!core.isReady()) {
       const how = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
       const output = stderrTail.length > 0 ? ` Its last output: ${stderrTail.join(" | ")}` : " It printed nothing on stderr.";

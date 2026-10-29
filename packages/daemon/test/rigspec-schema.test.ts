@@ -37,6 +37,26 @@ const VALID_RIG = {
 };
 
 describe("RigSpec schema (pod-aware)", () => {
+  it.each(["model", "label"])("rejects non-string member %s values in canonical validation", field => {
+    for (const value of [null, 7, {}, [], true]) {
+      const rig = structuredClone(VALID_RIG);
+      (rig.pods[0]!.members[0] as Record<string, unknown>)[field] = value;
+      const result = RigSpecSchema.validate(rig);
+      expect(result.valid).toBe(false);
+      expect(result.errors).toContain(`pods[0].members[0].${field}: must be a string`);
+    }
+  });
+
+  it.each(["model", "label"])("keeps optional and string member %s values unchanged", field => {
+    for (const value of [undefined, "", "selected-value"]) {
+      const rig = structuredClone(VALID_RIG);
+      const member = rig.pods[0]!.members[0] as Record<string, unknown>;
+      if (value === undefined) delete member[field]; else member[field] = value;
+      expect(RigSpecSchema.validate(rig).valid).toBe(true);
+      expect(RigSpecSchema.normalize(rig).pods[0]!.members[0]![field as "model" | "label"]).toBe(value);
+    }
+  });
+
   // T1: valid rig with embedded pods passes validation
   it("valid rig with embedded pods passes validation", () => {
     const result = RigSpecSchema.validate(VALID_RIG);
@@ -231,6 +251,23 @@ describe("RigSpec schema (pod-aware)", () => {
     const result = RigSpecSchema.validate(rig);
     expect(result.valid).toBe(false);
     expect(result.errors[0]).toMatch(/duplicate member id "impl"/);
+  });
+
+  it("members in different pods that derive the same session name get a warning", () => {
+    const rig = structuredClone(VALID_RIG);
+    rig.pods[0]!.id = "dev-impl";
+    rig.pods[0]!.members[0]!.id = "main";
+    rig.pods[0]!.edges[0]!.to = "main";
+    rig.edges[0]!.from = "dev-impl.main";
+    rig.pods[1]!.id = "dev";
+    rig.pods[1]!.members[0]!.id = "impl-main";
+    rig.edges[0]!.to = "dev.impl-main";
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+    expect(result.advisories).toEqual([
+      'pods[1].members[0].id: session name "dev-impl-main@dev-rig" is already used by member "dev-impl.main"',
+    ]);
   });
 
   // T9: dot in pod id or member id fails
@@ -626,5 +663,34 @@ describe("malformed topology stays a validation result", () => {
     const result = RigSpecSchema.validate({ ...VALID_RIG, pods: [null, VALID_RIG.pods[1]], edges: [{kind:"escalates_to",from:"absent.worker",to:"arch.reviewer"}] });
     expect(result.errors).toContain("pods[0]: must be an object");
     expect(result.errors).toContain('edges[0].from: "absent.worker" does not resolve to a pod member');
+  });
+});
+
+describe("a Claude member's own agent, prompt file and plugin folders (OPR.0.7.0.9)", () => {
+  const withFields = (index: number, fields: Record<string, unknown>) => {
+    const rig = structuredClone(VALID_RIG);
+    Object.assign(rig.pods[0]!.members[index] as Record<string, unknown>, fields);
+    return rig;
+  };
+
+  it("reads the three named settings on a Claude member, as paths beside the spec", () => {
+    const rig = withFields(0, { agent_file: "agents/reviewer.md", append_system_prompt_file: "prompts/house.md", plugin_dirs: ["plugins/review"] });
+    expect(RigSpecSchema.validate(rig).valid).toBe(true);
+    expect(RigSpecSchema.normalize(rig).pods[0]!.members[0]).toMatchObject({
+      agentFile: "agents/reviewer.md", appendSystemPromptFile: "prompts/house.md", pluginDirs: ["plugins/review"] });
+  });
+
+  it("takes an empty plugin_dirs as none", () => {
+    expect(RigSpecSchema.validate(withFields(0, { plugin_dirs: [] })).valid).toBe(true);
+  });
+
+  it("says why it can't take them: another runtime, a path outside the spec's folder, or a malformed list", () => {
+    const errors = (rig: unknown) => RigSpecSchema.validate(rig).errors.join(" | ");
+    expect(errors(withFields(1, { agent_file: "agents/reviewer.md" }))).toMatch(/members\[1\]\.agent_file: only for Claude members/);
+    expect(errors(withFields(0, { append_system_prompt_file: "/etc/prompt.md" }))).toMatch(/append_system_prompt_file: absolute paths are not allowed/);
+    expect(errors(withFields(0, { plugin_dirs: ["../outside"] }))).toMatch(/plugin_dirs\[0\]: path traversal/);
+    expect(errors(withFields(0, { plugin_dirs: "plugins/review" }))).toMatch(/plugin_dirs: must be a list/);
+    expect(errors(withFields(0, { plugin_dirs: ["a", "./a"] }))).toMatch(/plugin_dirs\[1\]: listed twice/);
+    expect(errors(withFields(0, { plugin_dirs: ["x/review", "y/review"] }))).toMatch(/plugin_dirs\[1\]: would be copied where plugin_dirs\[0\] is/);
   });
 });

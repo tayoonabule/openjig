@@ -19,7 +19,7 @@ import {
   classifyNudgeFailure,
   hasLinkedSuccessor,
 } from "../src/domain/queue-repository.js";
-import { CLOSURE_REASONS } from "../src/domain/hot-potato-enforcer.js";
+import { DONE_CLOSURE_REASONS } from "../src/domain/hot-potato-enforcer.js";
 import type { PersistedEvent } from "../src/domain/types.js";
 
 describe("QueueRepository", () => {
@@ -399,19 +399,19 @@ describe("QueueRepository", () => {
       expect(err).toBeInstanceOf(QueueRepositoryError);
       const e = err as QueueRepositoryError;
       expect(e.code).toBe("missing_closure_reason");
-      expect((e.meta?.validReasons as readonly string[])).toEqual(CLOSURE_REASONS);
+      expect((e.meta?.validReasons as readonly string[])).toEqual(DONE_CLOSURE_REASONS);
     }
   });
 
-  it("update accepts each of the 6 valid closure reasons", async () => {
-    for (const reason of CLOSURE_REASONS) {
+  it("update accepts each valid terminal closure reason", async () => {
+    for (const reason of DONE_CLOSURE_REASONS) {
       const item = await repo.create({
         sourceSession: "alice@rig",
         destinationSession: "bob@rig",
         body: `for ${reason}`,
       });
       repo.claim({ qitemId: item.qitemId, destinationSession: "bob@rig" });
-      const requiresTarget = reason === "handed_off_to" || reason === "blocked_on" || reason === "escalation";
+      const requiresTarget = reason === "handed_off_to" || reason === "escalation";
       const closed = repo.update({
         qitemId: item.qitemId,
         actorSession: "bob@rig",
@@ -1413,7 +1413,7 @@ describe("QueueRepository.listOpenObligations: the parked query's lean read", ()
     const ids = repo.list({ destinationSession: "b@r" }).map((r) => r.qitemId);
     repo.claim({ qitemId: ids[0]!, destinationSession: "b@r" });
     const want = repo.list({ destinationSession: "b@r", state: ["pending", "in-progress", "blocked"], limit: 500 })
-      .map((r) => ({ qitemId: r.qitemId, state: r.state, summary: r.summary ?? null }));
+      .map((r) => ({ qitemId: r.qitemId, state: r.state, summary: r.summary ?? null, blockedOn: r.blockedOn ?? null }));
     const prepare = vi.spyOn(db, "prepare");
     const got = repo.listOpenObligations("b@r", 500);
     expect(got).toEqual(want);
@@ -1458,7 +1458,7 @@ describe("QueueRepository.listOpenObligations: same rows, order and limit as lis
       for (const seat of [...seats, "nobody@r"]) {
         for (const limit of [1, 3, 500]) {
           const want = repo.list({ destinationSession: seat, state: ["pending", "in-progress", "blocked"], limit })
-            .map((r) => ({ qitemId: r.qitemId, state: r.state, summary: r.summary ?? null }));
+            .map((r) => ({ qitemId: r.qitemId, state: r.state, summary: r.summary ?? null, blockedOn: r.blockedOn ?? null }));
           expect(repo.listOpenObligations(seat, limit), `seed ${seed} ${seat} limit ${limit}`).toEqual(want);
         }
       }

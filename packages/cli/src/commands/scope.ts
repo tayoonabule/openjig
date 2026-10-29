@@ -11,7 +11,9 @@ import path from "node:path";
 import { Command } from "commander";
 import { DaemonClient } from "../client.js";
 import { attestationLineage, type AttestationLineage } from "../lib/scope/attestation-lineage.js";
-import { getDaemonStatus, getDaemonUrl , statusGuardMessage} from "../daemon-lifecycle.js";
+import { getDaemonStatus, getDaemonUrl , statusGuardMessage } from "../daemon-lifecycle.js";
+import { renderDaemonTransportError } from "../cli-error.js";
+import { daemonMayAnswer } from "../daemon-reachability.js";
 import { realDeps } from "./daemon.js";
 
 import {
@@ -99,12 +101,15 @@ function makeStdout(): Stdout {
   return { write: (text: string) => process.stdout.write(text) };
 }
 
-const MISSION_MANIFEST = `schema: openrig.mission/v0alpha1
+/** The lifecycle compiler names a mission's workflow by `metadata.name`, so the scaffold records it (quoted: a name
+ *  only excludes whitespace and path separators). */
+const missionManifest = (name: string) => `schema: openrig.mission/v0alpha1
 kind: mission
 # The project proof rollup counts only missions whose status is active or
 # release-candidate. A new mission is planned, so it stays outside the rollup
 # until you change this to active (or release-candidate).
 metadata:
+  name: ${JSON.stringify(name)}
   status: planned
 composition:
   mission_markdown:
@@ -146,7 +151,8 @@ function fail(err: unknown, json: boolean, out: Stdout): never {
     } else {
       process.stderr.write(`Error: ${err.fact}\n${err.consequence}\n${err.action}\n`);
     }
-  } else {
+  } else if (!renderDaemonTransportError(err, { out: (l) => out.write(`${l}\n`), err: (l) => process.stderr.write(`${l}\n`), json })) {
+    // A daemon timeout says the outcome is unknown and to check before any retry; anything else as before.
     const message = err instanceof Error ? err.message : String(err);
     process.stderr.write(`Error: ${message}\n`);
   }
@@ -341,7 +347,7 @@ function buildSliceCreateCommand(): Command {
             action: "Pick a slug containing letters or digits.",
           });
         }
-        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
+        const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace, strictOverride: true });
         const mission = findMission(missionsRoot, missionName);
         let nn = nextSliceNN(mission.absPath);
         const title = opts.title ?? titleFromSlug(slug);
@@ -796,8 +802,16 @@ function resolveMissionCreateRoot(override: string | null | undefined, advisorie
     fs.existsSync(childMissionsRoot) && fs.statSync(childMissionsRoot).isDirectory();
   const directMissionsRoot = path.basename(candidate) === "missions" && !hasChildMissionsRoot;
   const workspaceRoot = directMissionsRoot ? path.dirname(candidate) : candidate;
-  // A missing workspace is created at the named path by the mission's own mkdir, after rendering; it never falls
-  // back to the configured root. A path that can't be created reports the filesystem's own error there.
+  // A named workspace that doesn't exist is refused, not created: a mistyped path would otherwise start a new tree
+  // there. The configured root is never used in its place (#70).
+  if (!fs.existsSync(workspaceRoot) || !fs.statSync(workspaceRoot).isDirectory()) {
+    const source = override ? "--workspace" : "OPENRIG_WORK_ROOT";
+    throw new ScopeCliError({
+      fact: `The workspace named by ${source} is not an existing directory: ${workspaceRoot}.`,
+      consequence: "Mission not created; the configured workspace was NOT used as a fallback.",
+      action: `Point ${source} at an existing workspace, or create ${workspaceRoot} first.`,
+    });
+  }
 
   // A named workspace uses its project.yaml missions.root, as work positions do; a named missions folder is used as is.
   const missionsRoot = directMissionsRoot ? candidate : readProjectMissionsRoot(workspaceRoot, advisories);
@@ -947,7 +961,7 @@ function buildMissionCreateCommand(): Command {
         // New scaffolds author SPEC.md; existing README-backed nodes are never rewritten.
         const readmePath = path.join(absPath, "SPEC.md");
         fs.writeFileSync(readmePath, readmeBody, "utf8");
-        fs.writeFileSync(path.join(absPath, "mission.yaml"), MISSION_MANIFEST, "utf8");
+        fs.writeFileSync(path.join(absPath, "mission.yaml"), missionManifest(name), "utf8");
         const progressPath = path.join(absPath, "PROGRESS.md");
         fs.writeFileSync(progressPath, progressBody, "utf8");
         const capabilityDeltaPath = capabilityDeltaBody
@@ -1054,7 +1068,7 @@ function buildResolveNotesCommand(): Command {
 
 function buildAuditCommand(): Command {
   return new Command("audit")
-    .description("Read-only scope audit: flag scope findings and show the advisory dependency graph")
+    .description("Read-only scope audit: flag scope structure findings and show the advisory dependency graph. It doesn't read proof readiness: use rig proof show")
     .requiredOption("--mission <name>", "Mission to audit")
     .option("--json", "Machine-readable JSON output")
     .action(async (opts, command) => {
@@ -1062,7 +1076,7 @@ function buildAuditCommand(): Command {
       const json = Boolean(opts.json);
       try {
         const missionsRoot = resolveMissionsRoot({ override: getOpts(command).workspace });
-        const { classifyScopeItem } = await import("../lib/scope/scope-audit.js");
+        const { classifyScopeItem, SLICE_DIRECTORY_NAME } = await import("../lib/scope/scope-audit.js");
         const missionName = opts.mission as string;
 
         const missionDir = path.join(missionsRoot, missionName);
@@ -1201,7 +1215,7 @@ function buildAuditCommand(): Command {
                 : null,
             });
 
-            if (!/^\d{2,}-/.test(entry)) {
+            if (!SLICE_DIRECTORY_NAME.test(entry)) {
               sliceResult.findings.push({
                 kind: "id_convention_violation",
                 severity: "high",
@@ -2071,7 +2085,7 @@ function buildApproveCommand(tier: "slice" | "mission"): Command {
 
         const lifecycleDeps = realDeps();
         const status = await getDaemonStatus(lifecycleDeps);
-        if (status.state !== "running" || status.healthy === false) {
+        if (!daemonMayAnswer(status)) {
           throw new ScopeCliError({
             fact: statusGuardMessage(status).fact, // B8-1b: down ≠ busy
             consequence: "scope approve writes the stamp + audit row through the daemon (one operation).",
@@ -2141,7 +2155,7 @@ function shadowedNodeFileFinding(dir: string, level: "mission" | "slice"): {
 export function scopeCommand(): Command {
   const cmd = new Command("scope")
     .description("Scope tree primitive: missions, slices, sub-slices (per conventions/scope-and-versioning)")
-    .option("--workspace <path>", "Workspace root; use its project.yaml missions.root, else missions/. A directory named missions without its own missions/ child is used directly. If the tree is missing, fall back to configured workspace.slices_root, except mission create, which creates the named tree, and approve, which refuses. Without this flag, OPENRIG_WORK_ROOT is tried first with the same exceptions.");
+    .option("--workspace <path>", "Workspace root; use its project.yaml missions.root, else missions/. A directory named missions without its own missions/ child is used directly. If the tree is missing, fall back to configured workspace.slices_root, except slice create and approve, which refuse, and mission create, which refuses a path that isn't an existing directory and otherwise creates the missions tree inside it. Without this flag, OPENRIG_WORK_ROOT is tried first with the same exceptions.");
 
   const slice = new Command("slice").description("Slice-tier commands");
   slice.addCommand(buildSliceLsCommand());

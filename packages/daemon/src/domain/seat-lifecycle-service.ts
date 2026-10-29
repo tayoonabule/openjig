@@ -1,10 +1,13 @@
+import { readClaudePermissionRules, validateClaudePermissionRules } from "./claude-permission-rules.js";
+import { clearCodexMemberPermissions, readCodexMemberPermissions, validateCodexMemberPermissions, type CodexProfileObserver } from "./codex-member-permissions.js";
+import { parseTerminalPolicy, TerminalPolicyRefusal, TerminalPolicyStore, type TerminalAction } from "./terminal-policy.js";
 import type { NativeProcessLister } from "./native-process-lineage.js";
 import type { CurrentModelReader } from "./model-divergence/current-model-reader.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
 import type { EventBus } from "./event-bus.js";
-import type { TmuxAdapter, SessionProbe } from "../adapters/tmux.js";
+import type { TmuxAdapter, SessionProbe, StopPhase } from "../adapters/tmux.js";
 import { shellQuote } from "../adapters/shell-quote.js";
 import { EFFORT_SHAPE, piThinkingValue } from "../adapters/pi-runner-protocol.js";
 import type { NodeInventoryEntry, PersistedEvent } from "./types.js";
@@ -36,7 +39,7 @@ import {
   type EffortResolution, type NativeEffortObservation,
 } from "./seat-effort.js";
 import {
-  claudeCommandSessionToken, codexCommandResumeToken, observeClaudePaneRuntime, observeCodexPaneProcess, processArgv,
+  claudeCommandSessionToken, codexProcessArgv, codexProcessResumeToken, observeClaudePaneRuntime, observeCodexPaneProcess, processArgv,
 } from "./native-process-lineage.js";
 import { defaultInPlaceRestartIo } from "./seat-restart-in-place.js";
 import nodePath from "node:path";
@@ -46,6 +49,8 @@ import {
 } from "./seat-restart-in-place.js";
 import { CommunityHarnessRuntimeAdapter, seatAdapter } from "../adapters/community-harness-runtime-adapter.js";
 import { sessionCommunityHarnessSelect } from "./session-registry.js";
+import { seatLaunchAdditionsReport } from "./seat-launch-additions.js";
+import { seatSkillPaths } from "./seat-skill-storage.js";
 
 /**
  * S5 (OPR.0.5.4.7) — the seat-lifecycle verb surface: set-model, single-seat stop,
@@ -94,9 +99,14 @@ interface ResolvedSeat {
   nodeId: string;
 }
 
+/** Setting writes can address either a legacy seat name or one immutable node ID. */
+export type SeatSettingTarget = { seatRef: string; nodeId?: never } | { nodeId: string; seatRef?: never };
+
 export interface SeatRefusal {
   ok: false;
   code:
+    | "terminal_policy_refused"
+    | "terminal_policy_unavailable"
     | "seat_ref_required"
     | "seat_not_found"
     | "seat_ambiguous"
@@ -132,7 +142,12 @@ export interface SeatRefusal {
     | "invalid_effort"
     | "effort_unsupported_runtime"
     | "effort_unavailable"
-    | "invalid_policy";
+    | "invalid_policy"
+    | "invalid_stop_precondition"
+    | "guard_unavailable"
+    | "guard_target_changed"
+    | "selection_changed"
+    | "stop_uncertain";
   message: string;
   guidance?: string;
   matches?: Array<{ rig_name: string; logical_id: string; current_occupant: string | null }>;
@@ -212,7 +227,19 @@ export type SetEffortResult =
 
 export type StopSeatResult =
   | { ok: true; seat: SeatDescriptor; sessionName: string; sessionId: string }
-  | SeatRefusal;
+  | (SeatRefusal & { partialEffect?: boolean; stopPhase?: StopPhase });
+
+/** The narrow identity reviewed before an optional checked stop. */
+export interface StopPrecondition { nodeId: string; sessionId: string | null }
+
+/** Reject malformed explicit values so they never fall through to an unchecked stop. */
+function validStopPrecondition(value: unknown): value is StopPrecondition {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return Object.keys(record).sort().join(",") === "nodeId,sessionId"
+    && typeof record.nodeId === "string" && !!record.nodeId.trim()
+    && (record.sessionId === null || typeof record.sessionId === "string" && !!record.sessionId.trim());
+}
 
 export type CleanSeatResult =
   | { ok: true; seat: SeatDescriptor; actions: { sessionsExited: string[]; bindingCleared: boolean } }
@@ -228,6 +255,7 @@ export type LaunchFreshResult =
       generation: string;
       model: string | null;
       effort?: string | null;
+      advisor?: string | null;
       startupPolicyHash: string;
       supersededSessionIds: string[];
       warnings?: string[];
@@ -255,7 +283,7 @@ interface PersistedStartupContextRow {
   runtime: string | null;
 }
 
-interface ParsedStartupContext {
+export interface ParsedStartupContext {
   plan: ProjectionPlan;
   resolvedStartupFiles: ResolvedStartupFile[];
   startupActions: StartupAction[];
@@ -303,13 +331,55 @@ export class SeatLifecycleService {
     this.piRecords = deps.piRecords ?? null;
   }
 
-  async setModel(input: { seatRef: string; model: string; reason: string; operator?: string | null }): Promise<SetModelResult> {
+  private terminalPolicyCheck(nodeId: string, action: TerminalAction, operator?: string | null) {
+    try {
+      const decision = new TerminalPolicyStore(this.db).check(nodeId, action, { source: "caller", session: operator ?? null });
+      return { ok: true as const, ...decision };
+    } catch (error) {
+      const refusal: SeatRefusal = { ok: false, code: error instanceof TerminalPolicyRefusal ? "terminal_policy_refused" : "terminal_policy_unavailable",
+        message: (error as Error).message,
+        ...(error instanceof TerminalPolicyRefusal ? { actorClass: error.actorClass } : {}) };
+      return refusal;
+    }
+  }
+
+  setTerminalPolicy(input: { seatRef: string; preset: unknown; helpers?: unknown; exceptions?: unknown;
+    reason: string; actor: string; rigDefault?: boolean }) {
+    const required = this.requireReason(input.reason);
+    if (required) return required;
+    if (!input.actor.trim()) return { ok: false as const, code: "actor_required", message: "Supply the caller identity or --operator for the audit." };
+    const resolved = this.resolveSeat(input.seatRef);
+    if ("code" in resolved) return resolved;
+    let config: ReturnType<typeof parseTerminalPolicy>;
+    try { config = parseTerminalPolicy(input); }
+    catch (error) { return { ok: false as const, code: "invalid_terminal_policy", message: (error as Error).message }; }
+    try {
+      const store = new TerminalPolicyStore(this.db);
+      const seat = this.describe(resolved);
+      let persisted: PersistedEvent | null = null;
+      this.db.transaction(() => {
+        store.write(seat.nodeId, config, input.actor.trim(), input.reason.trim(), input.rigDefault);
+        persisted = this.eventBus.persistWithinTransaction({ type: "node.terminal_policy_changed", rigId: seat.rigId,
+          nodeId: seat.nodeId, scope: input.rigDefault ? "rig_default" : "seat", config,
+          actor: input.actor.trim(), reason: input.reason.trim() });
+      })();
+      if (persisted) this.eventBus.notifySubscribers(persisted);
+      return { ok: true as const, seat, config,
+        effect: input.rigDefault ? "Saved for newly added seats in this rig only; existing seats are unchanged."
+          : "Saved for managed compaction and future saved model/effort changes. No input, relaunch, native permission or interruption-level change.",
+        account: store.account(seat.nodeId, resolved.entry.runtime ?? null) };
+    } catch (error) {
+      return { ok: false as const, code: "terminal_policy_unavailable" as const, message: (error as Error).message };
+    }
+  }
+
+  async setModel(input: SeatSettingTarget & { model: string; reason: string; operator?: string | null }): Promise<SetModelResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
     if (!input.model?.trim()) {
       return { ok: false, code: "missing_model", message: "A target model id is required (--model)." };
     }
-    const resolved = this.resolveSeat(input.seatRef);
+    const resolved = this.resolveSettingTarget(input);
     if ("code" in resolved) return resolved;
 
     const model = input.model.trim();
@@ -322,9 +392,12 @@ export class SeatLifecycleService {
 
     let persisted: PersistedEvent | null = null;
     const tx = this.db.transaction(() => {
+      const decision = this.terminalPolicyCheck(seat.nodeId, "model", input.operator);
+      if (!decision.ok) return decision;
       this.rigRepo.setNodeModel(resolved.nodeId, model);
       persisted = this.eventBus.persistWithinTransaction({
         type: "node.model_changed",
+        actorClass: decision.actorClass,
         rigId: seat.rigId,
         nodeId: seat.nodeId,
         logicalId: seat.logicalId,
@@ -334,7 +407,8 @@ export class SeatLifecycleService {
         operator: input.operator ?? null,
       });
     });
-    tx();
+    const refused = tx();
+    if (refused) return refused;
     if (persisted) this.eventBus.notifySubscribers(persisted);
 
     return { ok: true, seat, from, to: model, changed: true };
@@ -391,7 +465,7 @@ export class SeatLifecycleService {
       if (!file.appliesOn.includes("fresh_start") || file.deliveryHint === "send_text") continue;
       try {
         const hint = file.deliveryHint === "auto"
-          ? resolveConcreteHint(file.path, fs.readFileSync(file.absolutePath, "utf8")) : file.deliveryHint;
+          ? resolveConcreteHint(file.path, fs.readFileSync(file.absolutePath, "utf8"), file.orientation) : file.deliveryHint;
         if (hint !== "send_text") files.push({ ...file, deliveryHint: hint });
       } catch (error) {
         const detail = `Startup file ${file.path}: ${(error as Error).message}`;
@@ -450,7 +524,7 @@ export class SeatLifecycleService {
   /** OPR.0.7.0.7 — save one seat's effort for its next managed continuation. Like set-model it
    *  validates, writes, and persists an audited event in the same transaction; it never restarts
    *  the seat or touches its peers, model or account. `effort: null` clears the explicit choice. */
-  async setEffort(input: { seatRef: string; effort: string | null; reason: string; operator?: string | null }): Promise<SetEffortResult> {
+  async setEffort(input: SeatSettingTarget & { effort: string | null; reason: string; operator?: string | null }): Promise<SetEffortResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
     const requested = input.effort === null ? null : input.effort.trim();
@@ -461,12 +535,12 @@ export class SeatLifecycleService {
         return { ok: false, code: "invalid_effort", message: `"${requested}" isn't an effort level: use the runtime's level name, such as low, medium or high.` };
       }
     }
-    const resolved = this.resolveSeat(input.seatRef);
+    const resolved = this.resolveSettingTarget(input);
     if ("code" in resolved) return resolved;
     const seat = this.describe(resolved);
     const runtime = resolved.entry.runtime ?? "unknown";
     if (runtime !== "claude-code" && runtime !== "codex" && runtime !== "pi") {
-      return { ok: false, code: "effort_unsupported_runtime", message: `Seat "${input.seatRef}" runs ${runtime}; reasoning effort applies to claude-code, codex and pi seats only.` };
+      return { ok: false, code: "effort_unsupported_runtime", message: `Seat "${this.settingTargetLabel(input)}" runs ${runtime}; reasoning effort applies to claude-code, codex and pi seats only.` };
     }
 
     const from = this.readEffort(seat.nodeId);
@@ -476,11 +550,14 @@ export class SeatLifecycleService {
     let changed = false;
     if (from.choice !== requested) {
       let persisted: PersistedEvent | null = null;
-      this.db.transaction(() => {
+      const refused = this.db.transaction(() => {
+        const decision = this.terminalPolicyCheck(seat.nodeId, "model", input.operator);
+        if (!decision.ok) return decision;
         if (!this.rigRepo.setNodeEffortChoice(seat.nodeId, requested)) return;
         changed = true;
         persisted = this.eventBus.persistWithinTransaction({
           type: "node.effort_changed",
+          actorClass: decision.actorClass,
           rigId: seat.rigId,
           nodeId: seat.nodeId,
           logicalId: seat.logicalId,
@@ -490,9 +567,10 @@ export class SeatLifecycleService {
           operator: input.operator ?? null,
         });
       })();
+      if (refused) return refused;
       if (persisted) this.eventBus.notifySubscribers(persisted);
       if (!changed) {
-        return { ok: false, code: "effort_unavailable", message: `The effort choice for seat "${input.seatRef}" was not saved (no node row was updated); nothing changed.` };
+        return { ok: false, code: "effort_unavailable", message: `The effort choice for seat "${this.settingTargetLabel(input)}" was not saved (no node row was updated); nothing changed.` };
       }
     }
     const saved = this.readEffort(seat.nodeId) ?? from;
@@ -537,19 +615,26 @@ export class SeatLifecycleService {
       ({ emitted, observed } = await this.piEffort(seat.nodeId, session.session_name, saved));
     } else {
       const observe = runtime === "claude-code" ? observeClaudePaneRuntime : observeCodexPaneProcess;
-      const process = (await observe({ target, tmux: this.tmuxAdapter, ...(this.listProcesses ? { listProcesses: this.listProcesses } : {}) }))?.process;
+      const process = (await observe({ target, tmux: this.tmuxAdapter, ...(runtime === "codex" ? { requireArgv: true } : {}),
+        ...(this.listProcesses ? { listProcesses: this.listProcesses } : {}) }))?.process;
       if (!process) {
         emitted = { state: "unknown", detail: `No single ${runtime === "claude-code" ? "Claude" : "Codex"} process could be read in the seat's pane.` };
         observed = { state: "not_verified", detail: "The running process could not be read, so no turn can be tied to its launch." };
       } else {
-        const flag = emittedEffortFromArgv(runtime, processArgv(process.command));
-        const value = flag.flag === "present" ? flag.value : null;
-        emitted = { state: "observed", value, pid: process.pid, startedAt: process.startedAt ?? null, matchesSaved: value === saved.effective };
-        // Native effort is attributed only from the transcript of the conversation this process is on.
-        const joined = await this.joinedTranscript(runtime, session, process);
-        const native = "detail" in joined ? { state: "not_verified" as const, detail: joined.detail }
-          : readNativeEffort(runtime, joined.path, process.startedAt ?? null);
-        observed = native.state === "observed" ? { ...native, matchesEmitted: native.value === value } : native;
+        const argv = runtime === "codex" ? codexProcessArgv(process) : processArgv(process.command);
+        if (!argv) {
+          emitted = { state: "unknown", detail: "The running Codex's exact arguments could not be read, so its launch effort is unknown." };
+          observed = { state: "not_verified", detail: "The running Codex's exact arguments could not be read, so no native turn can be tied to its launch." };
+        } else {
+          const flag = emittedEffortFromArgv(runtime, argv);
+          const value = flag.flag === "present" ? flag.value : null;
+          emitted = { state: "observed", value, pid: process.pid, startedAt: process.startedAt ?? null, matchesSaved: value === saved.effective };
+          // Native effort is attributed only from the transcript of the conversation this process is on.
+          const joined = await this.joinedTranscript(runtime, session, process);
+          const native = "detail" in joined ? { state: "not_verified" as const, detail: joined.detail }
+            : readNativeEffort(runtime, joined.path, process.startedAt ?? null);
+          observed = native.state === "observed" ? { ...native, matchesEmitted: native.value === value } : native;
+        }
       }
     }
     return { ok: true, seat, runtime, requested, saved, emitted, observed, precedence, summary: effortSummary(saved, emitted, observed, runtime) };
@@ -618,7 +703,7 @@ export class SeatLifecycleService {
   /** The transcript of the conversation the observed process is on, or why that join can't be made.
    *  The recorded conversation (Codex: the session's resume token; Claude: the status sidecar's session)
    *  must be the one the process itself names, by argv or, for a Codex that names none, by its own logs. */
-  private async joinedTranscript(runtime: "claude-code" | "codex", session: LatestSessionRow, process: { pid: number; command: string; startedAt?: string }):
+  private async joinedTranscript(runtime: "claude-code" | "codex", session: LatestSessionRow, process: { pid: number; command: string; argv?: string[] | null; startedAt?: string }):
     Promise<{ path: string | null } | { detail: string }> {
     if (!this.transcripts) return { detail: "The native transcript for this session isn't known to OpenRig." };
     const mismatch = "The process in the pane isn't on the conversation recorded for this seat (or its conversation couldn't be read), so no native turn can be attributed to it.";
@@ -626,7 +711,7 @@ export class SeatLifecycleService {
       if (runtime === "codex") {
         const recorded = this.sessionResumeToken(session.id);
         if (!recorded) return { detail: "No Codex conversation is recorded for this session yet." };
-        let own = codexCommandResumeToken(process.command) ?? undefined;
+        let own = codexProcessResumeToken(process) ?? undefined;
         if (own === undefined && process.startedAt) {
           const io = { ...defaultInPlaceRestartIo(), ...this.inPlaceRestartIo };
           const facts = await io.readProcess(process.pid);
@@ -672,40 +757,83 @@ export class SeatLifecycleService {
     return probe.state === "present" ? { state: "yes" } : { state: "no", detail: "tmux session absent" };
   }
 
-  async setPermissions(input: { seatRef: string; mode: string; reason: string; actor: string }): Promise<
-    | { ok: true; seat: SeatDescriptor; from: unknown; to: unknown; changed: boolean; effect: string }
+  async setPermissions(input: SeatSettingTarget & { mode?: string; rules?: unknown; codexPermissions?: unknown; codexProfile?: string; reason: string; actor: string }): Promise<
+    | { ok: true; seat: SeatDescriptor; from: unknown; to: unknown; changed: boolean; effect: string; replaced?: unknown; observation?: unknown }
     | SeatRefusal
   > {
     input = { ...input };
     const required = this.requireReason(input.reason);
     if (required) return required;
     if (!input.actor.trim()) return { ok: false, code: "permission_selection_refused", message: "Sender identity is required for permission audit." };
-    const resolved = this.resolveSeat(input.seatRef);
+    const resolved = this.resolveSettingTarget(input);
     if ("code" in resolved) return resolved;
     const seat = this.describe(resolved);
     const runtime = resolved.entry.runtime ?? "unknown";
+    const choices = [input.mode, input.rules, input.codexPermissions, input.codexProfile].filter(value => value !== undefined).length;
+    if (choices !== 1) return { ok: false, code: "permission_selection_refused", message: "Choose exactly one of mode, rules, codex permissions or codex profile." };
+    if (input.codexPermissions !== undefined) return this.setCodexPermissions(seat, runtime, input.codexPermissions, input.actor.trim(), input.reason.trim());
+    if (input.codexProfile !== undefined) return this.setCodexProfile(seat, runtime, input.codexProfile, resolved.entry.cwd ?? undefined,
+      input.actor.trim(), input.reason.trim(), input.nodeId !== undefined);
+    if (input.rules !== undefined) {
+      if (runtime !== "claude-code") return { ok: false, code: "permission_selection_refused", message: "claude_permissions is only supported for claude-code seats." };
+      try {
+        const to = validateClaudePermissionRules(input.rules);
+        let persisted: PersistedEvent | null = null;
+        const result = this.db.transaction(() => {
+          // Read the current record for the audit; malformed old bytes stay visible as such and can be repaired.
+          const row = this.db.prepare("SELECT claude_permissions_json FROM nodes WHERE id = ? AND runtime = 'claude-code'").get(seat.nodeId) as { claude_permissions_json: string | null } | undefined;
+          if (!row) throw new Error("Seat runtime changed; rules were not changed.");
+          let from: unknown = null;
+          try { from = readClaudePermissionRules(this.db, seat.nodeId) ?? null; }
+          catch { from = { state: "invalid", stored: row.claude_permissions_json }; }
+          const changed = JSON.stringify(from) !== JSON.stringify(to);
+          if (changed) {
+            this.db.prepare("UPDATE nodes SET claude_permissions_json = ? WHERE id = ?").run(JSON.stringify(to), seat.nodeId);
+            persisted = this.eventBus.persistWithinTransaction({ type: "node.permission_rules_changed", rigId: seat.rigId,
+              nodeId: seat.nodeId, from, to, actor: input.actor.trim(), reason: input.reason.trim(), effect: "future_launches_only" });
+          }
+          return { ok: true as const, seat, from, to, changed,
+            effect: "Rules apply at the next separately authorized managed launch or resume. The current process, permission mode and history are unchanged. Older readers may ignore these rules; check rollback compatibility and preserve restrictions before downgrading." };
+        })();
+        if (persisted) this.eventBus.notifySubscribers(persisted);
+        return result;
+      } catch (error) { return { ok: false, code: "permission_selection_refused", message: (error as Error).message }; }
+    }
+    const mode = input.mode!;
     try {
-      const dynamic = runtime === "claude-code" && !["floor", "full_bypass", "inherit"].includes(input.mode);
+      const dynamic = runtime === "claude-code" && !["floor", "full_bypass", "inherit"].includes(mode);
       const managed = this.runtimeAdapters["claude-code"]?.claudeManagedLaunch;
       if (dynamic && !managed) await unresolvedClaudePermissionModes();
-      const launch = dynamic ? await managed!.prepare({ nodeId: seat.nodeId, cwd: resolved.entry.cwd ?? undefined }, input.mode) : null;
-      const to = input.mode === "inherit" ? null : dynamic ? { runtime: "claude-code" as const, mode: input.mode }
-        : validateNativePermissionSelection(runtime, input.mode);
+      const launch = dynamic ? await managed!.prepare({ nodeId: seat.nodeId, cwd: resolved.entry.cwd ?? undefined }, mode) : null;
+      const to = mode === "inherit" ? null : dynamic ? { runtime: "claude-code" as const, mode: mode }
+        : validateNativePermissionSelection(runtime, mode);
       const store = new NativePermissionStore(this.db);
       let persisted: PersistedEvent | null = null;
       const result = this.db.transaction(() => {
+        if (dynamic && input.nodeId !== undefined) {
+          // Claude preparation awaits; an exact node target must still belong to an active rig.
+          const available = this.db.prepare(`SELECT 1 FROM nodes n JOIN rigs r ON r.id = n.rig_id
+            WHERE n.id = ? AND r.archived_at IS NULL`).get(seat.nodeId);
+          if (!available) return { ok: false as const, code: "seat_not_found" as const,
+            message: `Node "${seat.nodeId}" no longer exists in an active rig.`, guidance: SEAT_LOOKUP_GUIDANCE };
+        }
         launch?.assertCurrent();
         const currentRuntime = this.db.prepare("SELECT runtime FROM nodes WHERE id = ?").get(seat.nodeId) as { runtime: string } | undefined;
         if (currentRuntime?.runtime !== runtime) throw new Error("Seat runtime changed while checking native options; selection was not changed.");
         const from = store.read(seat.nodeId);
-        const changed = from?.runtime !== to?.runtime || from?.mode !== to?.mode;
-        if (changed) {
+        // One explicit Codex choice: a mode replaces the seat's envelope, in this same write, and says so.
+        const replaced = runtime === "codex" ? clearCodexMemberPermissions(this.db, seat.nodeId) : undefined;
+        const changed = from?.runtime !== to?.runtime || from?.mode !== to?.mode || replaced !== undefined;
+        // A Codex re-selection is intent for its next rebuild, even when the saved value is
+        // unchanged. Audit inherit too: a cleared selection has no row to carry its timestamp.
+        if (changed || runtime === "codex") {
           store.write(seat.nodeId, to, input.actor.trim(), input.reason.trim());
           persisted = this.eventBus.persistWithinTransaction({ type: "node.permissions_changed", rigId: seat.rigId,
-            nodeId: seat.nodeId, from, to, actor: input.actor.trim(), reason: input.reason.trim(), source: "seat_selection", effect: "future_launches_only" });
+            nodeId: seat.nodeId, from, to, actor: input.actor.trim(), reason: input.reason.trim(), source: "seat_selection", effect: "future_launches_only",
+            ...(replaced !== undefined ? { replaced: { codexPermissions: replaced } } : {}) });
         }
-        return { ok: true as const, seat, from, to, changed,
-          effect: "Future managed launches only. The current native process, history, permission rules and work posture are unchanged; no relaunch was requested." };
+        return { ok: true as const, seat, from, to, changed, ...(replaced !== undefined ? { replaced: { codexPermissions: replaced } } : {}),
+          effect: `Future managed launches only.${replaced !== undefined ? " This mode replaces the seat's Codex permission envelope." : ""} The current native process, history, permission rules and work posture are unchanged; no relaunch was requested.` };
       })();
       if (persisted) this.eventBus.notifySubscribers(persisted);
       return result;
@@ -714,12 +842,102 @@ export class SeatLifecycleService {
     }
   }
 
+  /** A Codex seat's envelope: its explicit permission choice, which replaces a recorded mode in the same write. */
+  private setCodexPermissions(seat: SeatDescriptor, runtime: string, value: unknown, actor: string, reason: string):
+    { ok: true; seat: SeatDescriptor; from: unknown; to: unknown; changed: boolean; effect: string; replaced?: unknown } | SeatRefusal {
+    if (runtime !== "codex") return { ok: false, code: "permission_selection_refused", message: "codex_permissions is only supported for codex seats." };
+    try {
+      const to = validateCodexMemberPermissions(value);
+      const store = new NativePermissionStore(this.db);
+      let persisted: PersistedEvent | null = null;
+      const result = this.db.transaction(() => {
+        // Read the current record for the audit; malformed old bytes stay visible as such and are replaced.
+        const row = this.db.prepare("SELECT codex_permissions_json FROM nodes WHERE id = ? AND runtime = 'codex'").get(seat.nodeId) as { codex_permissions_json: string | null } | undefined;
+        if (!row) throw new Error("Seat runtime changed; the envelope was not changed.");
+        let from: unknown = null;
+        try { from = readCodexMemberPermissions(this.db, seat.nodeId) ?? null; }
+        catch { from = { state: "invalid", stored: row.codex_permissions_json }; }
+        let mode: unknown = null;
+        try { mode = store.read(seat.nodeId); }
+        catch { mode = { state: "invalid" }; }
+        const replaced = mode ? { mode } : undefined;
+        const changed = JSON.stringify(from) !== JSON.stringify(to) || replaced !== undefined;
+        if (changed) {
+          this.db.prepare("UPDATE nodes SET codex_permissions_json = ? WHERE id = ?").run(JSON.stringify(to), seat.nodeId);
+          if (replaced) store.write(seat.nodeId, null, actor, reason);
+          persisted = this.eventBus.persistWithinTransaction({ type: "node.codex_permissions_changed", rigId: seat.rigId,
+            nodeId: seat.nodeId, from, to, ...(replaced ? { replaced } : {}), actor, reason, effect: "future_launches_only" });
+        }
+        return { ok: true as const, seat, from, to, changed, ...(replaced ? { replaced } : {}),
+          effect: `The envelope applies at the next separately authorized managed launch or resume, as explicit sandbox and approval flags that a profile or policy posture doesn't override.${replaced ? " It replaces the seat's recorded permission mode." : ""} The current process and history are unchanged. Older readers may ignore it; check rollback compatibility and preserve restrictions before downgrading.` };
+      })();
+      if (persisted) this.eventBus.notifySubscribers(persisted);
+      return result;
+    } catch (error) { return { ok: false, code: "permission_selection_refused", message: (error as Error).message }; }
+  }
+
+  /** A Codex seat's named profile. It doesn't replace a retained conversation's approval; an envelope does. The check
+   *  speaks only for the config home this seat's launches use, and a real load failure keeps the previous profile. */
+  private async setCodexProfile(seat: SeatDescriptor, runtime: string, value: string, cwd: string | undefined, actor: string, reason: string,
+    exactNodeTarget: boolean):
+    Promise<{ ok: true; seat: SeatDescriptor; from: unknown; to: unknown; changed: boolean; effect: string; observation?: unknown } | SeatRefusal> {
+    if (runtime !== "codex") return { ok: false, code: "permission_selection_refused", message: "A Codex profile is only supported for codex seats." };
+    const name = value.trim();
+    const to = name === "inherit" ? null : name;
+    if (to !== null && !/^[A-Za-z0-9_.-]+$/.test(to)) {
+      return { ok: false, code: "permission_selection_refused", message: "A Codex profile name uses letters, digits, '.', '_' and '-'; use inherit to clear it." };
+    }
+    const observer = this.runtimeAdapters["codex"] as unknown as Partial<CodexProfileObserver> | undefined;
+    // The check is evidence: if it fails unexpectedly, record that instead of failing the request.
+    const checksProfile = to !== null && cwd && observer?.observeProfile;
+    const observed = checksProfile
+      ? await observer!.observeProfile!(to, cwd, seat.nodeId).catch((error: unknown) => ({ vantage: "unestablished" as const, home: null, file: "unverified" as const,
+        load: "not_run" as const, detail: `The profile check couldn't run (${(error as Error).message}); each launch runs the native check.`, observedAt: new Date().toISOString() }))
+      : undefined;
+    if (observed?.load === "failed") {
+      return { ok: false, code: "permission_selection_refused", message: `Codex profile not changed: ${observed.detail}` };
+    }
+    try {
+      let persisted: PersistedEvent | null = null;
+      const result = this.db.transaction(() => {
+        if (exactNodeTarget && checksProfile) {
+          const available = this.db.prepare(`SELECT 1 FROM nodes n JOIN rigs r ON r.id = n.rig_id
+            WHERE n.id = ? AND r.archived_at IS NULL`).get(seat.nodeId);
+          if (!available) return { ok: false as const, code: "seat_not_found" as const,
+            message: `Node "${seat.nodeId}" no longer exists in an active rig.`, guidance: SEAT_LOOKUP_GUIDANCE };
+        }
+        const row = this.db.prepare("SELECT codex_config_profile FROM nodes WHERE id = ? AND runtime = 'codex'").get(seat.nodeId) as { codex_config_profile: string | null } | undefined;
+        if (!row) throw new Error("Seat runtime changed; the profile was not changed.");
+        const from = row.codex_config_profile;
+        // Re-recording the same profile compares its bytes with the last recorded observation, in the same home.
+        const last = this.db.prepare("SELECT payload FROM events WHERE node_id = ? AND type = 'node.codex_profile_changed' ORDER BY seq DESC LIMIT 1").get(seat.nodeId) as { payload: string } | undefined;
+        const lastObserved = last ? (JSON.parse(last.payload) as { to?: string | null; observation?: { home?: string | null; sha256?: string; file?: string } }) : undefined;
+        // Only two readings of the file (present or absent) compare; an unread or unverified one says nothing.
+        const read = (file: string | undefined) => file === "present" || file === "absent";
+        const fileChanged = observed?.vantage === "configured_codex_home" && lastObserved?.to === to && lastObserved.observation?.home === observed.home
+          && read(lastObserved.observation.file) && read(observed.file)
+          && (lastObserved.observation.file !== observed.file || lastObserved.observation.sha256 !== observed.sha256);
+        const observation = observed ? { ...observed, ...(fileChanged ? { changedSinceRecorded: true } : {}) } : undefined;
+        const changed = from !== to;
+        if (changed || observation) {
+          this.db.prepare("UPDATE nodes SET codex_config_profile = ? WHERE id = ?").run(to, seat.nodeId);
+          persisted = this.eventBus.persistWithinTransaction({ type: "node.codex_profile_changed", rigId: seat.rigId,
+            nodeId: seat.nodeId, from, to, ...(observation ? { observation } : {}), actor, reason, effect: "future_launches_only" });
+        }
+        return { ok: true as const, seat, from, to, changed, ...(observation ? { observation } : {}),
+          effect: "The profile applies at the next separately authorized managed launch or resume. A retained conversation keeps its saved approval unless an envelope sets one. The current process and history are unchanged." };
+      })();
+      if (persisted) this.eventBus.notifySubscribers(persisted);
+      return result;
+    } catch (error) { return { ok: false, code: "permission_selection_refused", message: (error as Error).message }; }
+  }
+
   /** `rig policy apply <name> --seat`: re-point an existing seat's own permission_policy. This writes
    *  the raw ref and the provenance the instantiator would persist for the same member ref; restore,
    *  resume and launches that read the seat's stored state use that provenance, while a launch from a
    *  spec that declares a policy re-applies the spec's. The ref is validated exactly as a spec
    *  member's is; the running process is untouched. */
-  async setPolicy(input: { seatRef: string; ref: string; reason: string; actor: string }): Promise<SetPolicyResult> {
+  async setPolicy(input: SeatSettingTarget & { ref: string; reason: string; actor: string }): Promise<SetPolicyResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
     const invalid = validatePermissionPolicyRef(input.ref, "permission_policy");
@@ -734,7 +952,7 @@ export class SeatLifecycleService {
         guidance: "Use builtin:<name> or none here, or declare the custom ref in the rig spec.",
       };
     }
-    const resolved = this.resolveSeat(input.seatRef);
+    const resolved = this.resolveSettingTarget(input);
     if ("code" in resolved) return resolved;
     const seat = this.describe(resolved);
     if (resolved.entry.runtime === "terminal") {
@@ -752,7 +970,8 @@ export class SeatLifecycleService {
     const before = this.rigRepo.getNodePolicyProvenance(seat.nodeId);
     const changed = from !== ref || !before || before.origin !== provenance.origin || before.resolvedTarget !== provenance.resolvedTarget
       || before.declaringDir !== provenance.declaringDir || before.launchPosture !== provenance.launchPosture;
-    if (changed) {
+    // Reaffirming the same Codex policy is also a deliberate choice for the next rebuild.
+    if (changed || resolved.entry.runtime === "codex") {
       let persisted: PersistedEvent | null = null;
       this.db.transaction(() => {
         this.rigRepo.setNodePermissionPolicy(seat.nodeId, ref);
@@ -774,9 +993,21 @@ export class SeatLifecycleService {
     return { ok: true, seat, from, to: ref, launchPosture: attachment.launchPosture, changed, effect };
   }
 
-  async stopSeat(input: { seatRef: string; reason: string; operator?: string | null }): Promise<StopSeatResult> {
+  /** Read the current node and latest session without changing seat state. */
+  stopPrecondition(seatRef: string): { contract: "seat-stop.v1"; expected: StopPrecondition } | SeatRefusal {
+    const resolved = this.resolveSeat(seatRef);
+    if ("code" in resolved) return resolved;
+    return { contract: "seat-stop.v1", expected: { nodeId: resolved.nodeId, sessionId: this.latestSession(resolved.nodeId)?.id ?? null } };
+  }
+
+  /** Stop one managed seat; an explicit expected tuple activates strict identity checks. */
+  async stopSeat(input: { seatRef: string; reason: string; operator?: string | null; expected?: unknown }): Promise<StopSeatResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
+    if ("expected" in input) {
+      if (!validStopPrecondition(input.expected)) return { ok: false, code: "invalid_stop_precondition", message: "expected must contain a nonempty nodeId and a nonempty sessionId or null." };
+      return this.stopSeatChecked(input, input.expected);
+    }
     const resolved = this.resolveSeat(input.seatRef);
     if ("code" in resolved) return resolved;
     const guard = this.tmuxAdapter.deliveryGuard;
@@ -813,6 +1044,48 @@ export class SeatLifecycleService {
     }
 
     return this.stopManagedTmuxSeat(resolved, session, input.reason, input.operator, true);
+  }
+
+  /** Hold the existing lifecycle lease from selection validation through terminal and DB effects. */
+  private async stopSeatChecked(
+    input: { seatRef: string; reason: string; operator?: string | null }, expected: StopPrecondition,
+  ): Promise<StopSeatResult> {
+    const guard = this.tmuxAdapter.deliveryGuard;
+    if (!guard) return { ok: false, code: "guard_unavailable", message: "Checked stop requires the delivery guard." };
+    const selection = (): SeatRefusal | null => {
+      const current = this.resolveSeat(input.seatRef);
+      if ("code" in current || current.nodeId !== expected.nodeId || (this.latestSession(current.nodeId)?.id ?? null) !== expected.sessionId) {
+        return { ok: false, code: "selection_changed", message: "The selected seat or latest session changed; review the stop precondition again." };
+      }
+      return null;
+    };
+    const initial = selection();
+    if (initial) return initial;
+    if (expected.sessionId === null) return { ok: false, code: "no_session", message: "The selected seat has no session to stop." };
+    try {
+      return await guard.lifecycle([expected.nodeId], async () => {
+        const stale = selection();
+        if (stale) return stale;
+        guard.checkInput(expected.nodeId);
+        const resolved = this.resolveSeat(input.seatRef);
+        if ("code" in resolved) return { ok: false, code: "selection_changed", message: "The selected seat changed." };
+        const seat = this.describe(resolved);
+        const session = this.latestSession(resolved.nodeId)!;
+        if (session.origin === "claimed") return { ok: false, code: "claimed_session", message: `Session "${session.session_name}" was adopted (origin=claimed), not launched by OpenRig — stop refuses to kill it.`, guidance: "Release an adopted session with: rig unclaim" };
+        const probed = await this.probeLiveness(session.session_name, "stop refuses rather than kill blind");
+        if ("code" in probed) return probed;
+        const afterProbe = selection();
+        if (afterProbe) return afterProbe;
+        guard.checkInput(resolved.nodeId);
+        if (probed.state === "absent") return { ok: false, code: "session_not_live", message: `Session "${session.session_name}" is absent in tmux; there is nothing to stop.`, guidance: "A dead seat with stale records is returned to launchable with: rig seat clean" };
+        return this.stopManagedTmuxSeat(resolved, session, input.reason, input.operator, true, { selection, guard });
+      });
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      return { ok: false, code: code === "guard_target_changed" || code === "guard_target_unknown" ? "selection_changed"
+        : code === "typing_guard_enabled" || code === "draft_aware_lifecycle" ? "typing_guard_enabled" : "tmux_probe_failed",
+      message: (error as Error).message };
+    }
   }
 
   async cleanSeat(input: { seatRef: string; reason: string; operator?: string | null }): Promise<CleanSeatResult> {
@@ -942,7 +1215,7 @@ export class SeatLifecycleService {
       || !this.stillPending(node.id, session.id, pending)) return { ok: false as const, code: "continuation_unavailable", message: "Startup changed during the readiness check. Refresh." };
     const result = await this.startupOrchestrator.startNode({
       rigId: seat.rigId, nodeId: node.id, sessionId: session.id,
-      binding: { ...binding, cwd: node.cwd ?? ".", model: node.model ?? undefined, effort: resolveSeatEffort(node).effective ?? undefined, codexConfigProfile: node.codexConfigProfile ?? undefined },
+      binding: { ...binding, cwd: node.cwd ?? ".", model: node.model ?? undefined, effort: resolveSeatEffort(node).effective ?? undefined, advisor: node.advisor ?? undefined, codexConfigProfile: node.codexConfigProfile ?? undefined },
       adapter, plan: startup.context.plan, resolvedStartupFiles: startup.context.resolvedStartupFiles,
       startupActions: startup.context.startupActions, isRestore: pending.mode === "fork" && pending.isRestore,
       sessionName: session.session_name, skipHarnessLaunch: true, continueFreshStartup: pending.mode === "fresh", includeDurableObligations: true, allowFreshFallback: false,
@@ -1138,6 +1411,9 @@ export class SeatLifecycleService {
       sessionName: canonicalSessionName, currentOccupant,
       stopRequired, wouldStop: blockers.length > 0 ? false : tmuxUnknown ? null : owned && input.stop === true,
       blockers, warnings, siblings,
+      // OPR.0.7.0.9: what this seat's launch passes of its own additions (null when none).
+      launchAdditions: node.runtime === "claude-code"
+        ? seatLaunchAdditionsReport(seatSkillPaths({ rigId: seat.rigId, logicalId: node.logicalId, runtime: "claude-code" })) : null,
       startup: { projectionCount: startup.plan.entries.length,
         fileCount: startup.resolvedStartupFiles.filter(f => f.appliesOn.includes("fresh_start")).length,
         actionCount: startup.startupActions.filter(a => a.appliesOn.includes("fresh_start")).length },
@@ -1186,6 +1462,7 @@ export class SeatLifecycleService {
     ).all(node.id) as Array<{ id: string }>).map((row) => row.id);
     const retiringGeneration = this.sessionRegistry.currentOccupantTenure(node.id)?.generationUuid ?? null;
 
+    const viewWarnings: string[] = [];
     let canonicalProbe = await this.probeLiveness(
       canonicalSessionName,
       "fresh launch refuses rather than overwrite a possibly-live canonical session",
@@ -1233,6 +1510,10 @@ export class SeatLifecycleService {
         false,
       );
       if (!stopped.ok) return stopped;
+      // Older open views still attach once. Keep recovery guidance for those
+      // views and replacements that outlast the new tile command's wait.
+      const view = shellQuote(`rig:${seat.rigName}`);
+      viewWarnings.push(`Replacing the tmux session for "${canonicalSessionName}" detaches its open terminal clients. New tiles wait up to 30 seconds for the same seat; for older views or a tile that closes, close and reopen the view: rig terminal open ${view} --window (Herdr or tmux), or rig terminal open ${view} --provider cmux.`);
       // Stopping the server's last session ends tmux's server, and every probe
       // below would then be transport_unavailable, never absence. Restore an
       // empty server (no session is invented; a no-op while the server is up)
@@ -1249,7 +1530,7 @@ export class SeatLifecycleService {
         reason: input.reason,
         operator: input.operator,
       });
-      if (!cleaned.ok) return cleaned;
+      if (!cleaned.ok) return { ...cleaned, warnings: viewWarnings };
     }
 
     // The stop/clean composition may have taken time; buy absence again at the
@@ -1258,11 +1539,12 @@ export class SeatLifecycleService {
       canonicalSessionName,
       "fresh launch refuses rather than race a canonical-session collision",
     );
-    if ("code" in finalProbe) return finalProbe;
+    if ("code" in finalProbe) return { ...finalProbe, warnings: viewWarnings };
     if (finalProbe.state === "present") {
       return {
         ok: false,
         code: "unmanaged_session_collision",
+        warnings: viewWarnings,
         message: `Canonical tmux session "${canonicalSessionName}" appeared before launch; refusing to overwrite it.`,
       };
     }
@@ -1281,7 +1563,7 @@ export class SeatLifecycleService {
       occupantKind: "fresh",
     });
     if (!launch.ok) {
-      return { ok: false, code: "launch_failed", message: launch.message };
+      return { ok: false, code: "launch_failed", message: launch.message, warnings: viewWarnings };
     }
     const observedGeneration = this.sessionRegistry.currentOccupantTenure(node.id)?.generationUuid ?? null;
     const generation = observedGeneration && observedGeneration !== retiringGeneration
@@ -1297,13 +1579,14 @@ export class SeatLifecycleService {
         startupPolicyHash: startup.hash,
         model: node.model,
         effort: resolveSeatEffort(node).effective,
+        advisor: node.advisor ?? null,
         reason: input.reason,
         operator: input.operator,
         errors: ["new occupant generation was not persisted"],
       });
       return compensation === "zero"
-        ? { ok: false, code: "startup_failed", status: "failed", message: "Fresh launch could not persist a new occupant generation; the new session was rolled back." }
-        : { ok: false, code: "attention_required", status: "attention_required", message: "Fresh launch could not persist a new occupant generation and the new process could not be confirmed stopped; the seat requires attention.", sessionName: canonicalSessionName, sessionId: launch.session.id };
+        ? { ok: false, code: "startup_failed", status: "failed", warnings: viewWarnings, message: "Fresh launch could not persist a new occupant generation; the new session was rolled back." }
+        : { ok: false, code: "attention_required", status: "attention_required", warnings: viewWarnings, message: "Fresh launch could not persist a new occupant generation and the new process could not be confirmed stopped; the seat requires attention.", sessionName: canonicalSessionName, sessionId: launch.session.id };
     }
     this.activityOracle?.declareOccupantSwap(node.id, generation);
 
@@ -1319,6 +1602,7 @@ export class SeatLifecycleService {
         cwd: node.cwd ?? ".",
         model: node.model ?? undefined,
         effort: resolveSeatEffort(node).effective ?? undefined,
+        advisor: node.advisor ?? undefined,
         codexConfigProfile: node.codexConfigProfile ?? undefined,
         launchPosture,
       },
@@ -1332,6 +1616,8 @@ export class SeatLifecycleService {
       allowFreshFallback: false,
     });
 
+    const warnings = viewWarnings.length ? [...(startupResult.warnings ?? []), ...viewWarnings] : startupResult.warnings;
+
     if (!startupResult.ok && startupResult.startupStatus === "failed") {
       const compensation = await this.compensateFailedFreshLaunch({
         seat,
@@ -1342,6 +1628,7 @@ export class SeatLifecycleService {
         startupPolicyHash: startup.hash,
         model: node.model,
         effort: resolveSeatEffort(node).effective,
+        advisor: node.advisor ?? null,
         reason: input.reason,
         operator: input.operator,
         errors: startupResult.errors,
@@ -1352,14 +1639,14 @@ export class SeatLifecycleService {
             code: "startup_failed",
             status: "failed",
             message: `Fresh startup failed and was rolled back to zero live session/binding: ${startupResult.errors.join("; ")}`,
-            warnings: startupResult.warnings,
+            warnings,
           }
         : {
             ok: false,
             code: "attention_required",
             status: "attention_required",
             message: `Fresh startup failed and the new process could not be confirmed stopped; the seat requires attention: ${startupResult.errors.join("; ")}`,
-            warnings: startupResult.warnings,
+            warnings,
             sessionName: canonicalSessionName,
             sessionId: launch.session.id,
             generation,
@@ -1405,6 +1692,7 @@ export class SeatLifecycleService {
         ...(nativeSessionId ? {} : { nativeSessionIdReason: "scrape_miss" }),
         model: node.model,
         effort: resolveSeatEffort(node).effective,
+        advisor: node.advisor ?? null,
         startupPolicyHash: startup.hash,
         reason: input.reason.trim(),
         operator: input.operator ?? null,
@@ -1425,7 +1713,7 @@ export class SeatLifecycleService {
         sessionName: canonicalSessionName,
         sessionId: launch.session.id,
         generation,
-        warnings: startupResult.warnings,
+        warnings,
       };
     }
 
@@ -1438,9 +1726,10 @@ export class SeatLifecycleService {
       generation,
       model: node.model,
       effort: resolveSeatEffort(node).effective ?? undefined,
+      advisor: node.advisor ?? undefined,
       startupPolicyHash: startup.hash,
       supersededSessionIds,
-      warnings: startupResult.warnings,
+      warnings,
     };
   }
 
@@ -1547,6 +1836,7 @@ export class SeatLifecycleService {
         ...(node.model ? { model: node.model } : {}),
         ...(savedEffort.effective ? { effort: savedEffort.effective } : {}),
         ...(node.codexConfigProfile ? { codexConfigProfile: node.codexConfigProfile } : {}),
+        ...(permissionOverride.codexPermissions ? { codexPermissions: permissionOverride.codexPermissions } : {}),
         launchPosture, kernelAuthority: permissionOverride.kernelAuthority, teamPermissionDefault: permissionOverride.teamPermissionDefault,
         nonInterruptive: this.rigRepo.getRigNonInterruptive(seat.rigId),
       },
@@ -1555,15 +1845,32 @@ export class SeatLifecycleService {
 
   // -- shared internals --
 
+  /** Shared stop effects; checked calls revalidate at terminal boundaries and before persistence. */
   private async stopManagedTmuxSeat(
     resolved: ResolvedSeat,
     session: LatestSessionRow,
     reason: string,
     operator: string | null | undefined,
     recordStopIntent: boolean,
+    checked?: { selection: () => SeatRefusal | null; guard: NonNullable<TmuxAdapter["deliveryGuard"]> },
   ): Promise<StopSeatResult> {
     const seat = this.describe(resolved);
-    const kill = await this.tmuxAdapter.killSession(session.session_name);
+    const beforeEffect = checked && (() => {
+      const changed = checked.selection();
+      if (changed) throw Object.assign(new Error(changed.message), { code: changed.code });
+      checked.guard.checkInput(resolved.nodeId);
+    });
+    const kill = checked
+      ? await this.tmuxAdapter.killSession(session.session_name, beforeEffect)
+      : await this.tmuxAdapter.killSession(session.session_name);
+    if (checked && !kill.ok) {
+      const partialEffect = kill.stopPhase !== undefined && kill.stopPhase !== "none";
+      if (kill.code === "selection_changed" || kill.code === "guard_target_changed" || kill.code === "guard_target_unknown") {
+        return { ok: false, code: "selection_changed", message: kill.message, partialEffect, stopPhase: kill.stopPhase };
+      }
+      if (!partialEffect && kill.code !== "session_not_found") return { ok: false, code: "tmux_probe_failed", message: kill.message };
+      return { ok: false, code: "stop_uncertain", message: `Checked stop did not complete: ${kill.message}`, partialEffect, stopPhase: kill.stopPhase };
+    }
     if (kill && !kill.ok && kill.code !== "session_not_found") {
       return {
         ok: false,
@@ -1572,7 +1879,12 @@ export class SeatLifecycleService {
       };
     }
     let persisted: PersistedEvent | null = null;
-    const tx = this.db.transaction(() => {
+    const tx = this.db.transaction((): SeatRefusal | null => {
+      if (checked) {
+        const changed = checked.selection();
+        if (changed) return changed;
+        checked.guard.checkInput(resolved.nodeId);
+      }
       if (recordStopIntent && kill?.ok) {
         this.sessionRegistry.markIntentionallyStopped(session.id);
       } else {
@@ -1588,10 +1900,23 @@ export class SeatLifecycleService {
         reason: reason.trim(),
         operator: operator ?? null,
       });
+      return null;
     });
-    tx();
-    this.tmuxAdapter.deliveryGuard?.rebindLifecycle(resolved.nodeId);
-    if (persisted) this.eventBus.notifySubscribers(persisted);
+    try {
+      const changed = tx();
+      if (changed) return { ...changed, partialEffect: true, stopPhase: "kill_attempted" };
+    } catch (error) {
+      if (!checked) throw error;
+      if ((error as { code?: string }).code === "guard_target_changed") return { ok: false, code: "selection_changed", message: (error as Error).message, partialEffect: true, stopPhase: "kill_attempted" };
+      return { ok: false, code: "stop_uncertain", message: `Session kill completed, but stop state could not be persisted: ${(error as Error).message}`, partialEffect: true, stopPhase: "kill_attempted" };
+    }
+    try {
+      this.tmuxAdapter.deliveryGuard?.rebindLifecycle(resolved.nodeId);
+      if (persisted) this.eventBus.notifySubscribers(persisted);
+    } catch (error) {
+      if (!checked) throw error;
+      return { ok: false, code: "stop_uncertain", message: `Session kill completed, but stop finalization failed: ${(error as Error).message}`, partialEffect: true, stopPhase: "kill_attempted" };
+    }
     return { ok: true, seat, sessionName: session.session_name, sessionId: session.id };
   }
 
@@ -1608,14 +1933,34 @@ export class SeatLifecycleService {
     return row?.resume_token?.trim() || null;
   }
 
-  private readStartupContext(
+  /**
+   * A seat started by hand has no persisted startup row. Reuse the row of a sibling in the
+   * same pod that runs the same runtime and agent reference (the same role). The sibling row
+   * is read only, never written. The caller still supplies this seat's own cwd.
+   */
+  private sameRoleSiblingStartupContext(nodeId: string): PersistedStartupContextRow | undefined {
+    const self = this.db.prepare("SELECT pod_id, runtime, agent_ref FROM nodes WHERE id = ?").get(nodeId) as
+      | { pod_id: string | null; runtime: string | null; agent_ref: string | null }
+      | undefined;
+    if (!self?.pod_id || !self.runtime || !self.agent_ref) return undefined;
+    return this.db.prepare(
+      `SELECT c.projection_entries_json, c.resolved_files_json, c.startup_actions_json, c.runtime
+         FROM node_startup_context c JOIN nodes n ON n.id = c.node_id
+        WHERE n.pod_id = ? AND n.runtime = ? AND n.agent_ref = ? AND n.id <> ?
+        ORDER BY n.logical_id LIMIT 1`,
+    ).get(self.pod_id, self.runtime, self.agent_ref, nodeId) as PersistedStartupContextRow | undefined;
+  }
+
+  readStartupContext(
     nodeId: string,
     cwd: string,
   ): { ok: true; context: ParsedStartupContext } | { ok: false; refusal: SeatRefusal } {
     const row = this.db.prepare(
       "SELECT projection_entries_json, resolved_files_json, startup_actions_json, runtime FROM node_startup_context WHERE node_id = ?",
     ).get(nodeId) as PersistedStartupContextRow | undefined;
-    if (!row) {
+    const sibling = row ? undefined : this.sameRoleSiblingStartupContext(nodeId);
+    const source = row ?? sibling;
+    if (!source) {
       return {
         ok: false,
         refusal: {
@@ -1630,13 +1975,13 @@ export class SeatLifecycleService {
     let rawFiles: unknown;
     let rawActions: unknown;
     try {
-      rawEntries = JSON.parse(row.projection_entries_json);
-      rawFiles = JSON.parse(row.resolved_files_json);
-      rawActions = JSON.parse(row.startup_actions_json);
+      rawEntries = JSON.parse(source.projection_entries_json);
+      rawFiles = JSON.parse(source.resolved_files_json);
+      rawActions = JSON.parse(source.startup_actions_json);
     } catch (error) {
       return this.malformedStartupContext(nodeId, `JSON parse failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-    if (!Array.isArray(rawEntries) || !Array.isArray(rawFiles) || !Array.isArray(rawActions) || !row.runtime?.trim()) {
+    if (!Array.isArray(rawEntries) || !Array.isArray(rawFiles) || !Array.isArray(rawActions) || !source.runtime?.trim()) {
       return this.malformedStartupContext(nodeId, "projection entries, resolved files, and startup actions must be arrays and runtime must be non-empty");
     }
 
@@ -1727,7 +2072,7 @@ export class SeatLifecycleService {
       appliesOn: file.appliesOn,
     }));
     const plan: ProjectionPlan = {
-      runtime: row.runtime,
+      runtime: source.runtime,
       cwd,
       entries,
       startup: { files: startupFiles, actions: startupActions },
@@ -1736,9 +2081,9 @@ export class SeatLifecycleService {
       diagnostics: [],
     };
     const hash = createHash("sha256")
-      .update(JSON.stringify([row.projection_entries_json, row.resolved_files_json, row.startup_actions_json, row.runtime]))
+      .update(JSON.stringify([source.projection_entries_json, source.resolved_files_json, source.startup_actions_json, source.runtime]))
       .digest("hex");
-    return { ok: true, context: { plan, resolvedStartupFiles, startupActions, runtime: row.runtime, hash } };
+    return { ok: true, context: { plan, resolvedStartupFiles, startupActions, runtime: source.runtime, hash } };
   }
 
   private malformedStartupContext(
@@ -1764,6 +2109,7 @@ export class SeatLifecycleService {
     startupPolicyHash: string;
     model: string | null;
     effort?: string | null;
+    advisor?: string | null;
     reason: string;
     operator?: string | null;
     errors: string[];
@@ -1799,6 +2145,7 @@ export class SeatLifecycleService {
         newGeneration: input.newGeneration,
         model: input.model,
         effort: input.effort ?? null,
+        advisor: input.advisor ?? null,
         startupPolicyHash: input.startupPolicyHash,
         reason: input.reason.trim(),
         operator: input.operator ?? null,
@@ -1866,6 +2213,21 @@ export class SeatLifecycleService {
       `SELECT id, session_name, status, origin, ${sessionCommunityHarnessSelect(this.db, "sessions")} AS community_harness FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1`,
     ).get(nodeId) as LatestSessionRow | undefined;
     return row ?? null;
+  }
+
+  private settingTargetLabel(target: SeatSettingTarget): string {
+    return target.nodeId === undefined ? target.seatRef : target.nodeId;
+  }
+
+  private resolveSettingTarget(target: SeatSettingTarget): ResolvedSeat | SeatRefusal {
+    if (target.nodeId === undefined) return this.resolveSeat(target.seatRef);
+    const nodeId = target.nodeId.trim();
+    if (!nodeId) return { ok: false, code: "seat_ref_required", message: "node ID is required", guidance: SEAT_LOOKUP_GUIDANCE };
+    const row = this.db.prepare(`SELECT n.rig_id FROM nodes n JOIN rigs r ON r.id = n.rig_id
+      WHERE n.id = ? AND r.archived_at IS NULL`).get(nodeId) as { rig_id: string } | undefined;
+    const entry = row && getNodeInventory(this.db, row.rig_id).find(candidate => candidate.nodeId === nodeId);
+    if (!entry) return { ok: false, code: "seat_not_found", message: `Node "${nodeId}" not found in an active rig.`, guidance: SEAT_LOOKUP_GUIDANCE };
+    return { entry, nodeId };
   }
 
   /** The ONE resolution path, mirroring SeatStatusService.findMatches semantics

@@ -86,7 +86,7 @@ export function askCommand(depsOverride?: StatusDeps): Command {
     .option("--seat <session-name>", "Scope the search to ONE seat's transcript across every generation that sat in it (cross-generation archaeology)")
     .option("--session <token>", "Search ONE specific session's JSONL by its session token (read-only)")
     .option("--wake <target>", "EXECUTES: wake member@rig[@N], or pass a session ID or title to the runtime — ask one question, get a snapshot answer, back to cold (runtime cost; explicit, never an implicit escalation from a search)")
-    .option("--runtime <runtime>", "runtime for --wake: claude (default) or codex")
+    .option("--runtime <runtime>", "runtime for --wake: claude (default), codex, or jcode")
     .option("--wake-timeout <seconds>", "bounded wake timeout in seconds (default 180)")
     .addHelpText("after", `
 rig ask is one verb for information about the PAST, three ways to reach it:
@@ -118,8 +118,11 @@ Examples:
 
 Exit codes:
   0  Success
-  1  Daemon not running, or the rig is unknown or ambiguous
-  2  Failed to fetch data from daemon (or wake timed out)`);
+  1  Daemon not running, the rig is unknown or ambiguous, or --runtime or
+     --wake-timeout is invalid
+  2  Failed to fetch data from daemon; the --wake seat has no such tenure, or its
+     tenure isn't Claude or Codex or has no resume token; or the wake failed or
+     timed out`);
 
   const getDeps = (): AskCommandDeps => (depsOverride as AskCommandDeps | undefined) ?? {
     lifecycleDeps: realDeps(),
@@ -145,7 +148,7 @@ Exit codes:
       }
 
       let token = target;
-      let runtime = opts.runtime ?? "claude";
+      let runtime: string = opts.runtime ?? "claude";
 
       if (target.includes("@")) {
         const status = await getDaemonStatus(deps.lifecycleDeps);

@@ -385,7 +385,11 @@ export function computeCostView(db: Database, q: { nowIso: string; seatSession?:
       ORDER BY seat_session ASC, id ASC`,
   ).all(...(q.seatSession ? [q.seatSession] : [])) as CostRow[];
   const bySeat = new Map<string, CostRow[]>();
-  for (const row of rows) bySeat.set(row.seat_session, [...(bySeat.get(row.seat_session) ?? []), row]);
+  for (const row of rows) {
+    let history = bySeat.get(row.seat_session);
+    if (!history) bySeat.set(row.seat_session, history = []);
+    history.push(row);
+  }
   const now = Date.parse(q.nowIso);
   const staleAfter = q.staleAfterMs ?? COST_STALE_AFTER_MS;
   const seats: SeatCost[] = [];
@@ -435,9 +439,24 @@ export function computeCostView(db: Database, q: { nowIso: string; seatSession?:
   }
   for (const pi of piSeatCosts(db, q.seatSession)) {
     const at = seats.findIndex((seat) => seat.seatSession === pi.seatSession);
-    if (at >= 0) seats[at] = pi; else seats.push(pi);
+    if (at < 0) { seats.push(pi); continue; }
+    // A seat name that once ran Pi and now runs Claude or Codex keeps its current harness's figure: its Pi session
+    // is history once a Claude or Codex sample is newer than that session's latest entry.
+    if (seats[at]!.runtime !== null && piSessionLatestMs(db, pi) < sampleMs(bySeat.get(pi.seatSession)!.at(-1)!)) continue;
+    seats[at] = pi;
   }
   return { seats, note };
+}
+
+function sampleMs(row: CostRow): number {
+  return Date.parse(row.sampled_at ?? row.captured_at);
+}
+
+/** When this Pi session's latest stored entry was written, of any origin; NaN when unknown, which keeps the Pi figure. */
+function piSessionLatestMs(db: Database, pi: PiSeatCost): number {
+  const row = db.prepare("SELECT MAX(entry_timestamp) AS at FROM pi_usage_entries WHERE seat_session = ? AND pi_session_id = ?")
+    .get(pi.seatSession, pi.window.piSessionId) as { at: string | null } | undefined;
+  return Date.parse(row?.at ?? "");
 }
 
 function hasChargeOutcome(db: Database, piSession: string): boolean {

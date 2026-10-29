@@ -83,6 +83,32 @@ function fmValue(fm: string, key: string): string | null {
   return m ? m[1]!.trim().replace(/^["']|["']$/g, "") : null;
 }
 
+/** Read only an explicitly labeled verdict. A stray PASS in a log or example is
+ * not a report verdict, and this projection never converts it into readiness. */
+export function readAuthoredProofReport(fs: ScopeFsDeps, dir: string): SliceScopeSummary["proofReport"] {
+  const content = fs.readFile(path.join(dir, "PROOF.md"));
+  if (content === null) return null;
+  const fm = extractFrontmatterRaw(content);
+  // Example commands and quoted examples do not constitute the author's verdict.
+  let fence: string | null = null;
+  const body = content.split(/\r?\n/).map(line => {
+    const marker = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
+    if (marker) {
+      if (!fence) fence = marker[1]!;
+      else if (marker[1]![0] === fence[0] && marker[1]!.length >= fence.length && !marker[2]!.trim()) fence = null;
+      return "";
+    }
+    return fence || /^\s*>|^(?: {4}|\t)/.test(line) ? "" : line;
+  }).join("\n");
+  const labeled = /(?:^|\s)(?:\*\*)?(?:Final\s+)?Verdict(?:\*\*)?\s*:\s*([^\r\n]+)/im.exec(body)?.[1];
+  const section = sectionBody(body, "(?:Final )?Verdict").split(/\r?\n/).find(line => line.trim());
+  const value = (fm && fmValue(fm, "verdict")) || labeled || section;
+  const clean = value?.replace(/[*`]/g, "").trim();
+  const detail = clean && !/^[<\[]|^(?:tbd|todo|pending)\b/i.test(clean) ? clean : null;
+  const verdict = detail ? (/^[a-z]+(?:-[a-z]+)*/i.exec(detail)?.[0] ?? detail).toLowerCase() : null;
+  return { file: "PROOF.md", verdict, detail };
+}
+
 /** Parse a YAML block list under `key:` — the C1 `evidences:` / `media:` shape. Read it
  * as YAML first, as the Review composer does: `rig proof add` writes the header with
  * YAML.stringify, which folds a long text ref onto continuation lines. */
@@ -229,9 +255,10 @@ function specShaFromLockedArtifacts(fs: ScopeFsDeps, sliceDir: string, fm: strin
   return createHash("sha256").update(bytes).digest("hex").slice(0, 8);
 }
 
-/** `root`: a selected catalog project's root. It bounds the readiness (policy search and scope identity) exactly as
- *  `rig proof` does for that project, so the scopes view and proof agree; without it the nearest project.yaml is used. */
-export function projectSliceScope(fs: ScopeFsDeps, sliceDir: string, readPolicy?: ProofPolicyRead, root?: string): SliceScopeDetail | null {
+export type SliceScopeHeader = Pick<SliceScopeSummary, "dirName" | "id" | "displayName" | "status" | "stage" | "locks">;
+
+/** A slice's own node file, read once: the counts view's row, and where every projection starts. */
+export function projectSliceHeader(fs: ScopeFsDeps, sliceDir: string): (SliceScopeHeader & { content: string; fm: string }) | null {
   const readmePath = NODE_FILE_PRECEDENCE
     .map((n) => path.join(sliceDir, n))
     .find((p) => fs.exists(p));
@@ -239,6 +266,24 @@ export function projectSliceScope(fs: ScopeFsDeps, sliceDir: string, readPolicy?
   const content = fs.readFile(readmePath);
   if (!content) return null;
   const fm = extractFrontmatterRaw(content) ?? "";
+  const heading = /^# (.+)$/m.exec(content);
+  return {
+    content, fm,
+    dirName: path.basename(sliceDir),
+    id: fmValue(fm, "id"),
+    displayName: heading ? heading[1]!.trim() : path.basename(sliceDir),
+    status: fmValue(fm, "status"),
+    stage: fmValue(fm, "stage"),
+    locks: readLocks(fm),
+  };
+}
+
+/** `root`: a selected catalog project's root. It bounds the readiness (policy search and scope identity) exactly as
+ *  `rig proof` does for that project, so the scopes view and proof agree; without it the nearest project.yaml is used. */
+export function projectSliceScope(fs: ScopeFsDeps, sliceDir: string, readPolicy?: ProofPolicyRead, root?: string): SliceScopeDetail | null {
+  const header = projectSliceHeader(fs, sliceDir);
+  if (!header) return null;
+  const { content, fm } = header;
 
   const items = readProofContract(sliceDir, fs);
   const proofDir = path.join(sliceDir, "proof");
@@ -255,17 +300,16 @@ export function projectSliceScope(fs: ScopeFsDeps, sliceDir: string, readPolicy?
   const contract = pairContract(items, drops);
   const paired = contract.filter((c) => c.paired).length;
 
-  const heading = /^# (.+)$/m.exec(content);
   const progressPath = path.join(sliceDir, "PROGRESS.md");
   return {
-    proofReport: readProofReport(fs, sliceDir),
+    proofReport: readAuthoredProofReport(fs, sliceDir),
     readiness: readSliceReadiness(sliceDir, fs, readPolicy, root),
-    dirName: path.basename(sliceDir),
-    id: fmValue(fm, "id"),
-    displayName: heading ? heading[1]!.trim() : path.basename(sliceDir),
-    status: fmValue(fm, "status"),
-    stage: fmValue(fm, "stage"),
-    locks: readLocks(fm),
+    dirName: header.dirName,
+    id: header.id,
+    displayName: header.displayName,
+    status: header.status,
+    stage: header.stage,
+    locks: header.locks,
     proof: { paired, total: items.length },
     intent: sectionBody(content, "Intent"),
     miniRequirements: miniRequirements(content),

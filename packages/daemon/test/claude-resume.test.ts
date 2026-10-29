@@ -1,6 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
 import { ClaudeResumeAdapter } from "../src/adapters/claude-resume.js";
 import type { TmuxAdapter, TmuxResult } from "../src/adapters/tmux.js";
+import type { ClaudeManagedLaunch } from "../src/domain/claude-managed-launch.js";
+import type { SeatLaunchEnvironment } from "../src/domain/seat-launch-environment.js";
 
 const CLAUDE_FLOOR_EFFECT = {
   runtime: "claude-code",
@@ -33,6 +35,34 @@ function mockTmux(overrides?: {
 }
 
 describe("ClaudeResumeAdapter", () => {
+  it.each([false, true])("refuses API resume when the token step cannot run (environment present: %s)", async (hasEnvironment) => {
+    const tmux = mockTmux();
+    tmux.sendShellCommand = vi.fn(async () => ({ ok: true as const }));
+    const adapter = new ClaudeResumeAdapter(tmux, {
+      claudeManagedLaunch: { seatTokenLaunch: () => ({
+        ref: { label: "api", tokenFile: "/synthetic/api-key", kind: "api-key" },
+        step: "synthetic-token-step", warnings: [],
+      }) } as unknown as ClaudeManagedLaunch,
+      ...(hasEnvironment ? { seatLaunchEnvironment: {
+        command: async (_session: string, command: string) => command,
+      } as unknown as SeatLaunchEnvironment } : {}),
+    });
+    const result = await adapter.resume("seat@rig", "claude_id", "original", "/repo", "floor", "haiku", undefined, "node");
+    expect(result).toMatchObject({ ok: false, code: "resume_failed", message: expect.stringContaining("no Claude process started") });
+    expect(tmux.sendText).not.toHaveBeenCalled();
+    expect(tmux.sendShellCommand).not.toHaveBeenCalled();
+    expect(tmux.sendKeys).not.toHaveBeenCalled();
+  });
+
+  it("the legacy continuation uses the retained executable and original conversation", async () => {
+    const tmux = mockTmux();
+    const adapter = new ClaudeResumeAdapter(tmux, { maxWaitMs: 1, sleep: async () => {} });
+    await adapter.resume("seat@rig", "claude_id", "original", "/repo", undefined, undefined, undefined, "node",
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "/native tools/claude");
+    expect(tmux.sendText).toHaveBeenCalledWith("seat@rig", expect.stringContaining("exec '/native tools/claude'"));
+    expect(tmux.sendText).toHaveBeenCalledWith("seat@rig", expect.stringContaining("--resume 'original'"));
+  });
+
   describe("canResume", () => {
     it("claude_name + token -> true", () => {
       const adapter = new ClaudeResumeAdapter(mockTmux());
@@ -102,6 +132,37 @@ describe("ClaudeResumeAdapter", () => {
       expect(sendText.mock.calls[0]![1]).toBe(
         "OPENRIG_RESUME_LAUNCH='my-session' CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude --permission-mode acceptEdits --model 'gpt-5.4-cheap' --effort 'high' --resume 'my-session'"
       );
+    });
+    it("OPR.0.7.0.9: a seat's launch additions reach the restore resume command after its Advisor, before --resume", async () => {
+      const sendText = vi.fn(async () => ({ ok: true as const }));
+      const tmux = mockTmux({ sendText });
+      const adapter = new ClaudeResumeAdapter(tmux);
+
+      await adapter.resume("r99-demo1-lead", "claude_name", "my-session", "/repo", undefined, undefined, undefined, undefined, undefined,
+        undefined, undefined, undefined, "opus", { agent: "openrig:reviewer", appendSystemPromptFile: "/seat root/additions/system-prompt.md", pluginDirs: [] });
+
+      expect(sendText.mock.calls[0]![1]).toBe(
+        "OPENRIG_RESUME_LAUNCH='my-session' CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude --permission-mode acceptEdits --advisor 'opus' --agent 'openrig:reviewer' --append-system-prompt-file '/seat root/additions/system-prompt.md' --resume 'my-session'"
+      );
+    });
+
+    it("keeps member rules when a classic resume applies the seat's own subscription token", async () => {
+      const step = "fixture-seat-token-step";
+      const sendShellCommand = vi.fn(async (_target: string, _command: string) => ({ ok: true as const }));
+      const command = vi.fn(async (_target: string, text: string, options: { claudeTokenStep?: string }) => `${options.claudeTokenStep}; ${text}`);
+      const adapter = new ClaudeResumeAdapter({ ...mockTmux(), sendShellCommand }, {
+        claudeManagedLaunch: { seatTokenLaunch: () => ({ step, ref: { label: "work", tokenFile: "/fixture/work.token" }, warnings: ["fixture token warning"] }) } as never,
+        seatLaunchEnvironment: { command } as never,
+      });
+      const result = await adapter.resume("seat@rig", "claude_id", "conversation", "/repo", undefined, undefined, undefined, "node",
+        undefined, undefined, undefined, undefined, undefined, undefined, { deny: ["Read(../peer/**)"] });
+      expect(result).toMatchObject({ ok: true, warnings: ["fixture token warning"] });
+      expect(command.mock.calls[0]![2].claudeTokenStep).toBe(step);
+      expect(sendShellCommand).toHaveBeenCalledTimes(1);
+      const launch = sendShellCommand.mock.calls[0]![1];
+      expect(launch).toContain(step);
+      expect(launch).toContain('"deny":["Read(../peer/**)"]');
+      expect(launch).toContain("--resume 'conversation'");
     });
 
     it("returns { ok: true } on success", async () => {

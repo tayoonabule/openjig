@@ -160,10 +160,18 @@ export class RigSpecCodec {
         if (m.codexConfigProfile) member["codex_config_profile"] = m.codexConfigProfile;
         if (m.model) member["model"] = m.model;
         if (m.effort) member["effort"] = m.effort;
+        if (m.advisor) member["advisor"] = m.advisor;
         // OPR.0.4.6.FAC1: role round-trips through spec serialization.
         if (m.role) member["role"] = m.role;
         // OPR.0.4.8.3 Seam B: per-seat permission_policy ref round-trips through spec serialization.
         if (m.permissionPolicy) member["permission_policy"] = m.permissionPolicy;
+        if (m.claudePermissions !== undefined) member["claude_permissions"] = m.claudePermissions;
+        if (m.claudeTokenRef) member["claude_token"] = { label: m.claudeTokenRef.label, file: m.claudeTokenRef.tokenFile };
+        if (m.claudeMcp !== undefined) member["claude_mcp"] = m.claudeMcp;
+        if (m.codexPermissions !== undefined) member["codex_permissions"] = m.codexPermissions;
+        if (m.agentFile) member["agent_file"] = m.agentFile;
+        if (m.appendSystemPromptFile) member["append_system_prompt_file"] = m.appendSystemPromptFile;
+        if (m.pluginDirs?.length) member["plugin_dirs"] = m.pluginDirs;
         if (m.env) member["env"] = { ...m.env };
         if (m.restorePolicy) member["restore_policy"] = m.restorePolicy;
         if (m.startup) member["startup"] = serializeStartupBlock(m.startup);
@@ -239,6 +247,11 @@ export class LegacyRigSpecCodec {
         if (node.role != null) n["role"] = node.role;
         if (node.model != null) n["model"] = node.model;
         if (node.effort != null) n["effort"] = node.effort;
+        if (node.advisor != null) n["advisor"] = node.advisor;
+        if (node.claudePermissions !== undefined) n["claude_permissions"] = node.claudePermissions;
+        if (node.claudeTokenRef) n["claude_token"] = { label: node.claudeTokenRef.label, file: node.claudeTokenRef.tokenFile };
+        if (node.claudeMcp !== undefined) n["claude_mcp"] = node.claudeMcp;
+        if (node.codexPermissions !== undefined) n["codex_permissions"] = node.codexPermissions;
         if (node.cwd != null) n["cwd"] = node.cwd;
         if (node.surfaceHint != null) n["surface_hint"] = node.surfaceHint;
         if (node.workspace != null) n["workspace"] = node.workspace;

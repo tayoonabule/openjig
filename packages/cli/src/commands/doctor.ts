@@ -4,7 +4,7 @@ import path from "node:path";
 import net from "node:net";
 import { execSync } from "node:child_process";
 import { resolveDaemonPath } from "../daemon-lifecycle.js";
-import { formatDaemonHostForUrl } from "../client.js";
+import { DaemonClient, ForeignLocalDaemonError, formatDaemonHostForUrl } from "../client.js";
 import { ConfigStore } from "../config-store.js";
 import { buildWritableHomeCheck } from "../system-preflight.js";
 import {
@@ -13,7 +13,7 @@ import {
   readCmuxSocketControlModeFromText,
   resolveCmuxSettingsPath,
 } from "../cmux-config.js";
-import { buildTmuxControlFailure, probeTmuxControl } from "../tmux-health.js";
+import { buildTmuxCaptureFailure, buildTmuxControlFailure, probeTmuxCapture, probeTmuxControl } from "../tmux-health.js";
 import { parse as parseYaml } from "yaml";
 import { compareSpecToLive, topologyFromRigSpec, topologyFromLiveLogicalIds } from "@openrig/daemon/spec-conformance";
 import { classifyNodeVersion } from "../node-support.js";
@@ -31,7 +31,8 @@ export interface DoctorDeps {
   exists: (p: string) => boolean;
   baseDir: string;
   readFile: (path: string) => string | null;
-  exec: (cmd: string) => string;
+  /** `timeoutMs` bounds one command; without it a command runs to completion, as before. */
+  exec: (cmd: string, opts?: { timeoutMs?: number }) => string;
   checkPort: (port: number, host: string) => Promise<boolean>;
   configStore: Pick<ConfigStore, "resolve">;
   platform?: NodeJS.Platform;
@@ -128,6 +129,16 @@ export function runDoctorChecks(deps: DoctorDeps, providerChecks: DoctorCheck[] 
     });
   } else if (tmuxProbe.available && tmuxProbe.version) {
     checks.push({ name: "tmux", status: "pass", message: tmuxProbe.version });
+    // #980: a tmux whose server exits on `capture-pane -p` fails every seat at launch.
+    const capture = probeTmuxCapture((cmd, opts) => deps.exec(cmd, opts));
+    if (capture.status === "fail") {
+      const failure = buildTmuxCaptureFailure(tmuxProbe.version, capture.detail);
+      checks.push({ name: "tmux_capture", status: "fail", message: failure.message, reason: failure.reason, fix: failure.fix });
+    } else {
+      checks.push(capture.status === "pass"
+        ? { name: "tmux_capture", status: "pass", message: "tmux can capture a pane (checked on a throwaway server)." }
+        : { name: "tmux_capture", status: "skipped", message: `Couldn't start a throwaway tmux server to check capture-pane: ${capture.detail}` });
+    }
     if (platform === "darwin") {
       const mouseMode = readTmuxMouseMode(deps);
       if (mouseMode === "on") {
@@ -313,7 +324,12 @@ async function buildSpecConformanceCheck(deps: DoctorDeps): Promise<DoctorCheck>
     return { name, status: "fail", message: `Rig spec at ${deps.specPath} declares no name or no pods.` };
   }
 
-  const liveIds = deps.fetchLiveLogicalIds ? await deps.fetchLiveLogicalIds(rigName) : null;
+  let liveIds: string[] | null;
+  try { liveIds = deps.fetchLiveLogicalIds ? await deps.fetchLiveLogicalIds(rigName) : null; }
+  catch (error) {
+    if (error instanceof ForeignLocalDaemonError) return { name, status: "fail", message: error.message };
+    throw error;
+  }
   if (liveIds === null) {
     return {
       name,
@@ -379,12 +395,38 @@ function buildCmuxDaemonWarning(deps: DoctorDeps, platform: NodeJS.Platform): Do
   };
 }
 
+/** The standalone doctor's command runner. A command with `timeoutMs` is bounded (the tmux capture probe passes one); others
+ *  run to completion, as before. */
+export function doctorExec(c: string, opts?: { timeoutMs?: number }): string {
+  return execSync(c, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"], ...(opts?.timeoutMs ? { timeout: opts.timeoutMs } : {}) });
+}
+
 function readTmuxMouseMode(deps: DoctorDeps): "on" | "off" | null {
   try {
     const mode = deps.exec("tmux show-options -gqv mouse").trim().toLowerCase();
     if (mode === "on" || mode === "off") return mode;
     return null;
   } catch {
+    return null;
+  }
+}
+
+/** Raw topology reads retain their existing headers; the owner policy is shared with the client. */
+export async function readLiveLogicalIds(base: string, rigName: string, ownerClient = new DaemonClient(base)): Promise<string[] | null> {
+  try {
+    await ownerClient.assertLocalOwner();
+    const rigsRes = await fetch(`${base}/api/rigs`);
+    if (!rigsRes.ok) return null;
+    const rigs = (await rigsRes.json()) as Array<{ id?: string; name?: string }>;
+    const rig = rigs.find((r) => r.name === rigName);
+    if (!rig?.id) return null;
+    await ownerClient.assertLocalOwner();
+    const nodesRes = await fetch(`${base}/api/rigs/${rig.id}/nodes`);
+    if (!nodesRes.ok) return null;
+    const nodes = (await nodesRes.json()) as Array<{ logicalId?: string | null }>;
+    return nodes.map((n) => n.logicalId ?? "");
+  } catch (error) {
+    if (error instanceof ForeignLocalDaemonError) throw error;
     return null;
   }
 }
@@ -402,28 +444,21 @@ export function doctorCommand(depsOverride?: DoctorDeps): Command {
         exists: existsSync,
         baseDir: import.meta.dirname,
         readFile: (p: string) => { try { return readFileSync(p, "utf-8"); } catch { return null; } },
-        exec: (c: string) => execSync(c, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }),
+        exec: doctorExec,
         checkPort: defaultCheckPort,
         configStore: new ConfigStore(),
         mkdirp: (dirPath: string) => mkdirSync(dirPath, { recursive: true }),
         checkWritable: (dirPath: string) => accessSync(dirPath, constants.W_OK),
         specPath: opts.spec ? path.resolve(opts.spec) : undefined,
-        // Returns null on ANY failure to read the live side. The conformance check treats null as
+        // Returns null when the live side is unavailable; a known foreign owner is reported. The conformance check treats null as
         // "unknown" and skips — an unreachable daemon must never read as a matching topology.
         fetchLiveLogicalIds: async (rigName: string): Promise<string[] | null> => {
           try {
             const cfg = new ConfigStore().resolve();
             const base = `http://${formatDaemonHostForUrl(cfg.daemon.host ?? "127.0.0.1")}:${cfg.daemon.port ?? DEFAULT_PORT}`;
-            const rigsRes = await fetch(`${base}/api/rigs`);
-            if (!rigsRes.ok) return null;
-            const rigs = (await rigsRes.json()) as Array<{ id?: string; name?: string }>;
-            const rig = rigs.find((r) => r.name === rigName);
-            if (!rig?.id) return null;
-            const nodesRes = await fetch(`${base}/api/rigs/${rig.id}/nodes`);
-            if (!nodesRes.ok) return null;
-            const nodes = (await nodesRes.json()) as Array<{ logicalId?: string | null }>;
-            return nodes.map((n) => n.logicalId ?? "");
-          } catch {
+            return await readLiveLogicalIds(base, rigName);
+          } catch (error) {
+            if (error instanceof ForeignLocalDaemonError) throw error;
             return null;
           }
         },

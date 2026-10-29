@@ -10,10 +10,10 @@ import type { SessionRegistry } from "./session-registry.js";
 import type { HarnessLaunchResult, NodeBinding } from "./runtime-adapter.js";
 import type { PersistedEvent, RigEvent } from "./types.js";
 import {
-  codexCommandResumeToken, listNativeProcesses, processArgv, verifyCodexPaneProcess,
+  codexProcessArgv, codexProcessResumeToken, listNativeProcesses, processArgv, verifyCodexPaneProcess,
   type NativeProcessLister, type NativeProcessRow,
 } from "./native-process-lineage.js";
-import { CodexThreadIdResolver, resolveCodexDbPaths } from "./codex-thread-id.js";
+import { CodexThreadIdResolver, resolveCodexDbPaths, type CodexThreadEvidence } from "./codex-thread-id.js";
 import { isShellForeground } from "./shell-classifier.js";
 import { terminatePaneInPlace, type PaneCutoverTiming } from "./pane-cutover.js";
 import { rebindAndVerifyPaneIdentity } from "./seat-attention-reconciler.js";
@@ -37,15 +37,17 @@ import { CODEX_NETWORK_DEFAULT_OVERRIDE } from "./codex-network-default.js";
 export type InPlaceRestartTmux = Pick<TmuxAdapter,
   | "getPanePid" | "getPaneCommand" | "listPanes" | "getSessionEnv" | "signalPid" | "setRemainOnExit"
   | "signalPaneProcess" | "isPaneDead" | "respawnPane" | "getPaneLocalOption" | "restorePaneOption"
-  | "capturePaneHistory">;
+  | "capturePaneHistory" | "capturePaneHistoryParts">;
 
 /** The Codex runtime adapter's resume surface this operation reuses. */
 export interface InPlaceCodexLauncher {
   buildResumeCommand(binding: NodeBinding, opts: { name: string; resumeToken: string; running?: RunningCodexLaunch }):
     Promise<{ ok: true; command: string; core: string } | { ok: false; error: string }>;
-  verifyResumeInPane(tmuxSession: string, resumeToken: string): Promise<HarnessLaunchResult>;
+  /** `nodeId` lets the resume proof read the seat's own CODEX_HOME when it declares one; `home`, the one the running
+   *  Codex was read using, wins over both that and the daemon's. */
+  verifyResumeInPane(tmuxSession: string, resumeToken: string, nodeId?: string, home?: string): Promise<HarnessLaunchResult>;
   /** Types a built command into the pane's shell and verifies the resume, preparing nothing again. */
-  sendResumeCommand(tmuxSession: string, command: string, resumeToken: string): Promise<HarnessLaunchResult>;
+  sendResumeCommand(tmuxSession: string, command: string, resumeToken: string, nodeId?: string, home?: string): Promise<HarnessLaunchResult>;
 }
 
 /** What one process shows about itself, read without touching any credential: cwd, executable, and only
@@ -54,13 +56,16 @@ export interface ProcessFacts {
   cwd: string | null;
   exe: string | null;
   env: { CODEX_HOME?: string; HOME?: string };
-  /** Names (never values) of API-key variables present. A name alone does not establish billing. */
-  apiKeyEnvNames: string[];
+  /** The process's exact argv, null or absent when it couldn't be read. `ps` joins argv with spaces, so a value
+   *  holding one (a cwd's `.git` add-dir) is split there; this one keeps every boundary. */
+  argv?: string[] | null;
 }
 
 export interface InPlaceRestartIo {
   readProcess(pid: number): Promise<ProcessFacts | null>;
   readThreadId(pid: number, startedAt: string, codexHome: string): Promise<string | undefined>;
+  /** The same read as readThreadId, with whether it met no detected incompleteness (discovery, open, query). */
+  readThreadEvidence(pid: number, startedAt: string, codexHome: string): Promise<CodexThreadEvidence>;
   /** `cli_auth_credentials_store` from the home's config.toml: the value, null when unset, undefined when unreadable. */
   readCredentialStore(codexHome: string): string | null | undefined;
   /** stat (never read) of the home's auth.json. */
@@ -123,6 +128,9 @@ export interface InPlaceRestartReport {
   paneShape: PaneShape;
   conversationId: string;
   conversationProof: "argv" | "native_logs";
+  /** When argv proves the stored conversation: what the process's own retained logs show, as a note. "no other
+   *  conversation logged" isn't proof the conversation is current; "not established: …" says why nothing was concluded. */
+  currentConversation?: string;
   activity: { state: "working" | "needs_input" | "idle" | "unknown"; needsInput: number | null; detail: string };
   childProcesses: Array<{ pid: number; name: string }>;
   settings: {
@@ -134,10 +142,8 @@ export interface InPlaceRestartReport {
   /** Launch evidence only: whether the running Codex's command line carries `--no-daemon`. It doesn't show whether an
    *  app-server process, its login or any lock is involved. */
   codexNoDaemonFlag: { present: boolean; detail: string };
-  /** Whether the running Codex is attached to an app-server, as observed. Nothing OpenRig reads observes that today, so
-   *  it is always `unknown`, with the reason. Never inferred from the launch flag. */
-  processMode: { state: "observed" | "unknown"; detail: string };
-  billingRoute: { state: "unknown"; detail: string; apiKeyEnvNames: string[] };
+  /** Kept only for CLIs before 0.7.0, whose printer reads `billingRoute.detail` unguarded; remove once they're gone. */
+  billingRoute: { state: "unknown"; detail: string };
   account: AccountEvidence;
   peers: PeerReport[];
   oldProcess: { pid: number; startedAt: string | null };
@@ -185,7 +191,7 @@ export type InPlaceVerifyResult =
 
 const RESTART_STARTED = "seat.restart_in_place_started" as const;
 const RESTART_FINISHED = "seat.restart_in_place_finished" as const;
-const API_KEY_NAMES = ["OPENAI_API_KEY", "CODEX_API_KEY"];
+const BILLING_ROUTE_FOR_OLDER_CLIS = { state: "unknown", detail: "Not reported." } as const;
 const NOT_VERIFIED = [
   "Which account the restarted Codex actually uses: only `--verify` with --expect-account and a completed tool turn can confirm it.",
   "Whether Codex saved the conversation before it exited (TERM, then KILL after the timeout).",
@@ -256,15 +262,16 @@ export class CodexInPlaceRestart {
         message: `The restart stopped with an error during ${progress.stage}; the seat's state was not observed afterwards.`,
       };
     }
-    // The Account lines already in the pane when the restart finished. --verify counts only lines beyond
-    // these, so text that was there before (anywhere in history or on screen) is never evidence.
-    const accountLinesAtRestart = result.outcome === "restarted_account_unverified"
-      ? accountLineCounts(await this.deps.tmux.capturePaneHistory(result.pane).catch(() => null))
+    // Where the pane's text stood when the restart finished: an anchor at the end of its history, and the
+    // Account lines after it. --verify counts only lines beyond these, so text that was there before is never
+    // evidence, however much older history tmux has trimmed since.
+    const accountTextAtRestart = result.outcome === "restarted_account_unverified"
+      ? accountTextMark(await this.deps.tmux.capturePaneHistoryParts(result.pane).catch(() => null))
       : null;
     this.persist({
       type: RESTART_FINISHED, rigId: seat.rigId, nodeId: seat.nodeId, logicalId: seat.logicalId, sessionName,
       outcome: result.outcome!, newPid: result.newProcess?.pid ?? null, newStartedAt: result.newProcess?.startedAt ?? null,
-      codexHome: result.codexHome, paneHeld: result.paneHeld ? true : false, accountLinesAtRestart, finishedAt: this.now().toISOString(),
+      codexHome: result.codexHome, paneHeld: result.paneHeld ? true : false, accountTextAtRestart, finishedAt: this.now().toISOString(),
     });
     return result;
   }
@@ -279,7 +286,7 @@ export class CodexInPlaceRestart {
 
     let launch: HarnessLaunchResult;
     if (report.paneShape === "shell_backed") {
-      const stopped = await this.stopUnderShell(pane, panePid, codexPid, codexStartedAt);
+      const stopped = await this.stopUnderShell(pane, panePid, codexPid, codexStartedAt, report.oldProcess);
       if (stopped === "running") {
         return { ...report, outcome: "not_started", recoveryCommand, message: "Codex did not exit after TERM and KILL; nothing was restarted and the original process is still running." };
       }
@@ -290,7 +297,8 @@ export class CodexInPlaceRestart {
       // The shell is back: type the exact resume command the checks ran on, built from the running Codex's
       // choices, and prove the resume. Preparing the launch again here would decide those choices afresh.
       progress.stage = "resume";
-      launch = await this.deps.codex.sendResumeCommand(sessionName, relaunch.command, report.conversationId);
+      // The relaunch runs in the home the running Codex used (anything else refused as drift), so the proof reads that one.
+      launch = await this.deps.codex.sendResumeCommand(sessionName, relaunch.command, report.conversationId, target.seat.nodeId, report.codexHome);
       if (!launch.ok) return this.incomplete(report, launch, recoveryCommand);
       progress.stage = "identity check";
       return this.verifyReplacement(target, report, oldExe);
@@ -322,7 +330,7 @@ export class CodexInPlaceRestart {
     }
     if (respawned.warnings) report.warnings.push(...respawned.warnings);
     progress.stage = "resume";
-    launch = await this.deps.codex.verifyResumeInPane(sessionName, report.conversationId);
+    launch = await this.deps.codex.verifyResumeInPane(sessionName, report.conversationId, target.seat.nodeId, report.codexHome);
     if (!launch.ok) return this.incomplete(report, launch, recoveryCommand, held);
     progress.stage = "identity check";
     const verified = await this.verifyReplacement(target, report, oldExe);
@@ -348,7 +356,7 @@ export class CodexInPlaceRestart {
     const latest = rows[0];
     if (!latest) return { ok: false, code: "no_restart_recorded", message: "This seat has no recorded in-place restart to verify." };
     if (latest.type === RESTART_STARTED) return { ok: false, code: "restart_not_completed", message: "The latest in-place restart of this seat has not finished." };
-    const finished = JSON.parse(latest.payload) as { outcome: string; newPid: number | null; newStartedAt: string | null; codexHome: string; finishedAt: string; accountLinesAtRestart?: Record<string, number> | null };
+    const finished = JSON.parse(latest.payload) as { outcome: string; newPid: number | null; newStartedAt: string | null; codexHome: string; finishedAt: string; accountLinesAtRestart?: Record<string, number> | null; accountTextAtRestart?: AccountTextMark | null };
     if (finished.outcome !== "restarted_account_unverified") {
       return { ok: false, code: "restart_not_completed", message: `The latest in-place restart ended ${finished.outcome}; there is nothing to verify.` };
     }
@@ -358,7 +366,10 @@ export class CodexInPlaceRestart {
     }
     const conversationId = readResumeToken(this.deps.db, target.sessionId);
     const toolTurn = this.readToolTurn(finished.codexHome, conversationId, finished.finishedAt);
-    const accountEvidence = await this.readAccountLine(target.binding.tmuxPane!, finished.accountLinesAtRestart ?? null, input.expectAccount ?? null);
+    // A restart recorded before the anchor existed carries only whole-pane counts; those are still compared as before.
+    const atRestart = finished.accountTextAtRestart !== undefined ? finished.accountTextAtRestart
+      : finished.accountLinesAtRestart != null ? { anchor: null, counts: finished.accountLinesAtRestart } : null;
+    const accountEvidence = await this.readAccountLine(target.binding.tmuxPane!, atRestart, input.expectAccount ?? null);
     const moved = toolTurn.state === "observed" && toolTurn.completed > 0 && toolTurn.errors === 0 && accountEvidence.state === "matched";
     return {
       ok: true, seat: target.seat, outcome: moved ? "moved" : "restarted_account_unverified", toolTurn, accountEvidence,
@@ -394,6 +405,8 @@ export class CodexInPlaceRestart {
       return { ok: false, code: "resume_binding_unverified", message: "No single Codex process in the seat's pane could be tied to the stored conversation (a running Codex that names another conversation is refused too). Nothing was stopped." };
     }
     const { process, panePid, rows } = codex;
+    const runningArgv = codexProcessArgv(process);
+    if (!runningArgv) return { ok: false, code: "settings_unverified", message: "The running Codex's exact arguments could not be read, so its launch settings are unverified. Nothing was stopped." };
     const startedAt = process.startedAt ?? null;
     const facts = await this.io.readProcess(process.pid);
     if (!facts) return { ok: false, code: "settings_unverified", message: "The running Codex's working directory and Codex home could not be read (this observer reads /proc on Linux). Nothing was stopped." };
@@ -401,14 +414,52 @@ export class CodexInPlaceRestart {
     if (!codexHome) return { ok: false, code: "settings_unverified", message: "The running Codex's home could not be determined (no CODEX_HOME or HOME). Nothing was stopped." };
 
     // The conversation the PROCESS is on: argv for a resumed Codex, its own native logs for a fresh one.
-    const argvToken = codexCommandResumeToken(process.command);
+    const argvToken = codexProcessResumeToken(process);
     let conversationProof: "argv" | "native_logs";
     if (argvToken === token) conversationProof = "argv";
     else if (argvToken === undefined && startedAt && (await this.io.readThreadId(process.pid, startedAt, codexHome)) === token) conversationProof = "native_logs";
     else return { ok: false, code: "resume_binding_unverified", message: "The running Codex could not be proven to be on the seat's stored conversation (checked: its argv, then its native logs). Nothing was stopped." };
 
+    // Its argv resumes the stored conversation, but its own logs may say it has moved on. Refuse only when a read with no
+    // detected incompleteness (every database found, opened and queried) names only another conversation; anything less
+    // keeps the restart, with a note. Not an atomic snapshot: a switch not yet logged, or rows inside the process's start
+    // second (excluded by the reuse gate), stay invisible.
+    let currentConversation: string | undefined;
+    if (conversationProof === "argv") {
+      let evidence: CodexThreadEvidence;
+      if (!startedAt) evidence = { reason: "no_log_row", fullyReadable: false };
+      else {
+        try { evidence = await this.io.readThreadEvidence(process.pid, startedAt, codexHome); }
+        catch { evidence = { reason: "sqlite_unreadable", fullyReadable: false, incomplete: "unreadable" }; }
+      }
+      if (evidence.fullyReadable && evidence.thread && evidence.thread !== token) {
+        return { ok: false, code: "resume_binding_unverified", detail: { reason: "conflicting retained native-thread evidence", loggedConversation: evidence.thread },
+          message: `Conflicting retained native-thread evidence: the running Codex's command line resumes the seat's stored conversation ${token}, but its own logs, read with no detected incompleteness, name only ${evidence.thread}. Nothing was stopped and nothing was typed.`,
+          guidance: "This doesn't show which conversation is current or that the stored one is gone. Check the seat's conversation (rig seat set-resume-token records one) before restarting it in place." };
+      }
+      currentConversation = evidence.thread === token && evidence.fullyReadable ? "no other conversation logged"
+        : evidence.thread ? (evidence.incomplete === "unreadable" ? "not established: a native database was unreadable"
+          : "not established: the native databases couldn't all be found")
+        : `not established: ${evidence.reason ?? "no_log_row"}`;
+    }
+
+    // Resolve ambiguous launcher names before classifying the observed process chain.
+    const byPid = new Map(rows.map(row => [row.pid, row]));
+    const launcherFacts = new Map<number, ProcessFacts | null>();
+    const visited = new Set<number>([process.pid]);
+    let ancestor = process;
+    while (ancestor.pid !== panePid) {
+      const parent = byPid.get(ancestor.ppid);
+      if (!parent || visited.has(parent.pid)) break;
+      visited.add(parent.pid);
+      if (executableBase(parent) === "MainThread") {
+        launcherFacts.set(parent.pid, await this.io.readProcess(parent.pid));
+      }
+      ancestor = parent;
+    }
+
     // Pane shape: the pane's root is Codex itself, or a shell whose child chain is Codex.
-    const chain = codexChain(rows, process, panePid);
+    const chain = codexChain(rows, process, panePid, launcherFacts);
     const top = chain.at(-1)!;
     const root = rows.find((row) => row.pid === panePid);
     let paneShape: PaneShape;
@@ -434,7 +485,7 @@ export class CodexInPlaceRestart {
     const relaunchBinding: NodeBinding = { ...binding, cwd };
     // The probed and prepared launch choices come from the running Codex, so the relaunch keeps them and no
     // Codex process is started to decide them again.
-    const runningArgv = processArgv(process.command);
+    // Keep the launch settings tied to the same OS argv used for the selected process's identity.
     const running = runningLaunch(runningArgv);
     const relaunch = await this.deps.codex.buildResumeCommand(relaunchBinding, { name: sessionName, resumeToken: token, running });
     if (!relaunch.ok) return { ok: false, code: "relaunch_unavailable", message: `The resume command could not be built: ${relaunch.error}. Nothing was stopped.` };
@@ -490,10 +541,9 @@ export class CodexInPlaceRestart {
       codexNoDaemonFlag: running.daemonOptOut
         ? { present: true, detail: "Launch evidence: the running Codex was started with --no-daemon. This doesn't show whether an app-server process, its login or any lock is involved." }
         : { present: false, detail: "Launch evidence: the running Codex's command line has no --no-daemon. This doesn't show whether an app-server process, its login or any lock is involved." },
-      processMode: { state: "unknown", detail: "Process mode: unknown. Nothing OpenRig reads shows whether the running Codex is attached to an app-server; the --no-daemon flag above is launch evidence only." },
-      billingRoute: { state: "unknown", apiKeyEnvNames: facts.apiKeyEnvNames,
-        detail: "Which billing route Codex uses is not observable without reading credentials; API-key variable names alone don't establish it." },
+      billingRoute: BILLING_ROUTE_FOR_OLDER_CLIS,
       account: this.accountEvidence(codexHome, startedAt, null),
+      ...(currentConversation ? { currentConversation } : {}),
       peers: await this.peers(seat.nodeId, codexHome),
       oldProcess: { pid: process.pid, startedAt },
       ...history,
@@ -534,17 +584,19 @@ export class CodexInPlaceRestart {
     const panePid = await this.deps.tmux.getPanePid(pane);
     if (!panePid) return null;
     const observation = await verifyCodexPaneProcess({ target: pane, tmux: { getPanePid: async () => panePid },
-      listProcesses: () => rows, ...(token ? { expectedToken: token } : {}) });
+      listProcesses: () => rows, requireArgv: true, ...(token ? { expectedToken: token } : {}) });
     return observation && observation.panePid === panePid ? { process: observation.process, panePid, rows } : null;
   }
 
   /** Shell-backed: TERM the Codex chain's top process (not the pane's shell), KILL after the timeout, then
-   *  require the original process gone AND the shell back in the foreground. */
-  private async stopUnderShell(pane: string, panePid: number, pid: number, startedAt: string | null): Promise<"stopped" | "running" | "unknown"> {
+   *  require both launcher and native process gone AND the shell back in the foreground. */
+  private async stopUnderShell(pane: string, panePid: number, pid: number, startedAt: string | null,
+    native: InPlaceRestartReport["oldProcess"]): Promise<"stopped" | "running" | "unknown"> {
     const gone = async (): Promise<boolean | null> => {
       const rows = await this.listProcesses();
       if (rows.length === 0) return null;
-      if (rows.some((row) => row.pid === pid && (row.startedAt ?? null) === startedAt)) return false;
+      if (rows.some((row) => (row.pid === pid && (row.startedAt ?? null) === startedAt)
+        || (row.pid === native.pid && (row.startedAt ?? null) === native.startedAt))) return false;
       const command = await this.deps.tmux.getPaneCommand(pane);
       const root = rows.find((row) => row.pid === panePid);
       return command !== null && isShellForeground(command) && !!root;
@@ -561,7 +613,8 @@ export class CodexInPlaceRestart {
     };
     await this.deps.tmux.signalPid(pid, "TERM");
     if (await wait()) return "stopped";
-    await this.deps.tmux.signalPid(pid, "KILL");
+    const launcherLive = (await this.listProcesses()).some((row) => row.pid === pid && (row.startedAt ?? null) === startedAt);
+    if (launcherLive) await this.deps.tmux.signalPid(pid, "KILL");
     const last = await wait();
     return last ? "stopped" : last === null ? "unknown" : "running";
   }
@@ -645,19 +698,32 @@ export class CodexInPlaceRestart {
     const attention = launch.recovery === "attention_required";
     // The native decision a named startup gate is waiting for. Nothing answers it: the step names it.
     const named = attention && launch.gate ? startupGateStep(launch, report.sessionName, report.pane, recoveryCommand) : null;
+    // The pane did restart here, so an unproven or disproved resume is reported without the adapter's closing
+    // "nothing was restarted", which is true only for a caller that restarted nothing.
+    const restarted = launch.resumeUnproven || launch.resumeMismatch;
+    const error = launch.resumeDetail ?? launch.error;
     return {
       ...report, outcome: "incomplete", recoveryCommand, ...(paneHeld ? { paneHeld } : {}),
-      account: { ...report.account, startupGate: attention ? launch.error : null, startupGateKind: attention ? launch.gate ?? null : null },
+      account: { ...report.account, startupGate: attention ? error : null, startupGateKind: attention ? launch.gate ?? null : null },
       remainingStep: signIn
         ? `Whoever owns the sign-in signs in to Codex in ${report.codexHome}, then the conversation resumes with the recovery command.`
         : missing
           ? `Codex in ${report.codexHome} has no saved session for this conversation; no fresh session was started. Find where it was saved before resuming.`
           : named
+            // #1524 (b): disproved: the resumed process's records name another conversation.
+            ?? (launch.resumeMismatch
+              ? `The resumed Codex opened ${launch.resumeMismatch.opened}, not the seat's conversation ${report.conversationId}; find the seat's conversation before resuming again. Nothing was retried.`
+            // #1524 (b): not disproved, only unproven; the resumed Codex may still be running it.
+            : launch.resumeUnproven
+              ? `The resumed Codex may still be running in the pane: its records didn't prove the conversation in time. Check the pane first; if the conversation is there, adopt it with rig reconcile-session ${report.sessionName} --no-launch. Use the recovery command only if the original is gone. ${attention && keyTyped(launch) ? typedSentence(launch) : "Nothing was retried."}`
+              : null)
             ?? (attention && keyTyped(launch)
               // OpenRig's own key is part of what the person needs to know, even with no screen named.
               ? `Resolve what Codex shows in the pane, then resume with the recovery command. ${typedSentence(launch)}`
               : "Resolve what Codex shows in the pane, then resume with the recovery command. Nothing was retried."),
-      message: `The original Codex exited, but the resume was not proven: ${launch.error}`,
+      message: restarted
+        ? `The pane restarted: the original Codex exited and the resume started in the same pane, but ${launch.resumeMismatch ? "it opened another conversation" : "it wasn't proven"}: ${error} Check the pane with rig capture ${report.sessionName}.`
+        : `The original Codex exited, but the resume was not proven: ${launch.error}`,
     };
   }
 
@@ -712,7 +778,7 @@ export class CodexInPlaceRestart {
       }
       reports.push({ logicalId: row.logical_id, sessionName: row.tmux_session, home,
         effect: home === "same"
-          ? `Not restarted; account unverified. Shares home ${codexHome}, so it may take the new account at its next start or token refresh.`
+          ? `Not restarted; account unverified. Shares home ${codexHome}: if the home's login changed, it keeps its current login only until its next token refresh, when Codex stops it with "signed in to another account" until it's restarted. Signing in again there would replace the home's login.`
           : home === "different" ? "Not restarted; uses a different Codex home." : "Not restarted; account unverified; its Codex home could not be observed." });
     }
     return reports;
@@ -741,23 +807,27 @@ export class CodexInPlaceRestart {
 
   /**
    * Account evidence counts only when the line was produced after the restart. A cursor position can't show
-   * that (a TUI rewrites rows above and below the cursor), so this compares occurrences: every Account line
-   * in the pane's whole text when the restart finished was counted, and a line is new only when the same
-   * text now occurs more often than it did then. Text that moved, stayed or was redrawn never counts more
-   * than once; anything that can't be compared is not observed.
+   * that (a TUI rewrites rows above and below the cursor), so this compares occurrences after an anchor: the
+   * last history lines when the restart finished, which no redraw changes once they've scrolled up. Only text
+   * after the anchor's last occurrence is compared, and a line is new only when the same text occurs there more
+   * often than it did after the anchor's own position then. tmux trims the oldest history first, so trimming
+   * can't remove the restart-time lines after the anchor while keeping the anchor, and older copies of a line no
+   * longer hide a new one. Text that moved, stayed or was redrawn never counts more than once; anything that
+   * can't be compared is not observed.
    */
-  private async readAccountLine(pane: string, atRestart: Record<string, number> | null, expectAccount: string | null): Promise<{ state: "matched" | "not_matched" | "not_requested" | "not_observed"; detail: string }> {
+  private async readAccountLine(pane: string, atRestart: { anchor: string[] | null; counts: Record<string, number> } | null, expectAccount: string | null): Promise<{ state: "matched" | "not_matched" | "not_requested" | "not_observed"; detail: string }> {
     if (!expectAccount?.trim()) return { state: "not_requested", detail: "No --expect-account given, so no account-specific evidence was checked." };
     if (atRestart === null) return { state: "not_observed", detail: "The pane's text at the restart was not recorded, so a line produced since can't be told apart from earlier text." };
     const text = await this.deps.tmux.capturePaneHistory(pane).catch(() => null);
     if (text === null) return { state: "not_observed", detail: "The pane's text could not be read." };
+    const compared = atRestart.anchor === null ? text : linesAfterAnchor(paneLines(text), atRestart.anchor).join("\n");
     const seen = new Map<string, number>();
     let newest: string | undefined;
-    for (const line of accountLines(text)) {
-      const key = accountLineKey(line);
+    for (const line of accountLines(compared)) {
+      const key = lineDigest(line);
       const count = (seen.get(key) ?? 0) + 1;
       seen.set(key, count);
-      if (count > (atRestart[key] ?? 0)) newest = line;
+      if (count > (atRestart.counts[key] ?? 0)) newest = line;
     }
     if (!newest) return { state: "not_observed", detail: "No Codex status Account line was produced since the restart (lines already in the pane then don't count); show /status in the seat first." };
     return accountLineNames(newest, expectAccount)
@@ -798,8 +868,31 @@ function isStagedLaunchScript(row: NativeProcessRow): boolean {
   return SH_RUNS_AS.has(executableBase(row)) && argv.length === 2 && /^(?:\/bin\/)?sh$/.test(argv[0]!) && isStagedSendScriptPath(argv[1]!);
 }
 
+const NODE_LAUNCH_FLAGS = new Set(["--no-warnings", "--trace-warnings", "--enable-source-maps",
+  "--preserve-symlinks", "--preserve-symlinks-main", "--no-deprecation", "--trace-deprecation",
+  "--throw-deprecation", "--inspect", "--inspect-brk"]);
+const NODE_LAUNCH_VALUE_FLAGS = new Set(["-r", "--require", "--import", "--loader", "--experimental-loader",
+  "-C", "--conditions", "--title"]);
+
+/** Identify the entry script, never an option's value or a script argument. Unknown option arity refuses the restart. */
+function nodeLaunchScript(argv: string[]): string | undefined {
+  for (let i = 1; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === "--") return argv[i + 1];
+    if (!arg.startsWith("-")) return arg;
+    if (NODE_LAUNCH_VALUE_FLAGS.has(arg)) {
+      if (!argv[++i]) return undefined;
+    } else if (!NODE_LAUNCH_FLAGS.has(arg)
+      && !(arg.includes("=") && process.allowedNodeEnvironmentFlags.has(arg))) {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 /** The Codex process and its Codex launcher ancestors, deepest first, up to the pane root. */
-function codexChain(rows: NativeProcessRow[], deepest: NativeProcessRow, panePid: number): NativeProcessRow[] {
+function codexChain(rows: NativeProcessRow[], deepest: NativeProcessRow, panePid: number,
+  launcherFacts: ReadonlyMap<number, ProcessFacts | null>): NativeProcessRow[] {
   const byPid = new Map(rows.map((row) => [row.pid, row]));
   const chain = [deepest];
   let current = deepest;
@@ -808,7 +901,16 @@ function codexChain(rows: NativeProcessRow[], deepest: NativeProcessRow, panePid
     if (!parent) break;
     const name = executableBase(parent);
     // A Codex launcher above the native binary: codex itself, or node running Codex's launcher script.
-    const launcher = /^codex/i.test(name) || (name === "node" && processArgv(parent.command).some((arg) => /codex/i.test(arg)));
+    // Node can name its Linux main thread MainThread; require the OS executable before accepting it.
+    const facts = launcherFacts.get(parent.pid);
+    const mainThreadNode = name === "MainThread" && nodePath.basename(facts?.exe ?? "") === "node";
+    // ps flattens argument boundaries; only exact argv can distinguish an option value from the entry script.
+    const script = mainThreadNode ? nodeLaunchScript(facts?.argv ?? []) : undefined;
+    const codexScript = !!script && nodePath.isAbsolute(script)
+      && (nodePath.basename(script) === "codex" || script.endsWith("/bin/codex.js"));
+    const launcher = /^codex/i.test(name)
+      || (name === "node" && processArgv(parent.command).some((arg) => /codex/i.test(arg)))
+      || (mainThreadNode && codexScript);
     if (!launcher) break;
     chain.push(parent);
     current = parent;
@@ -988,26 +1090,74 @@ function accountLines(text: string): string[] {
   return text.split("\n").map((line) => line.replace(/^[\s│|]+|[\s│|]+$/g, "")).filter((line) => /^Account:\s*\S/i.test(line));
 }
 
-/** A line's key in the recorded counts: a digest, so the event log holds no account names. */
-function accountLineKey(line: string): string {
+/** A line's key in the recorded anchor and counts: a digest, so the event log holds no pane text or account names. */
+function lineDigest(line: string): string {
   return createHash("sha256").update(line).digest("hex").slice(0, 16);
 }
 
-/** How often each Account line occurs in the pane's text; null when the text couldn't be read. */
-function accountLineCounts(text: string | null): Record<string, number> | null {
-  if (text === null) return null;
-  const counts: Record<string, number> = {};
-  for (const line of accountLines(text)) counts[accountLineKey(line)] = (counts[accountLineKey(line)] ?? 0) + 1;
-  return counts;
+/** How many history lines the anchor holds. */
+const ANCHOR_LINES = 8;
+
+/** Where the pane's text stood at the restart: digests of the last history lines (the anchor) and how often each
+ *  Account line occurs after them. */
+export interface AccountTextMark {
+  anchor: string[];
+  counts: Record<string, number>;
 }
 
-/** Whether a status `Account:` line names `expected` as a whole value: `bob@corp.com` doesn't match
- *  `jimbob@corp.com` or `bob@corp.com.au`. Case-insensitive, as account names are. */
+/** The pane's non-empty lines, trailing blanks removed. */
+function paneLines(text: string): string[] {
+  return text.split("\n").map((line) => line.trimEnd()).filter((line) => line.length > 0);
+}
+
+/** The lines after the anchor's last occurrence. When trimming has cut into the anchor, its longest surviving end
+ *  is used; when none of it survives, every line left came after it. The last occurrence is taken, so a repeat of
+ *  the anchor can only shorten what is compared, never reach back before the restart. */
+export function linesAfterAnchor(lines: string[], anchor: string[]): string[] {
+  const keys = lines.map(lineDigest);
+  for (let size = anchor.length; size >= 1; size--) {
+    const tail = anchor.slice(anchor.length - size);
+    for (let at = keys.length - size; at >= 0; at--) {
+      if (tail.every((key, offset) => keys[at + offset] === key)) return lines.slice(at + size);
+    }
+  }
+  return lines;
+}
+
+/** The anchor and the Account counts after it from one capture; null when the pane couldn't be read. The last history
+ *  line isn't part of the anchor: it can be the start of a line that wraps onto the screen, and joins its continuation
+ *  once it scrolls up. The counts start where the anchor actually ends, not after its last match: a copy of the anchor
+ *  on the screen can be redrawn away, and verify would then compare lines that were never counted. */
+export function accountTextMark(capture: { history: string; all: string } | null): AccountTextMark | null {
+  if (capture === null) return null;
+  const history = paneLines(capture.history);
+  const all = paneLines(capture.all);
+  const end = Math.max(0, history.length - 1);
+  const anchor = history.slice(Math.max(0, end - ANCHOR_LINES), end).map(lineDigest);
+  // The two captures can be separate tmux commands. If the pane moved between them, the anchor isn't where history
+  // ended, so the baseline is the whole pane with no anchor, and verify compares the whole pane.
+  const aligned = anchor.every((key, i) => lineDigest(all[end - anchor.length + i] ?? "") === key);
+  const counts: Record<string, number> = {};
+  for (const line of accountLines((aligned ? all.slice(end) : all).join("\n"))) {
+    counts[lineDigest(line)] = (counts[lineDigest(line)] ?? 0) + 1;
+  }
+  return { anchor: aligned ? anchor : [], counts };
+}
+
+/** Whether a status `Account:` line names `expected` as a whole value: `bob@example.com` doesn't match
+ *  `jimbob@example.com` or `bob@example.com.au`. Case-insensitive, as account names are. */
 export function accountLineNames(line: string, expected: string): boolean {
   const want = expected.trim();
   if (!want) return false;
   const escaped = want.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`(^|[^A-Za-z0-9._%+@-])${escaped}($|[^A-Za-z0-9._%+@-])`, "i").test(line.replace(/^Account:\s*/i, " "));
+}
+
+/** argv from a /proc/<pid>/cmdline read: NUL-terminated words, each kept exactly (spaces and empty words included). */
+export function procCmdlineArgv(raw: Buffer | string): string[] | null {
+  const words = raw.toString("utf8").split("\0");
+  if (words.at(-1) === "") words.pop();
+  return words.length > 0 ? words : null;
 }
 
 export function defaultInPlaceRestartIo(): InPlaceRestartIo {
@@ -1016,22 +1166,26 @@ export function defaultInPlaceRestartIo(): InPlaceRestartIo {
       try {
         const environ = fs.readFileSync(`/proc/${pid}/environ`);
         const env: ProcessFacts["env"] = {};
-        const apiKeyEnvNames: string[] = [];
         for (const entry of environ.toString("utf8").split("\0")) {
           const eq = entry.indexOf("=");
           if (eq <= 0) continue;
           const key = entry.slice(0, eq);
           if (key === "CODEX_HOME" || key === "HOME") env[key] = entry.slice(eq + 1);
-          else if (API_KEY_NAMES.includes(key) && eq < entry.length - 1) apiKeyEnvNames.push(key);
         }
         const read = (link: string) => { try { return fs.readlinkSync(`/proc/${pid}/${link}`); } catch { return null; } };
-        return { cwd: read("cwd"), exe: read("exe"), env, apiKeyEnvNames: apiKeyEnvNames.sort() };
+        let argv: string[] | null = null;
+        try { argv = procCmdlineArgv(fs.readFileSync(`/proc/${pid}/cmdline`)); }
+        catch { /* unreadable: the restart falls back to the ps command line */ }
+        return { cwd: read("cwd"), exe: read("exe"), env, argv };
       } catch {
         return null;
       }
     },
     async readThreadId(pid, startedAt, codexHome) {
-      return new CodexThreadIdResolver({ codexHome }).resolve(pid, startedAt);
+      return (await new CodexThreadIdResolver({ codexHome }).resolveWithReadability(pid, startedAt)).thread;
+    },
+    async readThreadEvidence(pid, startedAt, codexHome) {
+      return new CodexThreadIdResolver({ codexHome }).resolveWithReadability(pid, startedAt);
     },
     readCredentialStore(codexHome) {
       let text: string;

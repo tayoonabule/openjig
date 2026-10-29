@@ -39,7 +39,9 @@ export interface ArtifactPoolSpec {
    * When true, artifacts whose frontmatter cannot be parsed are still
    * included with empty frontmatter. Default false: malformed frontmatter
    * causes the artifact to be excluded (matches POC behavior so that
-   * agents do not get woken about half-written drafts).
+   * agents do not get woken about half-written drafts). An opening `---`
+   * with no closing `---` line counts as malformed, including Markdown
+   * whose first line is a `---` horizontal rule; `true` still includes it.
    */
   include_malformed_frontmatter?: boolean;
 }
@@ -92,7 +94,7 @@ function readFrontmatter(filePath: string): {
   }
   const close = /\n---(?:\n|$)/.exec(text.slice(FRONTMATTER_OPEN.length - 1));
   if (!close) {
-    return { raw, frontmatter: {}, frontmatter_parse_error: null };
+    return { raw, frontmatter: {}, frontmatter_parse_error: "frontmatter closing delimiter is missing" };
   }
   const block = text.slice(FRONTMATTER_OPEN.length, FRONTMATTER_OPEN.length - 1 + close.index);
   let parsed: unknown;
@@ -180,10 +182,9 @@ function statusFromFrontmatter(fm: Record<string, unknown>): string | null {
 export async function scanArtifactPools(
   pools: ArtifactPoolSpec | ArtifactPoolSpec[] | undefined,
 ): Promise<ScannedArtifact[]> {
+  const problem = artifactPoolListProblem(pools);
+  if (problem) throw new Error(problem);
   const expanded = expandPools(pools);
-  if (expanded.length === 0) {
-    throw new Error("artifact pool policy: context pool list is required");
-  }
   const out: ScannedArtifact[] = [];
   for (const pool of expanded) {
     if (!pool.path) {
@@ -223,11 +224,16 @@ export async function scanArtifactPools(
   return out.sort((a, b) => a.path.localeCompare(b.path));
 }
 
+/** Why `scanArtifactPools` refuses these pools before scanning any, or null. A job update checks a new spec with this too. */
+export function artifactPoolListProblem(pools: ArtifactPoolSpec | ArtifactPoolSpec[] | undefined): string | null {
+  return expandPools(pools).length === 0 ? "artifact pool policy: context pool list is required" : null;
+}
+
 /**
  * Expand the convenience input shape (single object, array of objects,
  * or `paths: [...]` shorthand) into a flat array of single-path pools.
  */
-function expandPools(
+export function expandPools(
   pools: ArtifactPoolSpec | ArtifactPoolSpec[] | undefined,
 ): ArtifactPoolSpec[] {
   if (!pools) return [];

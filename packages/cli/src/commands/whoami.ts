@@ -94,6 +94,7 @@ function projectCompactWhoami(data: Record<string, unknown>, bounded?: BoundedPe
       podNamespace: id["podNamespace"],
       memberId: id["memberId"],
       sessionName: id["sessionName"],
+      senderAddress: id["senderAddress"],
       runtime: id["runtime"],
     },
     peers: peers.map((p) => {
@@ -160,7 +161,8 @@ function whoamiPeersBound(): number {
 
 type TmuxExecFn = (cmd: string) => string;
 
-const defaultTmuxExec: TmuxExecFn = (cmd: string) => execSync(cmd, { encoding: "utf-8" }).trim();
+// tmux's stderr (an unset @rigged_* option, no server) rides the thrown error; callers fall through.
+const defaultTmuxExec: TmuxExecFn = (cmd: string) => execSync(cmd, { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
 function buildPartialWhoamiResult(source: { nodeId?: string; sessionName?: string }): Record<string, unknown> {
   return {
@@ -408,6 +410,7 @@ left out. --all-peers lists every one (today's compact output).`)
       console.log(`Logical ID: ${id.logicalId}`);
       console.log(`Pod:        ${(id.podNamespace ?? id.podId) ?? "—"} / ${id.memberId}`);
       console.log(`Session:    ${id.sessionName ?? "—"}`);
+      if (id.senderAddress && id.senderAddress !== id.sessionName) console.log(`Sender:     ${id.senderAddress}`);
       console.log(`Runtime:    ${id.runtime}`);
       console.log(`Transport:  ${id.attachmentType === "external_cli" ? "external_cli (outbound only)" : id.attachmentType}`);
       console.log(`Resolved:   via ${data.resolvedBy.replace(/_/g, " ")}`);

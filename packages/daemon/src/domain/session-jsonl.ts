@@ -19,8 +19,9 @@ export interface JsonlExchange {
 }
 
 /** Extract the user-visible text from a message `content` field (string, or an array of blocks —
- *  join `text` blocks, plus Codex input_text/output_text when requested; skip thinking/tool_use). Returns "" when there is no text. */
-function extractText(content: unknown, codex = false): string {
+ *  join `text` blocks, plus Codex input_text/output_text when requested; skip thinking/tool_use). Returns "" when there is no text.
+ *  Jcode message content blocks use the same {type:"text", text} shape as Claude projects. */
+export function extractText(content: unknown, codex = false): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content

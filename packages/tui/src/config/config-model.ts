@@ -1,4 +1,4 @@
-import { fieldLine, sectionRule, wrapDetailLines, type ContentLine } from "../detail.js";
+import { fieldLine, sectionRule, sliceWhole, wrapDetailLines, type ContentLine } from "../detail.js";
 import type { FleetSnapshot, ViewState } from "../types.js";
 
 export interface ConfigEntry {
@@ -61,6 +61,7 @@ const LABELS: Record<string, string> = {
   "snapshots.periodic.enabled": "Periodic snapshots", "snapshots.periodic.interval_seconds": "Snapshot interval",
   "snapshots.periodic.retention_keep": "Snapshots to retain", "ui.terminal.max_live_terminals": "Legacy web terminal limit",
   "retention.usage_samples_days": "Usage sample retention",
+  "retention.stream_days": "Stream retention (days)", "retention.stream_max_items": "Stream items kept",
   "transcripts.poll_interval_seconds": "Transcript refresh", "transcripts.lines": "Transcript lines",
   "ui.preview.refresh_interval_seconds": "Preview refresh", "ui.preview.max_pins": "Preview pins",
   "ui.preview.default_lines": "Preview lines", "context.system_world": "System world",
@@ -68,10 +69,11 @@ const LABELS: Record<string, string> = {
   "output.compact": "Compact command output",
   "output.whoami_peers": "Peers listed by whoami (compact)",
   "provider.usage_windows": "Codex and Claude usage windows",
-  "provider.subscription_moves": "Subscription move record",
+  "provider.selected": "Providers chosen at setup",
   "usage.pi_cost_facts": "Pi cost from persisted entries",
   "usage.pi_openrouter_charge": "OpenRouter charge for Pi requests",
   "transport.verify_input_box": "Verify by input box (Claude Code, Codex)",
+  "terminal.history_limit": "tmux scrollback rows",
   "ui.enabled": "Web UI",
   "health.context_pressure.warning_percent": "Context warning threshold",
   "health.context_pressure.critical_percent": "Context critical threshold",
@@ -125,7 +127,7 @@ export function configValue(entry: ConfigEntry, defaultValue = false): string {
   return String(v);
 }
 function clip(text: string, width: number): string {
-  return text.length <= width ? text : text.slice(0, Math.max(0, width - 1)) + "…";
+  return text.length <= width ? text : sliceWhole(text, Math.max(0, width - 1)) + "…";
 }
 export function configListLines(entries: ConfigEntry[], width: number, selectedKey?: string): ContentLine[] {
   const room = Math.max(20, width);

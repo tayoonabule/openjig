@@ -5,6 +5,7 @@ import {
   CODEX_ACTIVITY_RUNG_INVENTORY,
   JCODE_ACTIVITY_RUNG_INVENTORY,
   TMUX_GENERIC_RUNG_INVENTORY,
+  PI_ACTIVITY_RUNG_INVENTORY,
   runtimeRungInventory,
 } from "../src/domain/activity-taxonomy.js";
 import { readClaudeSelfReportEvidence, type ClaudeSelfReportRead } from "../src/adapters/claude-code-adapter.js";
@@ -44,8 +45,9 @@ describe("S19 A5 — per-harness rung inventories (one data source)", () => {
   it("runtime resolution: claude/codex/jcode map to their inventories; anything else gets the generic floor", () => {
     expect(runtimeRungInventory("claude-code")).toBe(CLAUDE_ACTIVITY_RUNG_INVENTORY);
     expect(runtimeRungInventory("codex")).toBe(CODEX_ACTIVITY_RUNG_INVENTORY);
+    expect(runtimeRungInventory("pi")).toBe(PI_ACTIVITY_RUNG_INVENTORY);
+    expect(runtimeRungInventory("terminal")).toBe(TMUX_GENERIC_RUNG_INVENTORY);
     expect(runtimeRungInventory("jcode")).toBe(JCODE_ACTIVITY_RUNG_INVENTORY);
-    expect(runtimeRungInventory("pi")).toBe(TMUX_GENERIC_RUNG_INVENTORY);
     expect(runtimeRungInventory(null)).toBe(TMUX_GENERIC_RUNG_INVENTORY);
   });
 });

@@ -16,13 +16,18 @@ import { makeQueuePorts } from "../gateway/slack/queue-access.js";
 import type { OwnerNotificationLevel } from "../queue-transition-log.js";
 import { OUTBOUND_OP } from "../gateway/slack/outbound-driver.js";
 import { DispatchBuffer } from "../gateway/dispatch-buffer.js";
+import { resolveDefaultPerson } from "../gateway/participants.js";
 import type { Policy, PolicyJob, PolicyEvaluation } from "./types.js";
+import { quietHoldFor } from "../gateway/human-quiet-windows.js";
+import { WatchdogJobsRepository } from "../watchdog-jobs-repository.js";
+import { holdForQuiet } from "./quiet-release.js";
 
 export const DELIVERY_DIGEST_FLUSH_POLICY = "delivery-digest-flush";
 
 interface RegistrySurfaceLike {
   loadHumanRegistry: (home: string) => {
     ok: boolean;
+    noHumans?: true;
     entities?: Array<{ entityId: string; address: string }>;
   };
 }
@@ -34,12 +39,24 @@ export interface RunDeliveryDigestFlushInput {
   dispatch: (op: string, entityBindingRef: string, payload: unknown, opts?: { decisionId?: string }) => { ok: boolean; error?: string };
   window: "4h" | "daily";
   minimumLevel?: OwnerNotificationLevel;
+  now?: Date;
 }
 
-export async function runDeliveryDigestFlush(input: RunDeliveryDigestFlushInput): Promise<{ dispatched: number; members: number }> {
+export interface DeliveryDigestFlushResult {
+  dispatched: number;
+  members: number;
+  /** Why nothing was dispatched; present only when `dispatched` is 0. */
+  idleReason?: string;
+}
+
+export async function runDeliveryDigestFlush(input: RunDeliveryDigestFlushInput): Promise<DeliveryDigestFlushResult> {
   const reg = input.registry.loadHumanRegistry(input.home);
-  if (!reg.ok || !reg.entities || reg.entities.length === 0) return { dispatched: 0, members: 0 };
-  const human = reg.entities[0]!;
+  if (!reg.ok && reg.noHumans) return { dispatched: 0, members: 0, idleReason: "no person is registered" };
+  if (!reg.ok || !reg.entities) return { dispatched: 0, members: 0, idleReason: "the human registry can't be read" };
+  if (reg.entities.length === 0) return { dispatched: 0, members: 0, idleReason: "no person is registered" };
+  // Asks and updates below go to their own recipients; the digest of notices goes to the default person.
+  const defaultPerson = resolveDefaultPerson(reg.entities, input.home);
+  const human = defaultPerson.person;
 
   const ports = makeQueuePorts(input.queueRepo, {
     loadHumanRegistry: () => reg,
@@ -66,19 +83,40 @@ export async function runDeliveryDigestFlush(input: RunDeliveryDigestFlushInput)
     }
   } catch { /* unreadable buffer: fail open to selection; the dispatcher's stable-id idempotence still guards the same-set case */ }
 
-  const selected = alerts.filter((alert) => {
+  const candidates = alerts.filter((alert) => {
     const key = alert.notificationKey ?? alert.qitemId;
     if (inFlight.has(key)) return false;
-    return input.queueRepo.listTransitions(alert.qitemId).some((t) =>
-      t.transitionNote?.startsWith("delivery-decision: digest")
-        && t.transitionNote.includes(`notification_key=${key}`)
-        && t.transitionNote.includes(`window=${input.window}`));
+    const notes = input.queueRepo.listTransitions(alert.qitemId).map((t) => t.transitionNote ?? "");
+    // An ask held for quiet hours belongs to its window's release job, which posts it individually.
+    if (notes.some((n) => n.startsWith("delivery-decision: quiet-hold") && n.split(/\s+/).includes(`notification_key=${key}`))) return false;
+    return notes.some((n) =>
+      n.startsWith("delivery-decision: digest")
+        && n.includes(`notification_key=${key}`)
+        && n.includes(`window=${input.window}`));
   });
-  if (selected.length === 0) return { dispatched: 0, members: 0 };
+  // Quiet hours re-checked at flush time, per ask, for its actual recipient: an ask put in the digest before its
+  // recipient's quiet began is held under that recipient's window, not posted. Everything else flushes as before.
+  const now = input.now ?? new Date();
+  let jobsRepo: WatchdogJobsRepository | undefined;
+  const selected = candidates.filter((item) => {
+    const recipient = (item.destinationSession ?? "").split("@")[0] ?? "";
+    const quiet = recipient ? quietHoldFor(input.queueRepo.db, recipient, now) : null;
+    if (!quiet) return true;
+    jobsRepo ??= new WatchdogJobsRepository(input.queueRepo.db);
+    holdForQuiet({ queueRepo: input.queueRepo, jobsRepo, qitemId: item.qitemId, entityId: recipient,
+      hold: { ...quiet, notificationKey: item.notificationKey ?? item.qitemId } });
+    return false;
+  });
+  if (selected.length === 0) {
+    const held = candidates.length;
+    return { dispatched: 0, members: 0,
+      idleReason: held > 0 ? `${held} item(s) held for quiet hours` : "nothing to flush" };
+  }
   // The selected timing remains the existing digest policy. At that time a
   // human request/update needs its OWN complete brief and reply identity, not a
   // summary-only member receipt. Ordinary system notices retain aggregation.
   let completeDispatched = 0;
+  let dispatchError: string | undefined;
   const members = [] as typeof selected;
   for (const item of selected) {
     if (item.ownerNotificationKind !== "human-required" && item.ownerNotificationKind !== "human-update" && !item.humanDetail) {
@@ -88,8 +126,19 @@ export async function runDeliveryDigestFlush(input: RunDeliveryDigestFlushInput)
     const id = createHash("sha256").update(input.window + "|" + (item.notificationKey ?? item.qitemId)).digest("hex").slice(0, 32);
     const result = input.dispatch(OUTBOUND_OP, item.destinationSession!, { ...item, deliveryDigestPost: true }, { decisionId: `digest:complete:${id}` });
     if (result.ok) completeDispatched++;
+    else dispatchError ??= result.error;
   }
-  if (!members.length) return { dispatched: completeDispatched, members: selected.length };
+  const failed = (error: string | undefined) => `digest dispatch failed: ${error ?? "unknown error"}`;
+  if (!members.length) {
+    return completeDispatched > 0 ? { dispatched: completeDispatched, members: selected.length }
+      : { dispatched: 0, members: selected.length, idleReason: failed(dispatchError) };
+  }
+  // Several people and none chosen: the notices wait (they stay selectable) rather than going to whoever sorts first.
+  if (!human) {
+    return completeDispatched > 0 ? { dispatched: completeDispatched, members: selected.length }
+      : { dispatched: 0, members: selected.length,
+        idleReason: `${members.length} notice(s) wait: ${defaultPerson.reason ?? "no default person"}` };
+  }
 
   const memberReceipts = members.map((m) => ({
     qitemId: m.qitemId,
@@ -113,7 +162,9 @@ export async function runDeliveryDigestFlush(input: RunDeliveryDigestFlushInput)
     memberReceipts,
   };
   const res = input.dispatch(OUTBOUND_OP, human.address, payload, { decisionId: `digest:${digestId}` });
-  return { dispatched: completeDispatched + (res.ok ? 1 : 0), members: selected.length };
+  const dispatched = completeDispatched + (res.ok ? 1 : 0);
+  if (dispatched > 0) return { dispatched, members: selected.length };
+  return { dispatched: 0, members: selected.length, idleReason: failed(res.error) };
 }
 
 /** Watchdog-engine policy wrapper — the repeating window flush (digests recur;
@@ -130,7 +181,7 @@ export function makeDeliveryDigestFlushPolicy(deps: {
       const window = ((job.context as { window?: string }).window === "daily" ? "daily" : "4h") as "4h" | "daily";
       const r = await runDeliveryDigestFlush({ ...deps, window });
       if (r.dispatched > 0) return { action: "skip", reason: `digest dispatched (${r.members} items)` };
-      return { action: "skip", reason: "nothing to flush" };
+      return { action: "skip", reason: r.idleReason ?? "nothing to flush" };
     },
   } as Policy;
 }

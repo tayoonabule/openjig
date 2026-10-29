@@ -53,7 +53,7 @@ function fixture(alphaMissions = "missions") {
 }
 
 describe("project-qualified proof scope (#132)", () => {
-  it("infers Hull and Provineer projects from the sender rig for show and judge, without changing explicit selection", async () => {
+  it("infers projects from the sender rig but preserves explicit selection", async () => {
     const f = fixture();
 
     const hull = await f.get("scope=m0/slices/01-t001", "worker@hull");
@@ -75,10 +75,10 @@ describe("project-qualified proof scope (#132)", () => {
     expect(fs.existsSync(join(f.legacy.slice, "proof/judgments"))).toBe(false);
   });
 
-  it("normalizes project-root-relative mission paths for inferred and explicit projects", async () => {
+  it("normalizes project-root-relative mission paths and rejects escaping paths", async () => {
     const f = fixture("work/missions");
 
-    const inferred = await f.get("scope=work/missions/m0", "worker@hull");
+    const inferred = await f.get("scope=work/missions/m0/slices/01-t001", "worker@hull");
     expect(inferred.status).toBe(200);
     expect((await inferred.json()).project).toEqual({ id: "alpha", root: join(f.workspace, "alpha") });
 
@@ -90,7 +90,7 @@ describe("project-qualified proof scope (#132)", () => {
     expect(judged.status).toBe(201);
     expect((await judged.json()).judgment.scope).toBe("work/missions/m0/slices/01-t001");
 
-    const escaping = await f.get("scope=work/missions/../../../beta/missions/m0", "worker@hull");
+    const escaping = await f.get("project=alpha&scope=work/missions/../../../beta/missions/m0");
     expect(escaping.status).toBe(400);
     expect((await escaping.json()).error).toBe("path_escape");
   });
@@ -144,7 +144,7 @@ describe("project-qualified proof scope (#132)", () => {
     expect((await sibling.json()).error).toBe("path_escape");
     const judged = await f.judge("alpha:../../legacy/missions/m0/slices/01-t001", {}, f.legacy.slice);
     expect((await judged.json()).error).toBe("path_escape");
-    const outside = fs.mkdtempSync(join(tmpdir(), "proof-outside-")); fixtures.push(outside);
+    const outside = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "proof-outside-"))); fixtures.push(outside);
     fs.writeFileSync(join(outside, "evidence.md"), "outside");
     fs.symlinkSync(outside, join(f.alpha.slice, "proof/outside"));
     const evidence = await f.judge("alpha:m0/slices/01-t001", { evidence: ["proof/outside/evidence.md"] });
@@ -194,6 +194,23 @@ describe("project-qualified proof scope (#132)", () => {
     expect(workspace.sourceObservation).toEqual({ state: "watching", revision: "workspace-1" });
   });
 
+  it("accepts a prepared root through a symlink, but refuses when that link selects another project", async () => {
+    const f = fixture();
+    const alias = join(f.workspace, "alpha-link");
+    fs.symlinkSync(join(f.workspace, "alpha"), alias, "dir");
+    const scope = "alpha:m0/slices/01-t001";
+    for (const root of [alias, `${alias}/.`]) {
+      const read = await f.get(`scope=${encodeURIComponent(scope)}&projectRoot=${encodeURIComponent(root)}`);
+      expect(read.status).toBe(200);
+    }
+    expect((await f.judge(scope, { projectRoot: alias })).status).toBe(201);
+    fs.unlinkSync(alias);
+    fs.symlinkSync(join(f.workspace, "beta"), alias, "dir");
+    const moved = await f.judge(scope, { projectRoot: alias });
+    expect(moved.status).toBe(409);
+    expect(await moved.json()).toMatchObject({ error: "project_changed" });
+  });
+
   it("a judgment pinned to the prepared projectRoot records; a moved root is refused with 409 project_changed", async () => {
     const f = fixture();
     const root = join(f.workspace, "alpha");
@@ -208,7 +225,7 @@ describe("project-qualified proof scope (#132)", () => {
   });
 
   it("a README-only catalog project under an ancestor project.yaml can't reach evidence outside its own root (CodeRabbit, CWE-22)", async () => {
-    const ws = fs.mkdtempSync(join(tmpdir(), "proof-ancestor-")); fixtures.push(ws);
+    const ws = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "proof-ancestor-"))); fixtures.push(ws);
     // the workspace itself has a project.yaml whose policy would authorise the judge; the catalog project has none
     write(join(ws, "project.yaml"), { kind: "project", metadata: { id: "outer" }, proofPolicy: { judges: ["judge@rig"] } });
     write(join(ws, "workspace.yaml"), { projects: [{ id: "readme-only", root: "readme-only" }] });
@@ -247,7 +264,7 @@ describe("project-qualified proof scope (#132)", () => {
   // Review (2026-10-01): scope readiness agrees with proof. A catalogued project that keeps its contract in README
   // (no SPEC, no project.yaml of its own) sits under a workspace whose own project.yaml has a different judge.
   function readmeProject() {
-    const ws = fs.mkdtempSync(join(tmpdir(), "proof-scopes-")); fixtures.push(ws);
+    const ws = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "proof-scopes-"))); fixtures.push(ws);
     write(join(ws, "project.yaml"), { kind: "project", metadata: { id: "outer" }, proofPolicy: { judges: ["outer@rig"] } });
     write(join(ws, "workspace.yaml"), { projects: [{ id: "readme-only", root: "readme-only" }, { id: "bare", root: "bare" }] });
     const mission = (root: string, policy: object) => {

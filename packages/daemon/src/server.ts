@@ -33,6 +33,7 @@ import type { DiscoveryRepository } from "./domain/discovery-repository.js";
 import type { ClaimService } from "./domain/claim-service.js";
 import type { SelfAttachService } from "./domain/self-attach-service.js";
 import { rigsRoutes } from "./routes/rigs.js";
+import { OPERATION_CONTRACT, OPERATION_KINDS } from "./domain/operation-correlation.js";
 import { sessionsRoutes, nodesRoutes, sessionAdminRoutes } from "./routes/sessions.js";
 import { adaptersRoutes } from "./routes/adapters.js";
 import { eventsRoute } from "./routes/events.js";
@@ -145,6 +146,8 @@ import { createRouteTimingMiddleware } from "./domain/route-timing-recorder.js";
 import { browserBoundary, type BrowserBoundaryOptions } from "./middleware/browser-boundary.js";
 
 export interface AppDeps {
+  /** Boot-time DB context observations, not a live exclusion guarantee. */
+  databaseWarnings?: string[];
   proofSourceWatch?: import("./domain/proof/source-watch.js").ProofSourceWatch;
   /** S20 — effective bind plan for the health surface (absent = legacy body). */
   bindPlan?: { mode: "explicit" | "default"; hosts: string[]; tailscaleDetected: boolean; ignoredRoutingHost?: string };
@@ -158,6 +161,8 @@ export interface AppDeps {
   /** Seat-scoped explicit fresh launch composes the same startup owner as rig launch. */
   startupOrchestrator?: import("./domain/startup-orchestrator.js").StartupOrchestrator;
   tmuxAdapter: TmuxAdapter;
+  /** Shared process census used by startup observations and native lineage checks. */
+  listProcesses?: import("./domain/native-process-lineage.js").NativeProcessLister;
   /** OPR.0.4.6.02 S1 — the shared tmux option-defaults applier, exposed to
    *  the seat-handover route so a fresh successor gets launch-only defaults. */
   tmuxOptionDefaults?: TmuxOptionDefaultsApplier;
@@ -269,6 +274,7 @@ export interface AppDeps {
   terminalService?: import("./domain/terminal/terminal-service.js").TerminalService;
   managedHerdrViews?: import("./domain/terminal/managed-herdr-views.js").ManagedHerdrViews;
   herdrAgentBridge?: import("./domain/terminal/jcode-herdr-agent-bridge.js").HerdrAgentBridge;
+  herdrAgentBridges?: import("./domain/terminal/jcode-herdr-agent-bridge.js").HerdrAgentBridge[];
   sliceDetailProjector?: import("./domain/slices/slice-detail-projector.js").SliceDetailProjector;
   /** User Settings v0 — daemon-side settings store (env > file > default). */
   settingsStore?: import("./domain/user-settings/settings-store.js").SettingsStore;
@@ -513,6 +519,7 @@ export function createApp(deps: AppDeps): Hono {
     c.set("nodeLauncher" as never, deps.nodeLauncher);
     c.set("startupOrchestrator" as never, deps.startupOrchestrator);
     c.set("tmuxAdapter" as never, deps.tmuxAdapter);
+    c.set("listProcesses" as never, deps.listProcesses);
     c.set("tmuxOptionDefaults" as never, deps.tmuxOptionDefaults);
     c.set("sessionEnv" as never, deps.sessionEnv);
     c.set("runtimeSessionEnv" as never, deps.runtimeSessionEnv);
@@ -669,12 +676,15 @@ export function createApp(deps: AppDeps): Hono {
 
   app.get("/healthz", (c) => {
     // OPR.0.4.3.21 — enrich the health surface with event-loop wedge evidence
-    // when the monitor is wired. Absent monitor keeps the exact legacy body so
-    // existing probes / tests that assert `{ status: "ok" }` are unchanged.
+    // when the monitor is wired. Process identity is additive with or without the monitor.
     // OPR.0.4.4.11 FR-7 — a STAMPED build additionally carries
     // {semver, commit, dirty, builtAt}; dev runs add NOTHING (stampFields is
     // {} without a stamp — no invented identity, legacy bodies preserved).
     const stamp = stampFields();
+    // Self-report for the optional CLI effective-user check, not authentication.
+    const euid = process.geteuid?.();
+    const databaseContext = deps.databaseWarnings?.length ? { databaseWarnings: deps.databaseWarnings } : {};
+    const processIdentity = { ...databaseContext, pid: process.pid, ...(euid === undefined ? {} : { euid }) };
     // 51-09 increment 3 (arch ruling 2e1b737f; local always-suffix rendering since
     // superseded by the 2026-08-27 root invariant) — expose the daemon's boot-reconciled
     // self-host id so the CLI edge can detect cross-host targets, self-resolve a
@@ -709,12 +719,12 @@ export function createApp(deps: AppDeps): Hono {
     // floor (escalation view + daemon-health); same additive contract.
     const wakeLadder = deps.wakeLadderStatus ? { wakeLadder: deps.wakeLadderStatus.snapshot() } : {};
     if (!monitor) {
-      return c.json({ status: "ok", pid: process.pid, ...stamp, ...selfHost, ...slowOperations, ...bind, ...stuckSweep, ...wakeLadder });
+      return c.json({ status: "ok", ...processIdentity, ...stamp, ...selfHost, ...slowOperations, ...bind, ...stuckSweep, ...wakeLadder });
     }
     const eventLoop = monitor.snapshot();
     return c.json({
       status: "ok",
-      pid: process.pid,
+      ...processIdentity,
       ...stamp,
       ...selfHost,
       eventLoop,
@@ -727,6 +737,7 @@ export function createApp(deps: AppDeps): Hono {
   });
 
   app.route("/api/rigs", rigsRoutes);
+  app.get("/api/operations/capabilities", (c) => c.json({ contract: OPERATION_CONTRACT, kinds: OPERATION_KINDS }));
   app.route("/api/rigs/:rigId/sessions", sessionsRoutes);
   // Slice 24 — per-rig CMUX workspace launcher.
   app.route("/api/rigs/:rigId/cmux", rigCmuxRoutes);
@@ -813,7 +824,7 @@ export function createApp(deps: AppDeps): Hono {
   // OPR.0.4.6.02 C3 — the canonical non-rig-scoped terminal composer + the
   // rig-scoped thin alias (composes view=rig:<rigId>, delegates to the same
   // TerminalService; arch R1 / guard b1).
-  app.route("/api/terminal", terminalRoutes());
+  app.route("/api/terminal", terminalRoutes({ bearerToken: deps.terminalBearerToken ?? null }));
   app.route("/api/rigs/:rigId/terminal", rigTerminalRoutes);
   // V0.3.1 slice 12 walk-item 1 — mission scope data layer
   // (aggregated mission metadata + slices filter; pairs with

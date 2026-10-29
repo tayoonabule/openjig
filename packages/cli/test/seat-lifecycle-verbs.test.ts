@@ -1,3 +1,6 @@
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 // S5 (OPR.0.5.4.7) — CLI surface for rig seat set-model / stop / clean: required
 // options, route paths + bodies posted, human output, refusal printing, --json
 // pass-through with non-zero exit.
@@ -74,6 +77,36 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("terminal interaction policy", () => {
+  it("records the explicit preset and actor exceptions without changing native permissions", async () => {
+    const calls: Array<{ path: string; body: unknown }> = [];
+    const { logs, exitCode } = await captureLogs(() => makeCommand(makeDeps({ status: 200,
+      data: { ok: true, effect: "Saved for managed checks; no native permission change." } }, calls)).parseAsync([
+      "node", "rig", "seat", "set-terminal-policy", "reviewer@team", "--preset", "help-within-instructions",
+      "--helper", "helper@team", "--peer-model", "deny", "--openrig-compaction", "allow", "--reason", "Keep the review model",
+    ]));
+    expect(calls).toEqual([{ path: "/api/seat/set-terminal-policy/reviewer%40team", body: {
+      preset: "help-within-instructions", helpers: ["helper@team"],
+      exceptions: { peer: { model: "deny" }, openrig: { compaction: "allow" } },
+      rigDefault: false, reason: "Keep the review model", operator: undefined,
+    } }]);
+    expect(exitCode).toBeUndefined();
+    expect(logs.join("\n")).toContain("rig seat status 'reviewer@team'");
+  });
+
+  it("shows actor scope and enforcement limits in the ordinary seat account", async () => {
+    const calls: Array<{ path: string; body: unknown }> = [];
+    const { logs } = await captureLogs(() => makeCommand(makeDeps({ status: 200, data: {
+      seat_ref: "reviewer@team", terminalPolicy: { state: "planned", label: "Custom", source: "explicit",
+        instruction: "Keep the review model", rules: { peer: { compaction: "allow", model: "deny" } },
+        supported: { compaction: "managed", model: "saved setting; native effect unverified" } },
+    } }, calls)).parseAsync(["node", "rig", "seat", "status", "reviewer@team"]));
+    expect(logs.join("\n")).toContain("Terminal interaction (planned; managed checks): Custom [explicit]");
+    expect(logs.join("\n")).toContain("peer: compaction=allow; model/effort=deny");
+    expect(logs.join("\n")).toContain("Other interventions: guidance-only");
+  });
+});
+
 describe("#729 startup warnings", () => {
   it.each([[200, false], [200, true], [409, false], [409, true]] as const)("seat launch retains warnings and HTTP %s (json=%s)", async (status, json) => {
     const warning = "Startup submission unverified: capture unavailable";
@@ -136,6 +169,25 @@ describe("default-path rig seat continue", () => {
 });
 
 describe("rig seat set-permissions", () => {
+  it("posts a rules file as an audited future-launch update, keeping mode separate", async () => {
+    const root = mkdtempSync(join(tmpdir(), "seat-rules-")), file = join(root, "rules.json");
+    const rules = { allow: ["Bash(node lane.mjs *)"], deny: ["Read(./private/**)"] };
+    writeFileSync(file, JSON.stringify(rules));
+    const calls: Array<{ path: string; body: unknown }> = [];
+    const deps = makeDeps({ status: 200, data: { ok: true, changed: true, to: rules, effect: "Next managed launch only." } }, calls);
+    try {
+      const result = await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "set-permissions", "dev-impl@seat-rig",
+        "--rules", file, "--reason", "Select lane", "--operator", "human@example.test"]).then(() => {}));
+      expect(result.exitCode).toBeUndefined();
+      expect(calls).toEqual([{ path: "/api/seat/set-permissions/dev-impl%40seat-rig", body: { rules, reason: "Select lane", operator: "human@example.test" } }]);
+      expect(result.logs.join(" ")).toContain("recorded and audited");
+      calls.splice(0);
+      const ambiguous = await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "set-permissions", "dev-impl@seat-rig",
+        "--rules", file, "--mode", "full_bypass", "--reason", "No mixed update"]).then(() => {}));
+      expect(ambiguous.exitCode).toBe(1); expect(calls).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("posts the explicit operator with the existing mode and reason", async () => {
     const calls: Array<{ path: string; body: unknown }> = [];
     const deps = makeDeps({ status: 200, data: { ok: true, changed: true, to: { mode: "floor" }, effect: "Future managed launches only." } }, calls);
@@ -427,6 +479,22 @@ describe("fresh launch preview", () => {
     expect(deps.lifecycleDeps.spawn).not.toHaveBeenCalled();
   });
 
+  it("OPR.0.7.0.9: the printed plan shows the seat's launch additions, as the seat view does", async () => {
+    const launchAdditions = { agent: "openrig:reviewer", agentPromptReplacesDefault: true, appendSystemPromptFile: "/s/additions/system-prompt.md",
+      pluginDirs: ["/s/additions/plugins/review"], missing: ["/s/gone"], refused: ["/s/linked is not inside this seat's storage"] };
+    const data = { ok: true, planOnly: true, complete: true, launchable: true, sessionName: "dev@fixture", currentOccupant: "absent",
+      startup: { projectionCount: 0, fileCount: 0, actionCount: 0 }, stopRequired: false, wouldStop: false, blockers: [], warnings: [], siblings: [],
+      launchAdditions };
+    const deps = makeDeps({ status: 200, data }, []);
+    const output = await captureLogs(() => makeCommand(deps).parseAsync(["node", "rig", "seat", "launch", "dev@fixture", "--fresh", "--plan"]).then(() => undefined));
+    const text = output.logs.join("\n");
+    expect(text).toContain("agent       openrig:reviewer (--agent; its prompt replaces Claude's default system prompt)");
+    expect(text).toContain("prompt      /s/additions/system-prompt.md (--append-system-prompt-file)");
+    expect(text).toContain("plugin dir  /s/additions/plugins/review (CLAUDE_CODE_PLUGIN_DIRS)");
+    expect(text).toContain("missing     /s/gone: not passed to the launch");
+    expect(text).toContain("refused     /s/linked is not inside this seat's storage: not passed to the launch");
+  });
+
   it("fails closed on an older daemon without ever posting to the launch endpoint", async () => {
     const calls: Array<{ path: string; body: unknown }> = [];
     const deps = makeDeps({ status: 404, data: { error: "Not Found" } }, calls);
@@ -454,21 +522,21 @@ describe("OPR.0.7.0.5 rig seat restart --keep-conversation", () => {
     ok: true, planOnly: outcome === undefined, ...(outcome ? { outcome } : {}), message: "Done.",
     seat: { logicalId: "dev.codex", rigName: "r" }, sessionName: "dev-codex@r", pane: "%1", paneShape: "shell_backed",
     conversationId: "tok", conversationProof: "argv", activity: { state: "working", detail: "Mid-turn." },
-    childProcesses: [{ pid: 9, name: "node" }], codexHome: "/h/.codex", billingRoute: { detail: "Unknown." },
+    childProcesses: [{ pid: 9, name: "node" }], codexHome: "/h/.codex",
     account: { credentialStore: { detail: "File-backed." }, authFile: { detail: "Stat only." }, startupGate: null },
     peers: [{ logicalId: "dev.peer", effect: "Not restarted; account unverified." }], warnings: [],
   });
 
   it("prints the --no-daemon launch evidence and a named startup gate's kind", async () => {
     const data = { ...report("incomplete"), codexNoDaemonFlag: { present: true, detail: "Launch evidence: the running Codex was started with --no-daemon. This doesn't show whether an app-server process, its login or any lock is involved." },
-      processMode: { state: "unknown", detail: "Process mode: unknown. Nothing OpenRig reads shows whether the running Codex is attached to an app-server; the --no-daemon flag above is launch evidence only." },
       account: { credentialStore: { detail: "File-backed." }, authFile: { detail: "Stat only." }, startupGate: "Codex is waiting for hook trust approval.", startupGateKind: "hook_trust_gate" },
       remainingStep: "Codex is waiting for a hook review decision in the pane (dev-codex@r, pane %1). That decision is for the person or an authorised operator; once it's made, run the recovery command." };
     const output = await captureLogs(() => makeCommand(makeDeps({ status: 200, data }, [])).parseAsync([
       "node", "rig", "seat", "restart", "dev@r", "--keep-conversation", "--reason", "x"]).then(() => undefined));
     const text = output.logs.join("\n");
     expect(text).toContain("Launch evidence: the running Codex was started with --no-daemon.");
-    expect(text).toContain("Process mode: unknown. Nothing OpenRig reads shows whether the running Codex is attached to an app-server;");
+    expect(text).not.toContain("Process mode");
+    expect(text).not.toContain("Billing route");
     expect(text).toContain("Codex startup gate (hook_trust_gate): Codex is waiting for hook trust approval.");
     expect(text).toContain("Remaining step: Codex is waiting for a hook review decision");
   });

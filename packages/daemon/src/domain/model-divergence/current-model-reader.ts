@@ -1,3 +1,4 @@
+import { observeCodexRebuildPermissions } from "../codex-rebuild-permissions.js";
 import { realpathSync, statSync } from "node:fs";
 import type { SessionRegistry } from "../session-registry.js";
 import type { SeatIdentityStore } from "../seat-identity-store.js";
@@ -39,7 +40,7 @@ interface Deps {
   piRunner: (sessionName: string) => PiOccupantRecordInput["runner"];
   native: CurrentGenerationDeps;
   census: ProcessCensus;
-  readAllPaneProcesses?: () => Promise<Map<string, { pid: number }> | null>;
+  readAllPaneProcesses?: () => Promise<Map<string, { pid: number | null }> | null>;
   now?: () => number;
 }
 type InventoryNode = { nodeId: string; canonicalSessionName: string | null; runtime: string | null; sessionStatus: string | null };
@@ -55,6 +56,13 @@ export class CurrentModelReader {
   readonly processCensus: ProcessCensus;
   private readonly facts = new Map<string, { key: string; signature: string; fact: NativeModelObservation | null }>();
   constructor(private readonly deps: Deps) { this.processCensus = deps.census; }
+
+  /** Rebuild continuity uses a fresh process read before and after the bounded native record read. */
+  currentCodexPermissions(nodeId: string, sessionName: string, cwd: string) {
+    return observeCodexRebuildPermissions({ nodeId, sessionName, cwd, sessions: this.deps.sessions,
+      tmux: this.deps.native, readThreadId: this.deps.native.readThreadIdByPid,
+      rollout: thread => this.deps.codexRollout(thread, sessionName, true) });
+  }
 
   private async select(seat: Seat, native: CurrentGenerationDeps, target = seat.sessionName, reporting = false): Promise<Selection> {
     if (seat.runtime === "codex") {
@@ -177,7 +185,7 @@ export class CurrentModelReader {
     } };
     const prepared = await Promise.all(nodes.map(n => this.prepare(n, native)));
     if (!prepared.some(p => "finish" in p)) return prepared as ModelObservation[];
-    let after: Map<string, { pid: number }> | null = null;
+    let after: Map<string, { pid: number | null }> | null = null;
     try { after = await this.deps.readAllPaneProcesses(); } catch { /* UNKNOWN, never a fallback subprocess storm. */ }
     return prepared.map(p => "finish" in p ? p.finish(after?.get(p.pane)?.pid ?? null, after === null ? "native-read-unavailable" : "pane-unavailable") : p);
   }

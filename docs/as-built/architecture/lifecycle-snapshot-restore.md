@@ -37,8 +37,9 @@ All in `packages/daemon/src/domain/types.ts`. The spec/projection types live in
   `resumed`, `rebuilt`, `fresh`, `fresh-primed`, `awaiting-decision`,
   `failed`, `attention_required`, `operator_recovered`, `n-a`. The restore
   result itself, `RestoreNodeResult.status` (`types.ts:475`), has the same
-  values without `n-a`: **8**
+  values without `n-a`, plus `left_attached`: **9**
   (`grep -E '^  status: "resumed"' packages/daemon/src/domain/types.ts | grep -o '"[^"]*"' | wc -l`).
+  `left_attached` isn't a `NodeRestoreOutcome`; the inventory projects it as `n-a`.
   Where `restore-orchestrator.ts` sets each one:
   - `resumed` — `baseStatus = "resumed"` after a legacy resume (`:1030`); the
     status is returned only by `finishJoinedResume` (defined `:1320`, called
@@ -61,6 +62,10 @@ All in `packages/daemon/src/domain/types.ts`. The spec/projection types live in
     `:1292`, `:1300`).
   - `operator_recovered` — only from later reconciliation,
     `reconcileNodeRuntimeTruth` (`:1590`, event at `:1727`).
+  - `left_attached` — a seat joined with `rig attach` as an external CLI,
+    returned first in `restoreNodeWithCompensation`: nothing is launched and
+    its binding and claim stay as they were. It doesn't count against the
+    rollup, and its forecast in `restore-plan-preview.ts` is `leave-attached`.
 - **RestoreRigResult** (`types.ts:444`) — the rig-level rollup, **4** values
   (`grep '^export type RestoreRigResult' packages/daemon/src/domain/types.ts | grep -o '"[^"]*"' | wc -l`):
   `fully_restored`, `partially_restored`, `failed`, `not_attempted`.
@@ -68,10 +73,26 @@ All in `packages/daemon/src/domain/types.ts`. The spec/projection types live in
   first three; `not_attempted` is set when pre-restore validation fails
   (`:281`).
 - **SnapshotData** (`types.ts:351`) — the serialized snapshot payload. It has
-  **7** optional fields, kept optional so older snapshots still load
+  **8** optional fields, kept optional so older snapshots still load
   (`sed -n '/^export interface SnapshotData/,/^}/p' packages/daemon/src/domain/types.ts | grep -c '?:'`):
-  `activeSessionIdByNode?`, `activeOccupantsByNode?`, `topologyRoster?`,
-  `pods?`, `continuityStates?`, `nodeStartupContext?`, `envReceipt?`.
+  `activeSessionIdByNode?`, `activeOccupantsByNode?`, `periodicResumeSourcesByNode?`,
+  `topologyRoster?`, `pods?`, `continuityStates?`, `nodeStartupContext?`, `envReceipt?`.
+  Periodic snapshots retain a down agent's whole authoritative resume-source
+  session in `periodicResumeSourcesByNode`, without marking it running. A named
+  single-agent launch using automatic periodic selection can resume that exact
+  carried source; an explicit snapshot or whole-rig restore still asks about an
+  absent agent with resumable history. Tokenless and non-resume-policy agents
+  keep their existing fresh path. Only the node's newest session with a token
+  and `resume_if_possible` policy is carried; a current fresh-successor relation
+  must agree. Named launch rechecks the live newest session, resume policy and
+  fresh-successor relation under its lifecycle lease, before changing any seat
+  state; a source retired after capture stops and asks without launching.
+  Idle-shell carry advice uses automatic selection again, not an
+  explicit snapshot that disables carry. The selected source is shared by preflight and post-launch
+  restore; explicit reviewed-history selection keeps its existing checks.
+  Ranking, periodic cadence and `--fresh` are unchanged. Retention is best-effort
+  if the earlier-source lookup fails: capture still records current crash
+  insurance and logs that the resume sources were unavailable.
 - **NodeStartupSnapshot** (`types.ts:344`) — persisted restore replay input:
   classification-free projection entries, resolved startup files, startup
   actions, runtime.
@@ -145,15 +166,18 @@ Restore behavior, each point checked in `restore-orchestrator.ts`:
   prefilters missing optional artifacts into warnings; **hard-fails a node if
   a required startup file is missing** (`:1161` — status `"failed"`, error
   "Missing required startup files: …"). Before any mutation,
-  `validatePreRestore` (`restore-preconditions.ts:7`, called at
-  `restore-orchestrator.ts:271`) already blocks the whole restore when a node
-  that will consume replay is missing a required startup file
-  (`required_startup_file_missing`, `restore-preconditions.ts:151`; outcome
-  `pre_restore_validation_failed`, `restore-orchestrator.ts:291`). Its other
+  `validatePreRestore` (`restore-preconditions.ts:7`, called from
+  `RestoreOrchestrator.restore`) finds a node that will consume replay and is
+  missing a required startup file (`required_startup_file_missing`, or
+  `startup_owner_root_missing`). Restore holds only that node: it is not
+  launched and is reported `failed` ("Not launched: …" with the blocker's
+  message and remediation), and the rest of the rig restores. When every node
+  the restore would launch is held, or for any other blocker, the whole restore
+  stops before any mutation (outcome `pre_restore_validation_failed`). Its other
   blockers are `invalid_snapshot_data` (`restore-preconditions.ts:27`),
   `invalid_topology_roster` (`:78`), `checkpoint_missing_node_cwd` (`:91`),
-  `startup_owner_root_missing` (`:139`), `service_rig_root_missing` (`:187`)
-  and `service_compose_file_missing` (`:197`). The `/api/up` route returns
+  `service_rig_root_missing` (`:187`) and `service_compose_file_missing`
+  (`:197`). The `/api/up` route returns
   that outcome as HTTP 409 with `status: "not_attempted"`
   (`routes/up.ts:162`). A node that resumes its exact native session replays
   no startup files, actions, guidance or skills (`replayContained`,
@@ -380,6 +404,20 @@ daemon's `/api/transcripts/<session>/full`, `:156`), `read <packet-dir> [--json]
 (`:452`; validate against the v0 schema; non-mutating). Packet shape is the
 cross-runtime v0 standard — Claude Code and Codex transcripts both supported
 via runtime parsers + redaction (`packages/cli/src/restore-packet/`).
+
+### Shared history inspection
+
+`GET /api/startup/:rigId/nodes/:nodeId/history` lists captured histories for one durable node in the current, policy-ranked restore snapshot. `POST` to the same path plus `/validate` with exactly `{ "snapshotId": "…", "historySessionId": "…" }` rechecks one listed choice. Both routes use startup's terminal bearer authentication. The CLI exposes the same server decisions with `rig seat history --rig <rig-id> --node-id <node-id> --json`; pass both `--snapshot-id` and `--history-session-id` to validate. These calls perform no snapshot capture, token refresh, launch, or database write.
+
+The list includes captured Claude and Codex rows that the current restore policy and native resume adapter can structurally attempt. Codex requires an explicit `codex_id` and token; implicit `codex_last` cannot name a particular history. Claude accepts `claude_id` and `claude_name` with tokens. The server checks exact rig and node membership, the snapshot's intended roster and runtime, and the node's current occupant compatibility. A change to a sibling node does not retarget or invalidate this node's list. A changed or pruned snapshot, removed history row, same-name replacement node, ambiguous current occupant, or incompatible source is refused; validation never substitutes another history.
+
+`tokenState` (`present`, `stale`, or `unverified` for listed rows) describes the saved verification record and its age. Eligibility means a future launch may **attempt** native resume. A stored row can share a native token with another row, and neither listing nor validation proves that a native conversation still exists.
+
+### Selected history startup
+
+`GET /api/startup/:rigId/nodes/:nodeId?snapshotId=<listed-id>&historySessionId=<listed-id>` returns a read-only review for one listed choice: the selected row's forecast, current terminal observation, consumed launch setting sources (including a member permission envelope or Claude rules), and an opaque revision. The permission view uses restore's pure policy resolution: a readable custom policy's current launch posture can supersede its persisted cache, and a changed resolved decision requires re-review. It refuses a captured row whose native type/token, provenance, restore policy, or harness no longer agrees with the live registry row. The response contains no native token. `POST /api/startup/:rigId/nodes/:nodeId` accepts exactly `{ "action": "resume", "snapshotId": "…", "historySessionId": "…", "revision": "…" }`. Both routes require startup's terminal bearer token. The selected route accepts no fresh, continue, arbitrary token, or alternate target. Review does not capture a snapshot or prepare a provider. `rig seat history` also uses a strictly read-only daemon status check, so inspection does not remove stale daemon state.
+
+Apply revalidates the same current compatible source, durable node and saved launch settings after prerequisite and presence checks. The existing narrow restore engine carries that exact historical row through legacy and pod-aware native resume, with a second identity check at native dispatch after preparation. Before the new registry row is committed, selected startup also checks that no other attachment or running occupant claimed the node during terminal creation or pane observation; a collision leaves that claimant intact and reports the terminal outcome for inspection. An occupied or uncertain terminal blocks the attempt. No alternate history or fresh conversation is selected. The response projects exact typed references and outcome fields; only diagnostic text is redacted, so even a short native name cannot corrupt an ID. It names the selected source row and the newly registered result row when one exists; only the engine's joined native continuity proof produces success. If a change occurs after shell creation, the result reports a partial or uncertain attempt for inspection. The existing engine handles native prerequisites, compensation and proof. This surface adds no separate per-agent prelaunch probe; native checks remain at execution. Physical tmux cleanup still addresses sessions by name, so it cannot prove ownership against an external same-name replacement outside the selected registry guard.
 
 ## See also
 

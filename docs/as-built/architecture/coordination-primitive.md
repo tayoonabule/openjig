@@ -146,8 +146,20 @@ that gateway side too. For the pane side, read:
   `indeterminate:…` reads `claimed` (`presentedNudgeResult`). Unclaiming shows
   the stored result again.
 - `claimedAt`: when the destination claimed the row. Closing doesn't clear it.
-- `pickup`: the derived pickup receipt (`unclaimed`, `working`,
+- `pickup`: the derived pickup receipt (`unclaimed`, `working`, `needs-input`,
   `stalled-after-claim`, `parked`, `terminal`), computed at read time.
+
+A claimed item whose owner's activity reports outstanding input reads
+`needs-input`, with the reason in `pickup.evidence`. That covers an item in
+progress and a `pending` item that kept its claim, after an update back to
+`pending` or a reopen. A Codex permission request the daemon couldn't confirm on
+screen reads `owner may need input (not verified: permission_request_unverified)`.
+The input signal can outlast the prompt it reported, so it never pauses
+recovery. When the claim would otherwise read `stalled-after-claim`, the receipt
+keeps that evidence in `pickup.stall`, and the stuck sweep's finding, its
+backstop and manual dispositions behave exactly as for `stalled-after-claim`.
+Queue reads, the pickup view and the execution view share this receipt
+(`queue-pickup.ts`). Unclaimed, blocked and terminal items keep their receipts.
 
 A claim isn't proof that the body was read or that the terminal render was
 verified, and closing a task isn't a new delivery receipt: a claimed task that
@@ -166,6 +178,60 @@ the destination's orchestrator when one is derivable, otherwise to the
 destination itself, and that seat may be dead. Overdue claims go to their
 destination. Repeated detections reuse the existing finding without changing
 its route; when the source condition resolves, the sweep closes its own finding.
+Previously, falling out of a reporting query could itself close a delivery or
+unclaimed finding. An unconfirmed retry, a fresh human-notification post window,
+an unreadable human registry or a larger reporting-age setting could therefore
+look like successful recovery. These findings now require source evidence:
+closure, pickup or parking of the work, a verified/accepted wake, or a posted
+notification for the current human recipient and episode, as appropriate to the
+finding. `delivered-ack-pending`, `indeterminate:…`, missing results and unrelated
+legacy human receipts do not prove resolution. Uncertainty keeps an existing
+finding open without itself sending another wake or creating another finding.
+A verified wake resolves a wake failure, not an unclaimed obligation: delivery
+does not prove pickup.
+
+A legacy human notice with no owner-notification history can still resolve from
+the existing item-scoped posted ledger when its recipient is confirmed human.
+This covers older pending asks and parks without inventing an episode that was
+never recorded. A registered alias needs a readable registry to establish its
+human recipient; reserved human references remain known during an outage.
+Legacy receipts carry no recipient key, so a destination reroute requires a new
+matching notification episode. A legacy park is accepted only when no earlier
+notice or reroute predates it, and later history contains only receipts or
+asking-agent reroutes within that park. A re-park, an exit from the park or an
+ambiguous append cannot establish the same recipient without owner history;
+the finding waits for a new matching episode or other source resolution.
+Rerouting only the asking agent within an otherwise unchanged park preserves
+its human recipient (`blockedOn`).
+Modern notifications still require their current episode, and an unrelated
+legacy human receipt cannot resolve an agent wake.
+
+A known hold still leaves recovery with the existing mechanism: an ask on
+Steering without an alert, a wake held by the seat typing guard, or a live
+quiet-release job. Its closure note names that disposition rather than claiming
+delivery or pickup. An unreadable quiet hold is not positive closure evidence.
+Claimed work in either `pending` or `in-progress` uses the same pickup derivation;
+returning a row to `pending` while retaining its claim no longer hides a later
+stall or closes its existing stalled-claim finding. A retained failed wake cannot
+override that pickup evidence. The agent's claim still does not establish delivery
+of a separate notification to a person.
+
+That automatic closure records `stuck-sweep@system` as the actor in both the
+transition and the `queue.updated` audit event, with the source evidence in the
+delivery and unclaimed-obligation closure notes. Previously it credited the finding's source agent
+with the detector's action. The finding's source,
+destination and claim remain its existing ownership records; the underlying work
+is not reassigned, and existing transition history is not rewritten.
+
+`queue-stuck-sweep-resolution.test.ts` checks unconfirmed retries, retained
+claims, current human-notification episodes and registry outages with migrated
+SQLite, including positive recovery controls and no repeated send on an
+unresolved retry. `quiet-hold-custody.test.ts` checks existing findings with
+readable and unreadable quiet custody. `queue-stuck-sweep.test.ts` checks that
+pending and claimed findings close once, name the sweep in their transition and
+event, and keep their ownership. The posted-human-notice case also checks the actor while leaving
+the person's original ask open. These checks exercise the detector and queue
+repository, not a live agent or connector.
 
 The sweep reports six finding kinds. Its custody check covers closures that
 name a successor qitem or a seat (`closure_reason = handed_off_to`) in the last
@@ -206,15 +272,17 @@ contract. `validateClosure` (`hot-potato-enforcer.ts:59`) checks a transition
 against `CLOSURE_REASONS` (`:18`; **7** values:
 `sed -n '/^export const CLOSURE_REASONS/,/] as const/p' packages/daemon/src/domain/hot-potato-enforcer.ts | grep -c '^  "'`):
 
-`state=done` requires `closure_reason ∈ {handed_off_to, blocked_on, denied,
+`state=done` requires `closure_reason ∈ {handed_off_to, denied,
 canceled, no-follow-on, escalation, superseded}`. The reasons
-`handed_off_to | blocked_on | escalation` additionally require
+`handed_off_to | escalation` additionally require
 `closure_target` (`:86`):
 
 - `handed_off_to` — work continues with a different seat (`closure_target` =
   new owner).
-- `blocked_on` — work is parked pending another qitem (`closure_target` =
-  blocker `qitem_id`).
+- `blocked_on` — an active `state=blocked` park record, rejected with `state=done`.
+  To wait for a qitem, use `rig queue block <id> --on <child>` or
+  `rig queue update <id> --state blocked --blocked-on <child>`; the item returns
+  to pending when its blocker completes.
 - `denied` — receiver rejected the work (`closure_target` = reason text).
 - `canceled` — sender or receiver withdrew (`closure_target` = note).
 - `no-follow-on` — terminal completion, nothing else needed.
@@ -415,7 +483,9 @@ over a body actor. On a direct request from a known origin it is recorded as
 `transport:v1`; `resolveRecordedProvenance` (`:199`) instead records
 `origin-unknown:v1` when the origin-unknown marker is set or a relayed request
 carried `origin-unknown:v1` (`:207`), `relay:v1` for a relayed request that
-carried `transport:v1`, and `claimed:v1` for other relayed requests. Without the
+carried `transport:v1`, and `claimed:v1` for other relayed requests. `transport:v1`
+says the name came from that header, which the CLI sets from the seat's
+`OPENRIG_SESSION_NAME`; it isn't an authentication. Without the
 header, the
 body actor is recorded as `claimed:v1`; with neither (or, for inbox drop,
 without the header) the route answers 400 `actor_required`. The stamp lands in

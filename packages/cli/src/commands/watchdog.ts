@@ -92,6 +92,8 @@ export function watchdogCommand(depsOverride?: WatchdogDeps): Command {
     .requiredOption("--registered-by <session>", "Registering session (for audit)")
     .option("--threshold-bytes <n>", "(context-usage-threshold) transcript byte threshold")
     .option("--threshold-mb <n>", "(context-usage-threshold) transcript threshold in decimal MB")
+    .option("--threshold-tokens <n>", "(context-usage-threshold) sampled-context token threshold; triggers from the seat's own usage sample")
+    .option("--threshold-percent <n>", "(context-usage-threshold) percent of the seat's context window; triggers from the seat's own usage sample")
     .option("--watched-file <path>", "(context-usage-threshold) explicit transcript file; recorded context path is the fallback")
     .option("--requires-job <jobId>", "(context-usage-threshold) require this earlier job's receipt for the same occupant")
     .option("--message <text>", "(context-usage-threshold) message delivered when the threshold fires")
@@ -109,6 +111,8 @@ export function watchdogCommand(depsOverride?: WatchdogDeps): Command {
       scanIntervalSeconds?: string;
       thresholdBytes?: string;
       thresholdMb?: string;
+      thresholdTokens?: string;
+      thresholdPercent?: string;
       watchedFile?: string;
       requiresJob?: string;
       message?: string;
@@ -122,8 +126,14 @@ export function watchdogCommand(depsOverride?: WatchdogDeps): Command {
         process.exitCode = 1;
         return;
       }
-      if (opts.thresholdBytes !== undefined && opts.thresholdMb !== undefined) {
-        console.error("Use only one of --threshold-bytes or --threshold-mb");
+      const byteFlagCount =
+        Number(opts.thresholdBytes !== undefined) + Number(opts.thresholdMb !== undefined);
+      const unitFlagCount =
+        Number(opts.thresholdTokens !== undefined) + Number(opts.thresholdPercent !== undefined);
+      if (byteFlagCount + unitFlagCount > 1) {
+        console.error(
+          "Use only one of --threshold-bytes, --threshold-mb, --threshold-tokens, or --threshold-percent",
+        );
         process.exitCode = 1;
         return;
       }
@@ -141,8 +151,40 @@ export function watchdogCommand(depsOverride?: WatchdogDeps): Command {
         process.exitCode = 1;
         return;
       }
-      if (isContextUsageThreshold && !opts.spec && thresholdBytes === undefined) {
-        console.error("Context threshold requires --threshold-bytes or --threshold-mb when --spec is omitted");
+      const thresholdTokens = opts.thresholdTokens !== undefined
+        ? Number(opts.thresholdTokens)
+        : undefined;
+      if (
+        isContextUsageThreshold &&
+        thresholdTokens !== undefined &&
+        (!Number.isInteger(thresholdTokens) || thresholdTokens <= 0)
+      ) {
+        console.error("--threshold-tokens must be a positive whole number of tokens");
+        process.exitCode = 1;
+        return;
+      }
+      const thresholdPercent = opts.thresholdPercent !== undefined
+        ? Number(opts.thresholdPercent)
+        : undefined;
+      if (
+        isContextUsageThreshold &&
+        thresholdPercent !== undefined &&
+        (!Number.isFinite(thresholdPercent) || thresholdPercent <= 0 || thresholdPercent > 100)
+      ) {
+        console.error("--threshold-percent must be a number from 0 (exclusive) to 100");
+        process.exitCode = 1;
+        return;
+      }
+      if (
+        isContextUsageThreshold &&
+        !opts.spec &&
+        thresholdBytes === undefined &&
+        thresholdTokens === undefined &&
+        thresholdPercent === undefined
+      ) {
+        console.error(
+          "Context threshold requires one of --threshold-bytes, --threshold-mb, --threshold-tokens, or --threshold-percent when --spec is omitted",
+        );
         process.exitCode = 1;
         return;
       }
@@ -162,7 +204,11 @@ export function watchdogCommand(depsOverride?: WatchdogDeps): Command {
           `  session: ${JSON.stringify(opts.targetSession)}`,
           ...(opts.message ? [`message: ${JSON.stringify(opts.message)}`] : []),
           "context:",
-          `  threshold_bytes: ${thresholdBytes}`,
+          ...(thresholdBytes !== undefined
+            ? [`  threshold_bytes: ${thresholdBytes}`]
+            : thresholdTokens !== undefined
+              ? [`  threshold_tokens: ${thresholdTokens}`]
+              : [`  threshold_percent: ${thresholdPercent}`]),
           ...(watchedFilePath ? [`  watched_file: ${JSON.stringify(watchedFilePath)}`] : []),
           ...(opts.requiresJob ? [`  requires: ${JSON.stringify(opts.requiresJob)}`] : []),
           "",
@@ -185,6 +231,8 @@ export function watchdogCommand(depsOverride?: WatchdogDeps): Command {
           scanIntervalSeconds,
           watchedFilePath,
           thresholdBytes,
+          thresholdTokens,
+          thresholdPercent,
           requiresJobId: opts.requiresJob,
           registeredBySession: opts.registeredBy,
         });
@@ -269,6 +317,49 @@ The pre-0.5.8 complete array remains available with: rig watchdog list --all --f
       await withClient(deps, async (client) => {
         const res = await client.post<unknown>(`/api/watchdog/${encodeURIComponent(jobId)}/stop`, {
           reason: opts.reason,
+        });
+        printResult(opts.json ?? false, res.data, res.status);
+      });
+    });
+
+  cmd
+    .command("update <jobId>")
+    .description(
+      "Change an active watchdog job's interval, spec or message in place, keeping its job id (so a queue " +
+      "attachment still holds), its registration, history and every field you don't name. A new interval takes " +
+      "effect immediately, measured from the job's last evaluation (or its registration if it has never run), " +
+      "and the last-evaluation and fire records are not rewritten. A stopped or finished job is refused, not " +
+      "restarted; so are a change of policy, target or registering agent, and a spec invalid for the job's policy",
+    )
+    .option("--interval-seconds <n>", "New evaluation interval (positive integer)")
+    .option("--message <text>", "New message; the rest of the spec stays as written")
+    .option("--spec <path>", "Path to a YAML spec file that replaces the job's spec")
+    .option("--json", "JSON output for agents")
+    .action(async (jobId: string, opts: { intervalSeconds?: string; message?: string; spec?: string; json?: boolean }) => {
+      if (opts.intervalSeconds === undefined && opts.message === undefined && opts.spec === undefined) {
+        console.error("Give at least one of --interval-seconds, --message or --spec");
+        process.exitCode = 1;
+        return;
+      }
+      let specYaml: string | undefined;
+      if (opts.spec) {
+        try {
+          specYaml = readFileSync(opts.spec, "utf-8");
+        } catch (err) {
+          console.error(`Failed to read spec file ${opts.spec}: ${err instanceof Error ? err.message : err}`);
+          process.exitCode = 1;
+          return;
+        }
+      }
+      const intervalSeconds = opts.intervalSeconds !== undefined
+        ? cadenceSeconds("--interval-seconds", opts.intervalSeconds)
+        : undefined;
+      const deps = getDeps();
+      await withClient(deps, async (client) => {
+        const res = await client.post<unknown>(`/api/watchdog/${encodeURIComponent(jobId)}/update`, {
+          intervalSeconds,
+          message: opts.message,
+          specYaml,
         });
         printResult(opts.json ?? false, res.data, res.status);
       });

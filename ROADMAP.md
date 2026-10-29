@@ -6,6 +6,12 @@ This isn't a schedule or a promise: we release often, and an item ships when a g
 To see what's being worked on, by release and theme, open the [OpenRig roadmap board](https://github.com/users/mvschwarz/projects/1).
 Issues labelled `good first issue` are also listed on the [contribute page](https://github.com/mvschwarz/openrig/contribute).
 
+## Released in 0.7.4
+
+[0.7.4 is published](https://github.com/mvschwarz/openrig/releases/tag/v0.7.4): a first, experimental step toward every
+assistant you use working on one team. See its release notes for what shipped, the experimental and security notes for
+hosted members, upgrade instructions, contributor credits and the remaining testing gaps.
+
 ## How to help
 
 1. Pick an item and comment on its issue to say you're working on it and coordinate with others. A maintainer can assign
@@ -32,7 +38,6 @@ tie. Feel free to coordinate on the issue first.
 ## Slack
 
 - **A DM or private channel for single-user setups** (#313).
-- **A channel map** (#192): one channel per seat, keyed by channel ID.
 
 ## Reliability and everyday use
 

@@ -1,7 +1,10 @@
 // OPR.0.7.0.5 — in-place restart of one Codex seat: every gate and every outcome, driven through the
 // public SeatLifecycleService surface against a fake tmux, process table, Codex launcher and OS reads.
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
 import { defaultTmuxFileOps, isStagedSendScriptPath } from "../src/adapters/tmux.js";
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import type Database from "better-sqlite3";
 import { createFullTestDb } from "./helpers/test-app.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
@@ -13,8 +16,20 @@ import type { NativeProcessRow } from "../src/domain/native-process-lineage.js";
 import type { HarnessLaunchResult, NodeBinding } from "../src/domain/runtime-adapter.js";
 import type { ArbitratedSeatState } from "../src/domain/activity-taxonomy.js";
 import type { InPlaceRestartIo, ProcessFacts } from "../src/domain/seat-restart-in-place.js";
-import { accountLineNames, parseEffectiveSettings, shellWords } from "../src/domain/seat-restart-in-place.js";
+import { accountLineNames, accountTextMark, defaultInPlaceRestartIo, linesAfterAnchor, parseEffectiveSettings, procCmdlineArgv, shellWords } from "../src/domain/seat-restart-in-place.js";
 import { CodexRuntimeAdapter } from "../src/adapters/codex-runtime-adapter.js";
+import { CodexThreadIdResolver, type CodexThreadEvidence } from "../src/domain/codex-thread-id.js";
+
+// No test here may read a real Codex home: the fake io answers every native-thread read. The real resolver is watched for
+// the whole file, and any call fails the test that made it.
+let realResolverReads: ReturnType<typeof vi.spyOn> | undefined;
+beforeEach(() => {
+  realResolverReads = vi.spyOn(CodexThreadIdResolver.prototype, "resolveWithReadability");
+});
+afterEach(() => {
+  expect(realResolverReads!.mock.calls, "a test read a real Codex home").toEqual([]);
+  realResolverReads!.mockRestore();
+});
 
 const LSTART = "Mon Oct 12 21:00:00 2026";
 const LATER = "Mon Oct 12 21:05:00 2026";
@@ -27,6 +42,7 @@ type Shape = "shell_backed" | "direct_native";
 interface WorldOptions {
   shape?: Shape;
   runningArgs?: string;
+  runningArgv?: string[];
   savedModel?: string | null;
   /** nodes.effort (authored) and nodes.effort_choice (rig seat set-effort). */
   savedEffort?: { authored?: string; choice?: string };
@@ -41,6 +57,8 @@ interface WorldOptions {
   /** The pane's own remain-on-exit value; "unreadable" makes the read fail. */
   remainOnExit?: string | null | "unreadable";
   threadId?: string;
+  /** What the running Codex's own logs show, and whether the read met no detected incompleteness. */
+  evidence?: CodexThreadEvidence;
   facts?: Partial<Record<number, ProcessFacts | null>>;
   identityFails?: boolean;
   rollout?: string | null;
@@ -48,6 +66,10 @@ interface WorldOptions {
   screen?: string;
   /** Already in the pane before the restart. */
   screenBefore?: string;
+  /** How many of the pane's last lines are its visible screen; the rest is history (default 3). */
+  screenRows?: number;
+  /** History as the restart's history-only capture read it, when the pane moved before the whole-pane capture. */
+  historyCapture?: string;
   throwAt?: "signalPid" | "sendResumeCommand" | "readProcessAfter" | "signalPaneProcess" | "respawnPane" | "verifyResumeInPane" | "restorePaneOption";
   daemonStartedAt?: Date;
   /** Only post-relaunch process observations; preflight and stop retain the existing table. */
@@ -66,11 +88,12 @@ afterEach(() => { for (const db of dbs.splice(0)) db.close(); });
 function shellRow(pid: number, tpgid: number): NativeProcessRow {
   return { pid, ppid: 1, pgid: pid, tpgid, executableName: "bash", command: "-bash", startedAt: LSTART };
 }
-function codexRow(pid: number, ppid: number, args: string, startedAt = LSTART, pgid = pid): NativeProcessRow {
-  return { pid, ppid, pgid, tpgid: pgid, executableName: "codex", command: `/usr/local/bin/codex ${args}`, startedAt };
+function codexRow(pid: number, ppid: number, args: string, startedAt = LSTART, pgid = pid, argv?: string[]): NativeProcessRow {
+  return { pid, ppid, pgid, tpgid: pgid, executableName: "codex", command: `/usr/local/bin/codex ${args}`,
+    argv: argv ?? ["/usr/local/bin/codex", ...args.split(" ")], startedAt };
 }
 function facts(over: Partial<ProcessFacts> = {}): ProcessFacts {
-  return { cwd: "/work", exe: "/usr/local/bin/codex", env: { CODEX_HOME: HOME }, apiKeyEnvNames: [], ...over };
+  return { cwd: "/work", exe: "/usr/local/bin/codex", env: { CODEX_HOME: HOME }, ...over };
 }
 
 function world(options: WorldOptions = {}) {
@@ -93,9 +116,9 @@ function world(options: WorldOptions = {}) {
   let rows: NativeProcessRow[] = shape === "shell_backed"
     ? options.between
       ? [shellRow(100, 150), { pid: 150, ppid: 100, pgid: 150, tpgid: 150, executableName: options.betweenName ?? options.between.split(" ")[0]!.split("/").pop()!, command: options.between, startedAt: LSTART },
-        codexRow(200, 150, runningArgs, LSTART, 150)]
-      : [shellRow(100, 200), codexRow(200, 100, runningArgs)]
-    : [codexRow(100, 1, runningArgs, LSTART, 100)];
+        codexRow(200, 150, runningArgs, LSTART, 150, options.runningArgv)]
+      : [shellRow(100, 200), codexRow(200, 100, runningArgs, LSTART, 200, options.runningArgv)]
+    : [codexRow(100, 1, runningArgs, LSTART, 100, options.runningArgv)];
   let paneCommand = "codex";
   let dead = false;
   let paneGone = false;
@@ -112,8 +135,8 @@ function world(options: WorldOptions = {}) {
 
   const relaunch = (startedAt = LATER) => {
     const replacement = shape === "shell_backed"
-      ? codexRow(300, 100, runningArgs, startedAt)
-      : codexRow(300, 1, runningArgs, startedAt, 300);
+      ? codexRow(300, 100, runningArgs, startedAt, 300, options.runningArgv)
+      : codexRow(300, 1, runningArgs, startedAt, 300, options.runningArgv);
     rows = shape === "shell_backed" ? [shellRow(100, 300), replacement] : [replacement];
     relaunched = true;
     paneCommand = "codex";
@@ -156,9 +179,15 @@ function world(options: WorldOptions = {}) {
     },
     respawnPane: async (_pane: string, command?: string): Promise<TmuxResult> => { calls.push(`respawn ${command}`); maybeThrow("respawnPane"); relaunch(); return { ok: true }; },
     capturePaneHistory: async () => paneLines.join("\n"),
+    capturePaneHistoryParts: async () => {
+      const history = paneLines.slice(0, Math.max(0, paneLines.length - (options.screenRows ?? 3)));
+      return { history: options.historyCapture ?? history.join("\n"), all: paneLines.join("\n") };
+    },
   } as unknown as TmuxAdapter;
 
   const launches: Array<{ command: string; resumeToken: string }> = [];
+  /** The Codex home each resume proof was asked to read. */
+  const proofHomes: Array<string | undefined> = [];
   const builds: Array<{ running?: unknown }> = [];
   const codex = {
     runtime: "codex",
@@ -171,15 +200,17 @@ function world(options: WorldOptions = {}) {
         + `${(running?.addDirs ?? []).map((dir) => ` --add-dir '${dir}'`).join("")} '${opts.resumeToken}'`;
       return { ok: true as const, core, command: `env CODEX_HOME='${HOME}' ${core}` };
     },
-    async sendResumeCommand(_session: string, command: string, resumeToken: string): Promise<HarnessLaunchResult> {
+    async sendResumeCommand(_session: string, command: string, resumeToken: string, _nodeId?: string, home?: string): Promise<HarnessLaunchResult> {
       launches.push({ command, resumeToken });
+      proofHomes.push(home);
       maybeThrow("sendResumeCommand");
       const result = options.launch ?? { ok: true, resumeToken, resumeType: "codex_id" };
       if (result.ok && !options.identityFails) relaunch();
       return result;
     },
-    async verifyResumeInPane(): Promise<HarnessLaunchResult> {
+    async verifyResumeInPane(_session?: string, _token?: string, _nodeId?: string, home?: string): Promise<HarnessLaunchResult> {
       calls.push("verifyResumeInPane");
+      proofHomes.push(home);
       maybeThrow("verifyResumeInPane");
       return options.launch ?? { ok: true };
     },
@@ -191,6 +222,13 @@ function world(options: WorldOptions = {}) {
       return options.facts && pid in options.facts ? options.facts[pid] ?? null : facts();
     },
     readThreadId: async (pid) => (pid === 200 ? options.threadId : undefined),
+    // Always answered here, never by the real reader. With no evidence given, the fake readThreadId's answer, as a read
+    // that wasn't complete: it can't produce the conflict refusal, only a "not established" note.
+    readThreadEvidence: async (pid: number): Promise<CodexThreadEvidence> => {
+      if (options.evidence) return pid === 200 ? options.evidence : { reason: "no_log_row", fullyReadable: true };
+      const thread = pid === 200 ? options.threadId : undefined;
+      return { ...(thread ? { thread } : { reason: "no_log_row" as const }), fullyReadable: false, incomplete: "discovery" };
+    },
     readCredentialStore: () => "file",
     statAuthFile: () => null,
     findRollout: () => (options.rollout === undefined ? null : "/rollout.jsonl"),
@@ -219,10 +257,14 @@ function world(options: WorldOptions = {}) {
   });
   const events = () => (db.prepare("SELECT type, payload FROM events WHERE type LIKE 'seat.restart_in_place%' ORDER BY seq").all() as Array<{ type: string; payload: string }>)
     .map((row) => ({ type: row.type, ...JSON.parse(row.payload) }));
-  return { db, service, node, session, calls, launches, builds, events, sessionRegistry, tmux,
+  return { db, service, node, session, calls, launches, proofHomes, builds, events, sessionRegistry, tmux,
     replacementYields, get replacementReads() { return replacementReads; }, get relaunched() { return relaunched; },
     setRows: (next: NativeProcessRow[]) => { rows = next; },
-    print: (text: string) => { paneLines.push(...text.split("\n").filter(Boolean)); } };
+    print: (text: string) => { paneLines.push(...text.split("\n").filter(Boolean)); },
+    /** tmux dropping the oldest history lines once the history is full. */
+    trim: (count: number) => { paneLines.splice(0, count); },
+    /** A redraw clearing the screen's last rows. */
+    erase: (count: number) => { paneLines.splice(paneLines.length - count, count); } };
 }
 
 function state(activity: string, needs = 0): ArbitratedSeatState {
@@ -231,19 +273,40 @@ function state(activity: string, needs = 0): ArbitratedSeatState {
 }
 
 describe("rig seat restart --keep-conversation: gates before any signal", () => {
-  it("plan reports activity, child processes, billing and settings, and changes nothing", async () => {
-    const w = world({ activity: state("working"), facts: { 200: facts({ apiKeyEnvNames: ["OPENAI_API_KEY"] }), 100: facts() } });
+  it("plan reports activity, child processes and settings, and changes nothing", async () => {
+    const w = world({ activity: state("working") });
     w.setRows([shellRow(100, 200), codexRow(200, 100, `-m gpt-5.5 -s workspace-write resume ${TOKEN}`),
       { pid: 210, ppid: 200, pgid: 210, tpgid: 200, executableName: "node", command: "node mcp-server.js --token=x", startedAt: LSTART }]);
     const plan = await w.service.restartInPlace({ seatRef: SEAT, plan: true });
     expect(plan).toMatchObject({
       ok: true, planOnly: true, paneShape: "shell_backed", conversationId: TOKEN, conversationProof: "argv",
       activity: { state: "working" }, childProcesses: [{ pid: 210, name: "node" }],
-      billingRoute: { state: "unknown", apiKeyEnvNames: ["OPENAI_API_KEY"] },
       settings: { effective: { model: "gpt-5.5", sandbox: "workspace-write" }, saved: { model: "gpt-5.5" } },
       codexHome: HOME,
     });
     expect(JSON.stringify(plan)).not.toContain("--token=x"); // argv of children is never reported
+    expect(w.calls).toEqual([]);
+    expect(w.events()).toEqual([]);
+  });
+
+  it.each([null, undefined, [], ["codex", "resume", TOKEN, "bad\0argument"], ["node", "resume", TOKEN]])(
+    "refuses plan and execution before provider input or stop when exact Codex argv is unusable: %j", async argv => {
+      const w = world({ threadId: TOKEN });
+      w.setRows([shellRow(100, 200), { ...codexRow(200, 100, `-m gpt-5.5 -s workspace-write resume ${TOKEN}`, LSTART, 200), argv }]);
+      expect(await w.service.restartInPlace({ seatRef: SEAT, plan: true })).toMatchObject({ ok: false, code: "resume_binding_unverified" });
+      expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "new account" })).toMatchObject({ ok: false, code: "resume_binding_unverified" });
+      expect(w.builds).toEqual([]);
+      expect(w.calls).toEqual([]);
+      expect(w.events()).toEqual([]);
+    });
+
+  it("refuses a readable Codex child below an opaque launcher before changing the seat", async () => {
+    const w = world({ threadId: TOKEN });
+    w.setRows([shellRow(100, 200), { ...codexRow(150, 100, "-m configured-model", LSTART, 200), argv: null },
+      codexRow(200, 150, `-m gpt-5.5 -s workspace-write resume ${TOKEN}`, LSTART, 200)]);
+    expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "new account" }))
+      .toMatchObject({ ok: false, code: "resume_binding_unverified" });
+    expect(w.builds).toEqual([]);
     expect(w.calls).toEqual([]);
     expect(w.events()).toEqual([]);
   });
@@ -335,6 +398,96 @@ describe("rig seat restart --keep-conversation: gates before any signal", () => 
     }
   });
 
+  it.each([
+    "node --pending-deprecation /absolute/bin/codex.js",
+    "node --max-http-header-size 16384 /absolute/bin/codex.js",
+    "node relative/bin/codex.js",
+    "node /opt/codex/renamed-entry.js",
+  ])("preserves the existing node launcher acceptance for %s without exact argv", async between => {
+    const w = world({ between, facts: { 150: null } });
+    expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "regression" })).toMatchObject({ ok: true });
+    expect(w.calls).toContain("signalPid 150 TERM");
+  });
+
+  it("refuses a MainThread supervisor mentioning Codex outside its launcher script", async () => {
+    const betweenName = "MainThread";
+    for (const between of ["node /opt/supervisor.js --project=codex", "node /opt/codex-supervisor.js", "node -e codex", "node /opt/tools.js /usr/local/bin/codex", "node --require /absolute/bin/codex.js /opt/supervisor.js", "node --eval=0 /absolute/bin/codex.js", "node --title /absolute/bin/codex.js /opt/supervisor.js"]) {
+      const w = world({ between, betweenName, facts: { 150: facts({ exe: "/usr/bin/node", argv: between.split(" ") }) } });
+      expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "regression" }), between).toMatchObject({ ok: false, code: "pane_shape_unknown" });
+      expect(w.calls, between).toEqual([]);
+    }
+  });
+
+  it("recognizes a MainThread Codex launcher after Node options", async () => {
+    const betweenName = "MainThread";
+    for (const options of ["--no-warnings", "--enable-source-maps --no-warnings", "--require /opt/preload.js", "--import=/opt/preload.mjs", "--inspect=127.0.0.1:9229", "--"]) {
+      const w = world({ between: `node ${options} /absolute/bin/codex.js`, betweenName, facts: { 150: facts({ exe: "/usr/bin/node", argv: ["node", ...options.split(" "), "/absolute/bin/codex.js"] }) } });
+      expect(await w.service.restartInPlace({ seatRef: SEAT, plan: true }), options).toMatchObject({ ok: true, paneShape: "shell_backed" });
+      expect(w.calls).toEqual([]);
+    }
+  });
+
+  it("uses exact argv to distinguish a MainThread supervisor from a spaced launcher path", async () => {
+    const betweenName = "MainThread";
+    const cases = [
+      { argv: ["node", "--require", "/tmp/preload /absolute/bin/codex.js", "/opt/supervisor.js"], accepted: false },
+      { argv: ["node", "--require", "/tmp/preload with spaces.js", "/opt/tools/bin/codex.js"], accepted: true },
+      { argv: ["node", "--no-warnings", "/opt/my tools/bin/codex.js"], accepted: true },
+    ];
+    for (const { argv, accepted } of cases) {
+      const w = world({ between: argv.join(" "), betweenName, facts: { 150: facts({ exe: "/usr/bin/node", argv }) } });
+      expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "regression" })).toMatchObject(accepted
+        ? { ok: true, paneShape: "shell_backed" } : { ok: false, code: "pane_shape_unknown" });
+      if (accepted) expect(w.calls).toContain("signalPid 150 TERM");
+      else expect(w.calls).toEqual([]);
+    }
+  });
+
+  it("refuses a MainThread launcher with unreadable exact argv", async () => {
+    const betweenName = "MainThread";
+    for (const observed of [null, facts({ exe: "/usr/bin/node" }), facts({ exe: "/usr/bin/node", argv: null }), facts({ exe: "/usr/bin/node", argv: [] })]) {
+      const w = world({ between: "node /usr/local/bin/codex", betweenName, facts: { 150: observed } });
+      expect(await w.service.restartInPlace({ seatRef: SEAT, plan: true })).toMatchObject({ ok: false, code: "pane_shape_unknown" });
+      expect(w.calls).toEqual([]);
+    }
+  });
+
+  it.each(["survives", "launcher PID reused", "exits after KILL", "PID reused"])("checks launcher and native identities before KILL and resume: %s", async nativeState => {
+    const w = world({ between: "node /usr/local/bin/codex", betweenName: "MainThread",
+      facts: { 150: facts({ exe: "/usr/bin/node", argv: ["node", "/usr/local/bin/codex"] }) } });
+    const signalPid = w.tmux.signalPid;
+    w.tmux.signalPid = async (pid, signal) => {
+      const result = await signalPid(pid, signal);
+      if (nativeState !== "exits after KILL" || signal !== "KILL") {
+        const launcherRows: NativeProcessRow[] = nativeState === "exits after KILL" || nativeState === "launcher PID reused"
+          ? [{ pid: 150, ppid: 100, pgid: 150, tpgid: 150, executableName: "MainThread", command: "node /usr/local/bin/codex",
+            startedAt: nativeState === "launcher PID reused" ? LATER : LSTART }] : [];
+        w.setRows([shellRow(100, 100), ...launcherRows, codexRow(200, launcherRows.length ? 150 : 1, `-m gpt-5.5 -s workspace-write resume ${TOKEN}`,
+          nativeState === "PID reused" ? LATER : LSTART)]);
+      }
+      return result;
+    };
+    const result = await w.service.restartInPlace({ seatRef: SEAT, reason: "regression" });
+    const survives = nativeState === "survives" || nativeState === "launcher PID reused";
+    expect(result).toMatchObject({ ok: true, outcome: survives ? "not_started" : "restarted_account_unverified" });
+    if (survives) expect(w.launches).toEqual([]);
+    else expect(w.launches).toHaveLength(1);
+    if (nativeState === "exits after KILL") expect(w.calls).toContain("signalPid 150 KILL");
+    else expect(w.calls).not.toContain("signalPid 150 KILL");
+  });
+
+  it("recognizes a MainThread-named npm launcher only when its OS executable is Node", async () => {
+    for (const exe of ["/usr/local/bin/node", "/usr/bin/python3", "", null]) {
+      const w = world({ between: "node /usr/local/bin/codex", betweenName: "MainThread",
+        facts: { 150: exe === null ? null : facts({ exe, argv: ["node", "/usr/local/bin/codex"] }) } });
+      const result = await w.service.restartInPlace({ seatRef: SEAT, plan: true });
+      expect(result).toMatchObject(exe?.endsWith("/node")
+        ? { ok: true, paneShape: "shell_backed" }
+        : { ok: false, code: "pane_shape_unknown" });
+      expect(w.calls).toEqual([]);
+    }
+  });
+
   it("refuses when the running Codex is on another conversation, or none can be proven", async () => {
     const other = world({ runningArgs: "-m gpt-5.5 -s workspace-write resume 019a-other" });
     expect(await other.service.restartInPlace({ seatRef: SEAT, plan: true })).toMatchObject({ ok: false, code: "resume_binding_unverified" });
@@ -375,6 +528,50 @@ describe("rig seat restart --keep-conversation: gates before any signal", () => 
   });
 });
 
+describe("rig seat restart --keep-conversation: conflicting retained native-thread evidence", () => {
+  const Y = "019fd98d-16a1-7981-8000-000000000002";
+
+  it("refuses when a fully readable read of the running Codex's own logs names only another conversation: nothing stopped, nothing typed", async () => {
+    for (const plan of [true, false]) {
+      const w = world({ evidence: { thread: Y, fullyReadable: true } });
+      const result = await w.service.restartInPlace({ seatRef: SEAT, ...(plan ? { plan: true } : { reason: "take the home's account" }) });
+      expect(result).toMatchObject({ ok: false, code: "resume_binding_unverified",
+        detail: { reason: "conflicting retained native-thread evidence", loggedConversation: Y } });
+      expect((result as { message: string }).message).toMatch(/^Conflicting retained native-thread evidence: .*Nothing was stopped and nothing was typed\.$/);
+      expect(w.calls).toEqual([]);
+      expect(w.launches).toEqual([]);
+      expect(w.events()).toEqual([]);
+    }
+  });
+
+  it("keeps today's ok, with a note, whenever the evidence is incomplete, ambiguous, missing or the same conversation", async () => {
+    const cases: Array<[CodexThreadEvidence, string]> = [
+      [{ thread: TOKEN, fullyReadable: true }, "no other conversation logged"],
+      [{ thread: Y, fullyReadable: false, incomplete: "unreadable" }, "not established: a native database was unreadable"],
+      [{ thread: Y, fullyReadable: false, incomplete: "discovery" }, "not established: the native databases couldn't all be found"],
+      [{ reason: "ambiguous_threads", fullyReadable: true }, "not established: ambiguous_threads"],
+      [{ reason: "no_log_row", fullyReadable: true }, "not established: no_log_row"],
+      [{ reason: "sqlite_unreadable", fullyReadable: false, incomplete: "unreadable" }, "not established: sqlite_unreadable"],
+    ];
+    for (const [evidence, note] of cases) {
+      const w = world({ evidence });
+      expect(await w.service.restartInPlace({ seatRef: SEAT, plan: true }))
+        .toMatchObject({ ok: true, conversationProof: "argv", currentConversation: note });
+    }
+    // Execute still restarts on incomplete evidence, exactly as before.
+    const w = world({ evidence: { thread: Y, fullyReadable: false, incomplete: "discovery" } });
+    expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "take the home's account" })).toMatchObject({ ok: true, outcome: "restarted_account_unverified" });
+    expect(w.calls).toEqual(["signalPid 200 TERM"]);
+  });
+
+  it("argv naming no token keeps the native-logs proof unchanged, with no conflict check", async () => {
+    const w = world({ runningArgs: "-m gpt-5.5 -s workspace-write -C /work", threadId: TOKEN, evidence: { thread: Y, fullyReadable: true } });
+    const result = await w.service.restartInPlace({ seatRef: SEAT, plan: true });
+    expect(result).toMatchObject({ ok: true, conversationProof: "native_logs" });
+    expect(result).not.toHaveProperty("currentConversation");
+  });
+});
+
 describe("rig seat restart --keep-conversation: outcomes", () => {
   it("shell-backed: TERMs Codex (not the shell), resumes the same conversation once, records started and finished", async () => {
     const w = world();
@@ -401,6 +598,19 @@ describe("rig seat restart --keep-conversation: outcomes", () => {
     const result = await w.service.restartInPlace({ seatRef: SEAT, reason: "x" });
     expect(result).toMatchObject({ ok: true, outcome: "incomplete", remainingStep: expect.stringContaining(`signs in to Codex in ${HOME}`),
       recoveryCommand: `codex -m 'gpt-5.5' -s workspace-write resume '${TOKEN}'`, account: { startupGate: expect.stringContaining("sign in") } });
+    expect(w.launches).toHaveLength(1);
+  });
+
+  it("#1524 (b): an unproven resume asks for the live Codex to be checked and adopted first, not for another resume", async () => {
+    const error = "Codex resume could not be proven within the resume window: no_log_row. The session was preserved; nothing was restarted.";
+    const w = world({ launch: { ok: false, error, recovery: "attention_required", resumeUnproven: true, verifierInput: "none" } });
+    const result = await w.service.restartInPlace({ seatRef: SEAT, reason: "x" });
+    expect(result).toMatchObject({ ok: true, outcome: "incomplete", account: { startupGate: error } });
+    const remaining = (result as { remainingStep: string }).remainingStep;
+    expect(remaining).toContain("may still be running in the pane");
+    expect(remaining).toContain(`rig reconcile-session ${SEAT} --no-launch`);
+    expect(remaining).toContain("only if the original is gone");
+    expect(remaining).not.toMatch(/^Resolve what Codex shows in the pane, then resume/);
     expect(w.launches).toHaveLength(1);
   });
 
@@ -433,7 +643,7 @@ describe("rig seat restart --keep-conversation: outcomes", () => {
     const tmux = { getPaneCommand: async () => "codex", capturePaneScreen: async () => prompt, capturePaneContent: async () => prompt,
       getPanePid: async () => 901, sendKeys: async (_: string, k: string[]) => { keys.push(k); return { ok: true }; } } as unknown as TmuxAdapter;
     const adapter = new CodexRuntimeAdapter({ tmux, fsOps: {} as never, sleep: async () => {},
-      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex" }] });
+      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex", argv: ["codex"] }] });
     const launch = await adapter.verifyResumeInPane("impl", "tok");
     expect(keys).toEqual([["3"]]);
     const w = world({ launch });
@@ -443,12 +653,63 @@ describe("rig seat restart --keep-conversation: outcomes", () => {
     expect(remaining).not.toMatch(/typed nothing|answered/);
   });
 
+  // #1524 (b), through the real adapter: what the adapter itself reports decides the step, not a flag the test supplies.
+  it("through the adapter: a capture that times out before any proof result asks for the live Codex first, not another resume", async () => {
+    const tmux = { getPanePid: async () => 901, capturePaneScreen: async () => "OpenAI Codex (v0.120.0)\n› Ask Codex to do anything",
+      capturePaneContent: async () => "OpenAI Codex (v0.120.0)\n› Ask Codex to do anything",
+      getPaneCommand: () => new Promise<string>((resolve) => setTimeout(() => resolve("codex"), 120)) } as unknown as TmuxAdapter;
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: {} as never, sleep: async () => {}, resumeProofWindowMs: 40,
+      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex resume tok", argv: ["codex", "resume", "tok"] }],
+      readResumeEvidence: () => ({ threadId: "tok" }) });
+    const launch = await adapter.verifyResumeInPane("impl", "tok");
+    expect(launch).toMatchObject({ ok: false, recovery: "attention_required", resumeUnproven: true });
+    const r = await report(launch);
+    expect(r.remainingStep).toContain("may still be running in the pane");
+    expect(r.remainingStep).toContain(`rig reconcile-session ${SEAT} --no-launch`);
+    expect(r.remainingStep).not.toMatch(/^Resolve what Codex shows in the pane, then resume/);
+  });
+
+  it("through the adapter: a resume whose records name another conversation gets its own step, not the unproven one", async () => {
+    const ready = "OpenAI Codex (v0.120.0)\n› Ask Codex to do anything";
+    const tmux = { getPanePid: async () => 901, getPaneCommand: async () => "codex", capturePaneScreen: async () => ready, capturePaneContent: async () => ready } as unknown as TmuxAdapter;
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: {} as never, sleep: async () => {},
+      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex resume tok", argv: ["codex", "resume", "tok"] }],
+      readResumeEvidence: () => ({ threadId: "another-thread" }) });
+    const launch = await adapter.verifyResumeInPane("impl", "tok");
+    expect(launch).toMatchObject({ ok: false, recovery: "attention_required", resumeMismatch: { opened: "another-thread" } });
+    expect(launch).not.toHaveProperty("resumeUnproven");
+    const r = await report(launch);
+    expect(r.remainingStep).toContain("The resumed Codex opened another-thread, not the seat's conversation");
+    expect(r.remainingStep).toContain("find the seat's conversation before resuming again");
+    expect(r.remainingStep).not.toContain("didn't prove the conversation in time");
+  });
+
+  // An in-place restart did restart the pane, so its result never repeats the adapter's "nothing was restarted",
+  // which stays true for a caller that restarted nothing.
+  const ready = "OpenAI Codex (v0.120.0)\n› Ask Codex to do anything";
+  const readyTmux = () => ({ getPanePid: async () => 901, getPaneCommand: async () => "codex", capturePaneScreen: async () => ready, capturePaneContent: async () => ready } as unknown as TmuxAdapter);
+  it.each([
+    ["unproven: no Codex process tied to the conversation", "codex", () => ({ threadId: "tok" })],
+    ["disproved: the records name another conversation", "codex resume tok", () => ({ threadId: "another-thread" })],
+  ] as const)("through the adapter, %s: the in-place result says the pane restarted and to check it", async (_case, command, evidence) => {
+    const adapter = new CodexRuntimeAdapter({ tmux: readyTmux(), fsOps: {} as never, sleep: async () => {}, resumeProofWindowMs: 40,
+      listProcesses: () => [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command, argv: command.split(" ") }],
+      readResumeEvidence: evidence });
+    const launch = await adapter.verifyResumeInPane("impl", "tok");
+    // What every other caller shows is unchanged: the adapter's own result still says nothing was restarted.
+    expect(launch).toMatchObject({ ok: false, error: expect.stringContaining("The session was preserved; nothing was restarted.") });
+    const r = await report(launch);
+    expect(r.message).toMatch(/^The pane restarted: the original Codex exited and the resume started in the same pane, but /);
+    expect(r.message).toContain(`Check the pane with rig capture ${SEAT}.`);
+    expect(JSON.stringify(r)).not.toContain("nothing was restarted");
+  });
+
   // Round 4: the report's message, startupGate and step all describe the newest moment, through the real adapter.
   const UPDATING = ["✨ Update available! 0.120.0 -> 0.121.0", "Updating Codex..."].join("\n");
   const SKIPPABLE = ["✨ Update available! 0.120.0 -> 0.121.0", "› 1. Update now (runs `npm install -g @openai/codex`)", "  2. Skip", "  3. Skip until next version", "Press enter to continue"].join("\n");
   const RESUMED = "OpenAI Codex (v0.120.0)\n› Ask Codex to do anything";
   const BOOTING = "Loading conversation...";
-  const CODEX_ROW = [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex" }];
+  const CODEX_ROW = [{ pid: 901, ppid: 1, pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000", command: "codex", argv: ["codex"] }];
   function scriptedAdapter(screen: (n: number, keysSent: number) => string, sendResult: TmuxResult = { ok: true }) {
     let n = 0; let keysSent = 0;
     const tmux = { getPaneCommand: async () => "codex", getPanePid: async () => 901,
@@ -554,12 +815,17 @@ describe("rig seat restart --keep-conversation: outcomes", () => {
     expect(restarted).toMatchObject({ outcome: "restarted_account_unverified", codexNoDaemonFlag: { present: true } });
   });
 
-  it("--plan and the report give the process mode as unknown, with the reason: nothing observes app-server attachment", async () => {
-    const detail = "Process mode: unknown. Nothing OpenRig reads shows whether the running Codex is attached to an app-server; the --no-daemon flag above is launch evidence only.";
+  it("--plan and the report carry no process mode, and only a constant billing route for older CLIs", async () => {
     for (const runningArgs of [undefined, `--no-daemon -m gpt-5.5 -s workspace-write resume ${TOKEN}`]) {
       const w = world(runningArgs ? { runningArgs } : {});
-      expect(await w.service.restartInPlace({ seatRef: SEAT, plan: true })).toMatchObject({ processMode: { state: "unknown", detail } });
-      expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "x" })).toMatchObject({ processMode: { state: "unknown", detail } });
+      for (const result of [await w.service.restartInPlace({ seatRef: SEAT, plan: true }), await w.service.restartInPlace({ seatRef: SEAT, reason: "x" })]) {
+        expect(result).not.toHaveProperty("processMode");
+        expect(result).toMatchObject({ billingRoute: { state: "unknown", detail: "Not reported." } });
+        // A CLI before 0.7.0 prints this unguarded: the read must succeed.
+        expect(`Billing route: ${(result as unknown as { billingRoute: { detail: string } }).billingRoute.detail}`).toBe("Billing route: Not reported.");
+        // The launch flag's line still says it doesn't show app-server involvement.
+        expect(result).toMatchObject({ codexNoDaemonFlag: { detail: expect.stringContaining("doesn't show whether an app-server process") } });
+      }
     }
   });
 
@@ -568,6 +834,16 @@ describe("rig seat restart --keep-conversation: outcomes", () => {
     const result = await w.service.restartInPlace({ seatRef: SEAT, reason: "x" });
     expect(result).toMatchObject({ outcome: "incomplete", remainingStep: expect.stringContaining("no fresh session was started") });
     expect(w.launches).toHaveLength(1);
+  });
+
+  it("proves the resume in the home the running Codex uses, in both pane shapes, though the seat declares none", async () => {
+    // The seat has no env: home, so the adapter would fall back to the daemon's; the restart already read the real one.
+    for (const shape of ["shell_backed", "direct_native"] as const) {
+      const w = world({ shape, ...(shape === "direct_native" ? { remainOnExit: null } : {}) });
+      const result = await w.service.restartInPlace({ seatRef: SEAT, reason: "x" });
+      expect(result).toMatchObject({ ok: true, outcome: "restarted_account_unverified", paneShape: shape });
+      expect(w.proofHomes).toEqual([HOME]);
+    }
   });
 
   it("native_unknown when the resumed process cannot be proven to be the conversation", async () => {
@@ -708,6 +984,43 @@ describe("#1196 round 1: launch choices come from the running Codex (LOW-1); ver
     expect(w.builds).toEqual([{ running: { networkOverride: true, daemonOptOut: true, addDirs: ["/shared/state"] } }]);
   });
 
+  it("an --add-dir holding a space survives whole: the relaunch reads the exact argv, not ps's whitespace split", async () => {
+    // ps shows this Codex's argv joined by spaces, so its cwd's .git ("/home/u/my repo/.git") reads as "/home/u/my" + "repo/.git".
+    const argv = ["/usr/local/bin/codex", "-m", "gpt-5.5", "-s", "workspace-write", "resume", TOKEN, "--add-dir", "/home/u/my repo/.git"];
+    const w = world({ runningArgs: argv.slice(1).join(" "), runningArgv: argv, facts: { 200: facts({ argv }) } });
+    await w.service.restartInPlace({ seatRef: SEAT, plan: true });
+    expect(w.builds).toEqual([{ running: { networkOverride: false, daemonOptOut: false, addDirs: ["/home/u/my repo/.git"] } }]);
+  });
+
+  it("does not plan a restart when the saved token occurs only inside an argv option value", async () => {
+    const argv = ["/usr/local/bin/codex", "resume", "--add-dir", `/tmp/${TOKEN}`, "019a0000-0000-7000-8000-000000000002"];
+    const w = world({ runningArgs: argv.slice(1).join(" "), runningArgv: argv });
+    expect(await w.service.restartInPlace({ seatRef: SEAT, plan: true }))
+      .toMatchObject({ ok: false, code: "resume_binding_unverified" });
+    expect(w.calls).toEqual([]);
+  });
+
+  it("a /proc cmdline read keeps every argv word exactly: spaces and empty words included", () => {
+    expect(procCmdlineArgv(Buffer.from("/usr/local/bin/codex\0resume\0tok\0--add-dir\0/home/u/my repo/.git\0"))).toEqual(
+      ["/usr/local/bin/codex", "resume", "tok", "--add-dir", "/home/u/my repo/.git"]);
+    expect(procCmdlineArgv("codex\0-c\0\0")).toEqual(["codex", "-c", ""]);
+    expect(procCmdlineArgv("")).toBeNull();
+  });
+
+  it.skipIf(!fs.existsSync("/proc/self/cmdline"))("the default reader takes a process's exact argv from /proc, a word with a space included", async () => {
+    const args = ["-e", "setTimeout(() => {}, 30000)", "my repo/.git"];
+    const child = spawn(process.execPath, args, { stdio: "ignore" });
+    try {
+      // Until exec completes, /proc shows the parent's argv; wait for the child's own.
+      for (let tries = 0; tries < 200 && !fs.readFileSync(`/proc/${child.pid}/cmdline`, "utf8").includes("my repo"); tries++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect((await defaultInPlaceRestartIo().readProcess(child.pid!))?.argv).toEqual([process.execPath, ...args]);
+    } finally {
+      child.kill();
+    }
+  });
+
   it("the production adapter builds from the running choices without starting any probe", async () => {
     const { CodexRuntimeAdapter } = await import("../src/adapters/codex-runtime-adapter.js");
     const probes: string[] = [];
@@ -835,7 +1148,7 @@ describe("#1196 round 2: account evidence only from lines produced after the res
   it("no record of the pane's text at the restart means not_observed", async () => {
     const w = world({ rollout });
     await w.service.restartInPlace({ seatRef: SEAT, reason: "x" });
-    w.db.prepare("UPDATE events SET payload = json_set(payload, '$.accountLinesAtRestart', NULL) WHERE type = 'seat.restart_in_place_finished'").run();
+    w.db.prepare("UPDATE events SET payload = json_set(payload, '$.accountTextAtRestart', NULL) WHERE type = 'seat.restart_in_place_finished'").run();
     w.print("Account: me@example.com");
     expect(await w.service.verifyRestartInPlace({ seatRef: SEAT, expectAccount: "me@example.com" }))
       .toMatchObject({ outcome: "restarted_account_unverified", accountEvidence: { state: "not_observed" } });
@@ -845,8 +1158,124 @@ describe("#1196 round 2: account evidence only from lines produced after the res
     const w = world({ screenBefore: "Account: me@example.com" });
     await w.service.restartInPlace({ seatRef: SEAT, reason: "x" });
     const finished = w.events().at(-1)!;
-    expect(Object.values(finished.accountLinesAtRestart)).toEqual([1]);
+    expect(Object.values(finished.accountTextAtRestart.counts)).toEqual([1]);
     expect(JSON.stringify(finished)).not.toContain("example.com");
+  });
+});
+
+// #1264: tmux trims the oldest history once it's full, so the verdict can't depend on how much is kept.
+describe("--verify compares only text after the restart, however much history tmux has trimmed since", () => {
+  const rollout = JSON.stringify({ timestamp: "2099-01-01T00:00:00Z", type: "response_item", payload: { type: "function_call_output" } });
+  const OLD = "  Account:  me@example.com (Pro)";
+  const filler = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => `output line ${from + i}`).join("\n");
+  const verify = (w: ReturnType<typeof world>) => w.service.verifyRestartInPlace({ seatRef: SEAT, expectAccount: "me@example.com" });
+
+  // Two old /status lines, then twelve lines of output; the last three are the visible screen.
+  async function restartedAfterOldStatus() {
+    const w = world({ screenBefore: [OLD, OLD, filler(1, 12)].join("\n"), rollout });
+    expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "x" })).toMatchObject({ outcome: "restarted_account_unverified" });
+    return w;
+  }
+
+  it("a new /status line counts after the old copies are trimmed (main reported it unverified)", async () => {
+    const w = await restartedAfterOldStatus();
+    w.print(filler(13, 20));
+    w.trim(2);
+    w.print(OLD);
+    expect(await verify(w)).toMatchObject({ outcome: "moved", accountEvidence: { state: "matched" } });
+  });
+
+  it("still counts it when trimming has cut into the anchor, or removed all of it", async () => {
+    const partly = await restartedAfterOldStatus();
+    partly.trim(5);
+    partly.print(OLD);
+    expect(await verify(partly)).toMatchObject({ outcome: "moved" });
+
+    const whole = await restartedAfterOldStatus();
+    whole.print(filler(13, 20));
+    whole.trim(11);
+    whole.print(OLD);
+    expect(await verify(whole)).toMatchObject({ outcome: "moved" });
+  });
+
+  it("a line from before the restart never counts as new, trimmed or not", async () => {
+    // In history above the anchor, with nothing new printed.
+    const above = await restartedAfterOldStatus();
+    above.print(filler(13, 20));
+    above.trim(1);
+    expect(await verify(above)).toMatchObject({ outcome: "restarted_account_unverified", accountEvidence: { state: "not_observed" } });
+
+    // On the screen at the restart (after the anchor), with the whole anchor trimmed since.
+    const onScreen = world({ screenBefore: [filler(1, 12), OLD].join("\n"), rollout });
+    await onScreen.service.restartInPlace({ seatRef: SEAT, reason: "x" });
+    onScreen.print(filler(13, 20));
+    onScreen.trim(12);
+    expect(await verify(onScreen)).toMatchObject({ outcome: "restarted_account_unverified", accountEvidence: { state: "not_observed" } });
+
+    // Inside the anchor itself, with the anchor's start trimmed.
+    const inAnchor = world({ screenBefore: [filler(1, 4), OLD, filler(5, 12)].join("\n"), rollout });
+    await inAnchor.service.restartInPlace({ seatRef: SEAT, reason: "x" });
+    inAnchor.trim(4);
+    expect(await verify(inAnchor)).toMatchObject({ outcome: "restarted_account_unverified", accountEvidence: { state: "not_observed" } });
+  });
+
+  it("a copy of the anchor on the screen at the restart doesn't move where counting starts", async () => {
+    // History ends with the anchor (a to h) and one more line; the screen shows an old /status, then the anchor again.
+    const anchor = "abcdefgh".split("").map((letter) => `step ${letter}`);
+    const w = world({ screenBefore: [...anchor, "tail", OLD, ...anchor].join("\n"), screenRows: 9, rollout });
+    expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "x" })).toMatchObject({ outcome: "restarted_account_unverified" });
+    w.erase(8);
+    expect(await verify(w)).toMatchObject({ outcome: "restarted_account_unverified", accountEvidence: { state: "not_observed" } });
+  });
+
+  it("captures that don't line up give a whole-pane baseline: a new /status line still counts, the old one never does", async () => {
+    // The history-only capture read a, b, tail; by the whole-pane capture the pane read b, tail, then an old /status.
+    const restartMisaligned = async () => {
+      const w = world({ screenBefore: ["b", "tail", OLD].join("\n"), historyCapture: "a\nb\ntail", rollout });
+      expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "x" })).toMatchObject({ outcome: "restarted_account_unverified" });
+      expect(w.events().at(-1)!.accountTextAtRestart.anchor).toEqual([]);
+      return w;
+    };
+    const fresh = await restartMisaligned();
+    fresh.print(OLD);
+    expect(await verify(fresh)).toMatchObject({ outcome: "moved", accountEvidence: { state: "matched" } });
+
+    const unchanged = await restartMisaligned();
+    expect(await verify(unchanged)).toMatchObject({ outcome: "restarted_account_unverified", accountEvidence: { state: "not_observed" } });
+  });
+
+  it("a restart recorded with the earlier whole-pane counts is still compared as before", async () => {
+    const w = await restartedAfterOldStatus();
+    w.db.prepare("UPDATE events SET payload = json_remove(json_set(payload, '$.accountLinesAtRestart', json(?)), '$.accountTextAtRestart') WHERE type = 'seat.restart_in_place_finished'")
+      .run(JSON.stringify({ [createHash("sha256").update(OLD.trim()).digest("hex").slice(0, 16)]: 2 }));
+    w.print(OLD);
+    expect(await verify(w)).toMatchObject({ outcome: "moved" });
+  });
+});
+
+describe("accountTextMark", () => {
+  const key = (line: string) => createHash("sha256").update(line).digest("hex").slice(0, 16);
+  it("counts from where the anchor ends in history, not from a later copy on the screen", () => {
+    expect(accountTextMark({ history: "a\nb\ntail", all: "a\nb\ntail\nAccount: x\na\nb" }))
+      .toEqual({ anchor: [key("a"), key("b")], counts: { [key("Account: x")]: 1 } });
+  });
+  it("counts the whole pane, with no anchor, when the two captures don't line up", () => {
+    expect(accountTextMark({ history: "a\nb\ntail", all: "b\ntail\nAccount: x" })).toEqual({ anchor: [], counts: { [key("Account: x")]: 1 } });
+  });
+  it("records nothing when the pane couldn't be read", () => {
+    expect(accountTextMark(null)).toBeNull();
+  });
+});
+
+describe("linesAfterAnchor", () => {
+  const key = (line: string) => createHash("sha256").update(line).digest("hex").slice(0, 16);
+  it("takes the anchor's last occurrence, so a repeat only shortens what is compared", () => {
+    expect(linesAfterAnchor(["a", "b", "x", "a", "b", "y"], [key("a"), key("b")])).toEqual(["y"]);
+  });
+  it("uses the longest surviving end of a trimmed anchor, and everything when none survives", () => {
+    expect(linesAfterAnchor(["b", "c", "y"], [key("a"), key("b"), key("c")])).toEqual(["y"]);
+    expect(linesAfterAnchor(["y", "z"], [key("a"), key("b")])).toEqual(["y", "z"]);
+    expect(linesAfterAnchor(["y"], [])).toEqual(["y"]);
   });
 });
 
@@ -931,8 +1360,8 @@ describe("post-relaunch identity observation window", () => {
 
   it.each(["wrong token", "missing token", "conflicting native", "wrong OS executable"])("never promotes stable invalid evidence: %s", async kind => {
     const rows = replacement("shell_backed");
-    if (kind === "wrong token") rows[3] = { ...rows[3]!, command: "/usr/local/bin/codex resume other-thread" };
-    if (kind === "missing token") rows[3] = { ...rows[3]!, command: "/usr/local/bin/codex" };
+    if (kind === "wrong token") rows[3] = { ...rows[3]!, command: "/usr/local/bin/codex resume other-thread", argv: ["/usr/local/bin/codex", "resume", "other-thread"] };
+    if (kind === "missing token") rows[3] = { ...rows[3]!, command: "/usr/local/bin/codex", argv: ["/usr/local/bin/codex"] };
     if (kind === "conflicting native") rows.push(codexRow(401, 351, `resume ${TOKEN}`, LATER, 350));
     if (kind === "wrong OS executable") rows[3] = { ...rows[3]!, executableName: "node" };
     const w = world({ replacementRows: () => rows });
@@ -951,7 +1380,7 @@ describe("post-relaunch identity observation window", () => {
 
   it("allows an earlier token mismatch to resolve only into a later fully valid pair", async () => {
     const good = replacement("shell_backed");
-    const bad = good.map(row => row.pid === 400 ? { ...row, command: "/usr/local/bin/codex resume other-thread" } : row);
+    const bad = good.map(row => row.pid === 400 ? { ...row, command: "/usr/local/bin/codex resume other-thread", argv: ["/usr/local/bin/codex", "resume", "other-thread"] } : row);
     const w = world({ replacementRows: read => read <= 2 ? bad : good });
     expect(await w.service.restartInPlace({ seatRef: SEAT, reason: "later valid proof" }))
       .toMatchObject({ outcome: "restarted_account_unverified" });

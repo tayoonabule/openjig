@@ -20,7 +20,9 @@ export interface StatusDeps {
 function formatSnapshotAge(snapshotAt: string | null): string {
   if (!snapshotAt) return "none";
   const now = Date.now();
-  const then = new Date(snapshotAt).getTime();
+  // Snapshot times are SQLite `datetime('now')` stamps: UTC written without a zone, which Date reads as local time.
+  const then = Date.parse(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(snapshotAt)
+    ? `${snapshotAt.replace(" ", "T")}Z` : snapshotAt);
   const diffMs = now - then;
   const diffMin = Math.floor(diffMs / 60_000);
   if (diffMin < 1) return "just now";
@@ -40,7 +42,7 @@ export function statusCommand(depsOverride?: StatusDeps): Command {
     // JSON mode: one object, same keys on every path; sections the command did not
     // (or could not) read are null rather than absent.
     const emit = (daemon: Record<string, unknown>, rest: Record<string, unknown> = {}): void => {
-      console.log(JSON.stringify({ daemon, kernel: null, workspaceRoot: null, rigs: null, cmux: null, ...rest }, null, 2));
+      console.log(JSON.stringify({ daemon: { ...daemon, ...(status.databaseWarnings ? { databaseWarnings: status.databaseWarnings } : {}) }, kernel: null, workspaceRoot: null, rigs: null, cmux: null, ...rest }, null, 2));
     };
 
     const deps = depsOverride ?? {
@@ -49,6 +51,7 @@ export function statusCommand(depsOverride?: StatusDeps): Command {
     };
 
     const status = await getDaemonStatus(deps.lifecycleDeps);
+    if (!json) for (const warning of status.databaseWarnings ?? []) console.log(`Warning: ${warning}`);
 
     if (json && status.state !== "running") {
       // reachable: false = positively down (stopped, stale); null = not confirmed (unverified).
@@ -60,7 +63,10 @@ export function statusCommand(depsOverride?: StatusDeps): Command {
         message: statusGuardMessage(status).fact,
         ...(status.pid !== undefined ? { pid: status.pid } : {}),
         ...(status.probeErrorCode ? { probeErrorCode: status.probeErrorCode } : {}),
-        ...(status.siblingHint ? { siblingHint: status.siblingHint } : {}),
+        // The JSON keeps its two fields; `moved` only decides auto-start.
+        ...(status.siblingHint
+          ? { siblingHint: { resolvedHome: status.siblingHint.resolvedHome, siblingHome: status.siblingHint.siblingHome } }
+          : {}),
         ...(life ? { lifecycle: life } : {}),
       });
       return;

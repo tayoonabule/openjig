@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,7 +28,7 @@ afterEach(() => {
 const nothingElse: WorkCandidateLookups = { getRow: () => null, continuationOf: () => null };
 
 function world() {
-  root = mkdtempSync(join(tmpdir(), "refocus-work-packet-"));
+  root = realpathSync(mkdtempSync(join(tmpdir(), "refocus-work-packet-")));
   const workspace = join(root, "workspace");
   const missions = join(workspace, "missions");
   const topology = join(root, "topology");
@@ -84,7 +84,7 @@ describe("deriveWorkCandidates — labelled evidence beside the strict derivatio
     const w = world();
     const out = deriveWorkCandidates([{ qitemId: "q-1", state: "in-progress", tags: ["mission:release-a"] }], w.missions, nothingElse);
     expect(out.candidates).toEqual([{
-      kind: "tag", qitemId: "q-1", mission: "release-a", slice: null,
+      kind: "tag", qitemId: "q-1", projects: [], mission: "release-a", slice: null,
       workNodePath: join(w.missions, "release-a"), intent: "Ship A",
       source: "tag mission:release-a on row q-1", unresolved: null,
     }]);

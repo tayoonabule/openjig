@@ -42,8 +42,10 @@ function harness(opts: { admitted?: boolean; failCreates?: number; newerRoot?: s
       : ts === "400.7" ? { threadTs: "400.0", seat: "other@rig", conversationId: "qitem-ask-2" }
       : null,
   } as never;
+  const seen = new SeenStore("/s.jsonl", fs, clock);
   const deadLetter = new DeadLetterStore<SlackEvent>("/d.jsonl", fs, clock);
-  const router = new InboundRouter({
+  // The wire, built on the same durable stores as a restart builds it; `reactions` is the saved setting.
+  const build = (reactions?: "route" | "off") => new InboundRouter({
     queue: {
       createQitem: async (input: Landed) => {
         if (failures > 0) { failures--; throw new Error("queue unavailable"); }
@@ -51,15 +53,16 @@ function harness(opts: { admitted?: boolean; failCreates?: number; newerRoot?: s
         return input.qitemId;
       },
     },
-    seen: new SeenStore("/s.jsonl", fs, clock),
+    seen,
     deadLetter,
+    ...(reactions ? { reactions } : {}),
     destination: "operator-agent@kernel",
-    resolveSender: () => opts.admitted === false ? { admitted: false, teaching: "not registered" } : { admitted: true, source: "founder@humans" },
+    resolveSender: () => opts.admitted === false ? { admitted: false, teaching: "not registered" } : { admitted: true, source: "ana@humans" },
     resolveRoute: makeThreadRouteResolver({ map: threadMap, unroutedDestination: "orch-lead@team", log: (m: string) => logs.push(m) }),
     resolveHumanReply: async (input: { qitemId: string }) => { resolved.push(input.qitemId); return "resolved"; },
     log: (m: string) => logs.push(m),
   } as never);
-  return { router, rows, resolved, deadLetter, logs };
+  return { router: build(), rows, resolved, deadLetter, logs, rebuild: build };
 }
 
 const reaction = (over?: Partial<SlackEvent>): SlackEvent => ({
@@ -79,10 +82,10 @@ describe("#899 reactions on an ask", () => {
     expect(await deliver(h, reaction())).toEqual({ status: "accepted", reason: "reaction" });
     expect(h.rows).toHaveLength(1);
     const row = h.rows[0]!;
-    expect(row).toMatchObject({ source: "founder@humans", destination: "asker@rig" });
+    expect(row).toMatchObject({ source: "ana@humans", destination: "asker@rig" });
     expect(row.tags).toContain("human-reaction");
-    expect(row.summary).toBe("Founder via Slack: reacted :white_check_mark: to qitem-ask-1");
-    expect(row.body).toContain("founder@humans reacted :white_check_mark: to your ask qitem-ask-1");
+    expect(row.summary).toBe("ana@humans via Slack: reacted :white_check_mark: to qitem-ask-1");
+    expect(row.body).toContain("ana@humans reacted :white_check_mark: to your ask qitem-ask-1");
     expect(row.body).toContain("doesn't answer or close the ask");
     // The seat decides what the reaction means; nothing resolves the ask for it.
     expect(h.resolved).toEqual([]);
@@ -94,29 +97,29 @@ describe("#899 reactions on an ask", () => {
     expect(await deliver(h, reaction())).toEqual({ status: "ignored", reason: "dup" });
     await deliver(h, reaction({ reaction: "eyes", event_ts: "402.0" }));
     expect(h.rows.map((row) => row.summary)).toEqual([
-      "Founder via Slack: reacted :white_check_mark: to qitem-ask-1",
-      "Founder via Slack: reacted :eyes: to qitem-ask-1",
+      "ana@humans via Slack: reacted :white_check_mark: to qitem-ask-1",
+      "ana@humans via Slack: reacted :eyes: to qitem-ask-1",
     ]);
   });
 
   it("on an older root of the same ask still reach its seat", async () => {
     const h = harness({ newerRoot: "450.0" });
     expect(await deliver(h, reaction())).toEqual({ status: "accepted", reason: "reaction" });
-    expect(h.rows[0]).toMatchObject({ destination: "asker@rig", summary: "Founder via Slack: reacted :white_check_mark: to qitem-ask-1" });
+    expect(h.rows[0]).toMatchObject({ destination: "asker@rig", summary: "ana@humans via Slack: reacted :white_check_mark: to qitem-ask-1" });
   });
 
   it("on a reply part OpenRig posted for a long ask reach the seat that asked, as on the ask itself", async () => {
     const h = harness({ newerRoot: "400.0" });
     expect(await deliver(h, reaction({ item: { type: "message", channel: "C1", ts: "400.5" } }))).toEqual({ status: "accepted", reason: "reaction" });
     expect(h.rows).toHaveLength(1);
-    expect(h.rows[0]).toMatchObject({ destination: "asker@rig", summary: "Founder via Slack: reacted :white_check_mark: to qitem-ask-1" });
+    expect(h.rows[0]).toMatchObject({ destination: "asker@rig", summary: "ana@humans via Slack: reacted :white_check_mark: to qitem-ask-1" });
   });
 
   it("on an ask posted into another ask's thread reach that ask's own seat, not the thread owner's", async () => {
     const h = harness();
     expect(await deliver(h, reaction({ item: { type: "message", channel: "C1", ts: "400.7" } }))).toEqual({ status: "accepted", reason: "reaction" });
     expect(h.rows).toHaveLength(1);
-    expect(h.rows[0]).toMatchObject({ destination: "other@rig", summary: "Founder via Slack: reacted :white_check_mark: to qitem-ask-2" });
+    expect(h.rows[0]).toMatchObject({ destination: "other@rig", summary: "ana@humans via Slack: reacted :white_check_mark: to qitem-ask-2" });
   });
 
   it("are ignored on any message that isn't an ask, with no row for anyone", async () => {
@@ -154,6 +157,15 @@ describe("#899 reactions on an ask", () => {
     expect(ingestDecision(reaction())).toEqual({ ingest: true });
     expect(ingestDecision(reaction({ item: { type: "file", ts: "400.0" } }))).toEqual({ ingest: false, reason: "reaction-target" });
     expect(ingestDecision(reaction({ user: undefined }))).toEqual({ ingest: false, reason: "no-user" });
+  });
+
+  it("#2233: one retained before reactions were turned off is dropped by the retry, with no row for anyone", async () => {
+    const h = harness({ failCreates: 1 });
+    expect(await deliver(h, reaction())).toEqual({ status: "dead-lettered", reason: "create_failed" });
+    // The person turns reactions off, and the wire is built again on the same stores, as a restart does.
+    expect(await h.rebuild("off").retryDeadLetters()).toMatchObject({ landed: 0 });
+    expect(h.rows).toEqual([]);
+    expect(h.deadLetter.readAll()).toHaveLength(0);
   });
 
   it("survive a failed create: dead-lettered, then landed once by the retry", async () => {

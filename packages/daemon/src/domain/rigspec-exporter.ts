@@ -1,3 +1,5 @@
+import { readClaudePermissionRules } from "./claude-permission-rules.js";
+import { readCodexMemberPermissions } from "./codex-member-permissions.js";
 import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
 import type { PodRepository } from "./pod-repository.js";
@@ -6,6 +8,7 @@ import type {
   RigSpec, RigSpecPod, RigSpecPodMember, RigSpecPodEdge, RigSpecCrossPodEdge,
 } from "./types.js";
 import { RigNotFoundError } from "./errors.js";
+import { seatLaunchAdditionsForNode } from "./seat-launch-additions.js";
 
 interface RigSpecExporterDeps {
   rigRepo: RigRepository;
@@ -30,6 +33,25 @@ export class RigSpecExporter {
     this.rigRepo = deps.rigRepo;
     this.sessionRegistry = deps.sessionRegistry;
     this.podRepo = deps.podRepo ?? null;
+  }
+
+  /** OPR.0.7.0.9 — seats whose launch additions (agent file, appended prompt file, plugin folders) an export doesn't
+   *  carry: the node records the seat's copies, not the spec's paths, so they must be named rather than dropped silently. */
+  launchAdditionsNotCarried(rigId: string): string[] {
+    const rig = this.rigRepo.getRig(rigId);
+    if (!rig) return [];
+    return rig.nodes.filter((node) => {
+      const additions = seatLaunchAdditionsForNode(this.db, node.id);
+      return !!additions && (!!additions.agent || !!additions.appendSystemPromptFile || additions.pluginDirs.length > 0);
+    }).map((node) => node.logicalId).sort();
+  }
+
+  /** Name dormant Claude MCP choices omitted from declarations for another runtime. */
+  claudeMcpNotCarried(rigId: string): string[] {
+    const rig = this.rigRepo.getRig(rigId);
+    return (rig?.nodes ?? [])
+      .filter((node) => node.runtime !== "claude-code" && node.claudeMcp === "none")
+      .map((node) => node.logicalId).sort();
   }
 
   exportRig(rigId: string): LegacyRigSpec | RigSpec {
@@ -80,6 +102,13 @@ export class RigSpecExporter {
       if (node.role) specNode.role = node.role;
       if (node.model) specNode.model = node.model;
       if (node.effort) specNode.effort = node.effort;
+      if (node.advisor) specNode.advisor = node.advisor;
+      if (node.runtime === "claude-code" && node.claudeMcp) specNode.claudeMcp = node.claudeMcp;
+      const rules = node.runtime === "claude-code" ? readClaudePermissionRules(this.db, node.id) : undefined;
+      if (rules !== undefined) specNode.claudePermissions = rules;
+      if (node.runtime === "claude-code" && node.claudeTokenRef && !node.accountHome && node.claudeTokenRef.kind !== "api-key") specNode.claudeTokenRef = node.claudeTokenRef;
+      const envelope = node.runtime === "codex" ? readCodexMemberPermissions(this.db, node.id) : undefined;
+      if (envelope !== undefined) specNode.codexPermissions = envelope;
       if (node.cwd) specNode.cwd = node.cwd;
       if (node.surfaceHint) specNode.surfaceHint = node.surfaceHint;
       if (node.workspace) specNode.workspace = node.workspace;
@@ -94,7 +123,7 @@ export class RigSpecExporter {
       if (!from) {
         throw new Error(`Cannot export edge: unmapped source node ID '${edge.sourceId}'`);
       }
-      const to = idToLogical.get(edge.targetId);
+      const to = edge.targetRef ?? idToLogical.get(edge.targetId);
       if (!to) {
         throw new Error(`Cannot export edge: unmapped target node ID '${edge.targetId}'`);
       }
@@ -113,6 +142,7 @@ export class RigSpecExporter {
   private exportPodAware(rigId: string, rig: import("./types.js").RigWithRelations): RigSpec {
     const pods = this.podRepo!.getPodsForRig(rigId);
     const sessions = this.sessionRegistry.getSessionsForRig(rigId);
+    const startupLayers = this.rigRepo.getRigStartupLayers(rigId);
 
     // Build maps for lookups
     // logicalId is "podSpecId.memberLocalId" — extract both parts
@@ -160,12 +190,19 @@ export class RigSpecExporter {
         if (node.codexConfigProfile) member.codexConfigProfile = node.codexConfigProfile;
         if (node.model) member.model = node.model;
         if (node.effort) member.effort = node.effort;
+        if (node.advisor) member.advisor = node.advisor;
+        if (node.runtime === "claude-code" && node.claudeMcp) member.claudeMcp = node.claudeMcp;
         // OPR.0.4.6.FAC1: a declared seat role exports with the pod
         // member (round-trip fidelity — export→import keeps the role).
         if (node.role) member.role = node.role;
         // OPR.0.4.8.3 Seam B: the seat's RAW permission_policy ref round-trips
         // (export truth = the ref, never the resolved provenance).
         if (node.permissionPolicy) member.permissionPolicy = node.permissionPolicy;
+        const rules = node.runtime === "claude-code" ? readClaudePermissionRules(this.rigRepo.db, node.id) : undefined;
+        if (rules !== undefined) member.claudePermissions = rules;
+        if (node.runtime === "claude-code" && node.claudeTokenRef && !node.accountHome && node.claudeTokenRef.kind !== "api-key") member.claudeTokenRef = node.claudeTokenRef;
+        const envelope = node.runtime === "codex" ? readCodexMemberPermissions(this.rigRepo.db, node.id) : undefined;
+        if (envelope !== undefined) member.codexPermissions = envelope;
         if (node.env) member.env = node.env;
         if (node.sessionSource) member.sessionSource = node.sessionSource;
         const rp = getRestorePolicy(node.id);
@@ -191,6 +228,10 @@ export class RigSpecExporter {
         edges: podEdges,
       };
       if (pod.summary) podSpec.summary = pod.summary;
+      const podFiles = startupLayers?.podStartupFiles?.[pod.namespace];
+      if (Array.isArray(podFiles) && podFiles.length > 0) {
+        podSpec.startup = { files: podFiles, actions: [] };
+      }
       if (pod.continuityPolicyJson) {
         try {
           podSpec.continuityPolicy = JSON.parse(pod.continuityPolicyJson);
@@ -205,12 +246,12 @@ export class RigSpecExporter {
       .filter((e) => {
         const srcPod = nodeIdToPodId.get(e.sourceId);
         const tgtPod = nodeIdToPodId.get(e.targetId);
-        return srcPod && tgtPod && srcPod !== tgtPod;
+        return Boolean(e.targetRef) || (srcPod && tgtPod && srcPod !== tgtPod);
       })
       .map((e) => ({
         kind: e.kind,
         from: idToLogical.get(e.sourceId)!,
-        to: idToLogical.get(e.targetId)!,
+        to: e.targetRef ?? idToLogical.get(e.targetId)!,
       }));
 
     // OPR.0.4.8.3 Seam B: rig-level permission_policy is a RIG-ROW field (not derivable
@@ -220,15 +261,20 @@ export class RigSpecExporter {
     const rigEnv = this.rigRepo.getRigEnv(rigId);
     // #25: the selected Claude managed-block file is also a rig-row field.
     const claudeManagedBlockFile = this.rigRepo.getRigClaudeManagedBlockFile(rigId);
+    // #1631: culture_file and rig-level startup block round-trip through export.
+    const cultureFile = startupLayers?.cultureFile;
+    const startup = startupLayers?.startup;
 
     return {
       version: "0.2",
       name: rig.rig.name,
+      ...(cultureFile ? { cultureFile } : {}),
       ...(rigPermissionPolicy ? { permissionPolicy: rigPermissionPolicy } : {}),
       ...(this.rigRepo.getRigNonInterruptive(rigId) ? { nonInterruptive: true } : {}),
       ...(rigEnv ? { env: rigEnv } : {}),
       ...(claudeManagedBlockFile ? { managedBlocks: { "claude-code": claudeManagedBlockFile } } : {}),
       ...(workspace ? { workspace } : {}),
+      ...(startup ? { startup } : {}),
       pods: podSpecs,
       edges: crossPodEdges,
     };

@@ -244,6 +244,15 @@ interactive"), and the post-launch files aren't sent. A Codex fork that the rig 
 `session_source.mode: fork`, or an agent image's fork) is the exception: its timeout ends as `attention_required`,
 with its startup context kept for `rig seat continue` (see below). A seat handover's fork has its own readiness check.
 
+**Fresh Claude handovers.** `rig handover --source fresh` keeps the previous agent's scrollback. Before sending the
+handover context, OpenRig waits for the latest prompt inside Claude's complete input frame, and confirms that the
+process in the pane belongs to the new launch. A shell's `❯` prompt or echoed launch command is not enough, even
+with an old Claude header or input frame above it and Claude already running. A header alone or a partially drawn
+input frame also keeps the check pending. If the current screen or process cannot be read, or the process identity is unconfirmed, the handover keeps
+waiting within the readiness window and fails if that window expires. Old screen text or the `claude` process label
+alone cannot complete this check. A healthy agent can therefore remain unconfirmed while those observations are
+unavailable; inspect its pane before deciding how to recover.
+
 **Claude submission check.** For each startup message to a Claude seat, OpenRig makes a bounded check that the prompt
 was submitted. When the capture can't tell, it records the submission as unverified and carries on. When it sees the
 same prompt still sitting in the input, it presses Enter once more; if it's still there, it warns "Startup prompt still
@@ -321,6 +330,12 @@ not the destination's file contents.)
 - `rig seat launch <seat> --fresh --stop --reason <text>`, which starts a blank conversation; or
 - `rig handover <seat> --source rebuild --reason <text>`, which carries durable context.
 
+For Codex rebuilds, OpenRig also carries a complete supported native permission policy read from the live
+predecessor's own conversation and process, without adding fresh-launch grants. A later recorded seat permission
+or policy choice, or a differing declared successor profile, takes precedence. Missing, stale or unsupported observations keep the existing launch
+behaviour and are reported as unverified in the handover result; requested modes and profiles alone don't prove
+preservation. The result reports what was emitted, not native successor equivalence.
+
 **Adopt it promptly.** The saved directory doesn't move the running process, but background work can use it before
 adoption. Saved configuration isn't the live process's directory, and these examples aren't the only consumers. For a
 running Claude seat:
@@ -349,10 +364,37 @@ declaration isn't changed either; update it separately if a future recreation sh
 Each startup file and action specifies when it applies:
 - `fresh_start` — delivered when a new conversation starts: the first launch, `rig seat launch --fresh`,
   `rig seat continue`, and seats restored with `--fresh`
-- `restore` — delivered when a seat is restored, including a restore whose resume falls back to a fresh conversation
+- `restore` — delivered when a seat is restored without its earlier conversation: a restore whose resume falls back to a fresh conversation, or a retried start
 - Default: `[fresh_start, restore]` (both)
 
-Use this to avoid re-sending context that the agent already has from its resumed conversation. For example, a one-time project briefing might only apply on `fresh_start`, while identity grounding should apply on both.
+**An exact resume delivers neither.** When a restore reopens the seat's saved conversation (`rig up <rig> --existing` with a resume token), OpenRig types no startup actions and delivers no startup files, `restore` ones included: the conversation already has them, and typing them again would add turns to it. The one exception: a managed guidance block missing from the guidance file is put back before the harness starts.
+
+Use this to avoid re-sending context that a fresh conversation doesn't need twice. For example, a one-time project briefing might only apply on `fresh_start`, while identity grounding should apply on both, so a seat that comes back fresh gets it again.
+
+---
+
+## What a seat is set to, and what it's running
+
+A seat's settings can disagree with its running agent: what's saved for the next launch, what the running process
+actually uses, and what its conversation has already read are three separate things. OpenRig reports each one
+separately. Without live evidence it says unknown (or not verified), never the saved value. A saved change reaches the
+running seat only through the action in the last column.
+
+| What | Saved for the next launch | What the running seat has | How the running seat gets it |
+|---|---|---|---|
+| Model | `rig seat set-model` | `rig ps --nodes` shows the configured model beside the last observed one, or `UNKNOWN (<reason>)` | The next managed resume or successor launch |
+| Reasoning effort | `rig seat set-effort` | `rig seat effort <seat>`: requested, saved, sent at launch, and what the session recorded, which is not verified until it takes a turn | Its next managed continuation; nothing restarts |
+| Permissions | `rig seat set-permissions` (`--mode`, `--rules`, or for Codex `--codex-permissions` or `--codex-profile`), shown by `rig seat status` | What it launched with; a status read doesn't prove the running process enforces the selection | Its next managed launch or resume ([per-seat permission mode](getting-started.md#per-seat-permission-mode)) |
+| Working directory | `rig seat set-cwd`, shown by `rig seat status` as **Working directory for future launches** | The directory it started in | `rig seat launch --fresh --stop` (a blank conversation) or `rig handover --source rebuild` (durable context); [details](#change-an-existing-seats-working-directory) |
+| Startup files and skills | The spec's startup files, skills and actions | What its conversation read when it started; editing a file afterwards doesn't reach it | A fresh launch or a handover delivers them again; for the running seat, send or walk the change (`rig walk <seat> --through <files>`) |
+| Tools (MCP servers, plugins) | Selected fragments, merged into the harness's own config (`.mcp.json` for Claude, `config.toml` for Codex) | Unknown to OpenRig: registered isn't active, Claude asks before it uses a new server, and no OpenRig command reports which tools a running harness loaded | Check in the harness itself (Claude Code's `/mcp`); a running session may need a restart to pick up newly written config ([runtime config disclosure](#runtime-config-disclosure)) |
+
+Per harness: Claude Code's and Codex's permission choices are in the setup reference
+([Claude Code](getting-started.md#claude-code-a-different-launch-flag),
+[Codex](getting-started.md#codex-select-sandbox-and-approvals-together)), Codex homes are
+[below](#separate-codex-homes-for-separate-installations), community harnesses' limits are in
+[their presets](community-harness-presets.md), and moving a live seat to the other runtime is in the
+[setup reference](getting-started.md#move-a-seat-to-the-other-runtime).
 
 ---
 
@@ -391,6 +433,11 @@ Each value is typed into the harness's input and submitted, so it is a prompt or
 Types are `send_text`, `slash_command` and `startup_proof` (see "Startup proof" above); `shell` is refused.
 `idempotent` is required, and an action that isn't idempotent must not list `restore` in `applies_on`. Both phases
 run after the harness is ready: `after_files` (the default) after the post-launch files, then `after_ready`.
+
+**Don't rename a managed Claude seat.** OpenRig starts every Claude seat with `--name <session>`, on a fresh start and on
+every resume, and its own reads of the seat use that name: context usage and managed compaction read the status-line
+record Claude saves under it, and the input box is recognized by the name on its border. A startup `/rename` to another
+name breaks those reads until the next resume puts the session name back.
 
 ### Current Support Matrix
 
@@ -516,6 +563,46 @@ remain shared.
   workspace folder
 
 **Terminal seats** (`builtin:terminal`) get no agent or profile layers and no startup proof.
+
+### Claude compaction preparation directory
+
+Managed Claude compaction asks the seat to write a restore map before `/compact`. By default,
+OpenRig uses `<cwd>/.openrig/compaction/preparation/`, falling back to its instance home when
+that directory cannot be prepared. A filesystem write check cannot establish whether Claude's
+file-edit permissions allow the seat to write there.
+
+If the launch workspace is denied by Claude's permissions, select an absolute preparation root:
+
+```sh
+rig config set policies.claude_compaction.preparation_root /absolute/path/to/restore-maps
+```
+
+Grant the seat file-edit access to that root in its Claude configuration. OpenRig does not change
+Claude permissions; choose a directory outside any matching deny rule. The corresponding environment
+variable is `OPENRIG_POLICIES_CLAUDE_COMPACTION_PREPARATION_ROOT`.
+
+New manual and automatic attempts use `<root>/<session>/<attempt-id>/RESTORE-MAP.md`; an in-flight
+attempt keeps its original path through the post-compaction restore request. The root gets an
+exclusive `.gitignore` containing `*`, and the daemon publishes the marked `.tmp` file with an
+atomic rename. Use a dedicated root: a conflicting
+ignore file or an unwritable configured directory stops preparation with
+`preparation_directory_unavailable`, visible in `rig compact <session> --state`, without choosing
+another location. Fix the directory and explicitly retry. `--skip-map` still skips the map once.
+
+Reset with `rig config reset policies.claude_compaction.preparation_root` to restore the default.
+The setting applies to new attempts without restarting the daemon.
+
+The managed `/compact` command keeps its 600-character budget. When the selected map path or
+the attempt's compaction instruction does not fit, the existing restore request carries it;
+it never substitutes a newer preparation root or instruction. An explicitly selected root's
+published map is also named in that request when the path fit in `/compact`. The default root
+keeps the existing command/restore handoff. Under `--skip-map`, restore still recognizes an
+optional map completed at that attempt's path, or says that no map was required.
+
+The compaction preparation and command-submission tests cover manual and automatic attempts,
+long paths and instructions, settings changed during preparation, directory failures and
+late maps after cancellation or expiry. They use synthetic delivery and filesystem fixtures;
+they do not prove a live Claude session's permission choices or compaction behavior.
 
 ### Codex compaction and sizing
 

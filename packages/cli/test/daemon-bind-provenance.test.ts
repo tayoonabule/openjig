@@ -21,18 +21,18 @@ describe("S20 — buildDaemonEnv: routing env never crosses into the daemon", ()
   it("declared intent exports the DEDICATED bind env plus a COHERENT routing env (seats route where the daemon binds)", () => {
     const env = buildDaemonEnv(
       { HOME: "/Users/op", OPENRIG_HOST: "10.0.0.9" }, // stale inherited routing is still ignored
-      { port: 7433, host: "100.95.124.51", db: "/tmp/t.db" },
+      { port: 7433, host: "100.88.0.20", db: "/tmp/t.db" },
     );
-    expect(env["OPENRIG_BIND_HOST"]).toBe("100.95.124.51");
-    expect(env["OPENRIG_HOST"]).toBe("100.95.124.51"); // the routing half follows the DECLARED intent
+    expect(env["OPENRIG_BIND_HOST"]).toBe("100.88.0.20");
+    expect(env["OPENRIG_HOST"]).toBe("100.88.0.20"); // the routing half follows the DECLARED intent
   });
 
   it("an inherited OPENRIG_BIND_HOST passes through — the dedicated surface IS unambiguous operator opt-in", () => {
     const env = buildDaemonEnv(
-      { HOME: "/Users/op", OPENRIG_BIND_HOST: "100.95.124.51" },
+      { HOME: "/Users/op", OPENRIG_BIND_HOST: "100.88.0.20" },
       { port: 7433, db: "/tmp/t.db" },
     );
-    expect(env["OPENRIG_BIND_HOST"]).toBe("100.95.124.51");
+    expect(env["OPENRIG_BIND_HOST"]).toBe("100.88.0.20");
   });
 });
 
@@ -115,18 +115,31 @@ describe("S20 — the restored listener gate: adoption fails loudly on a dropped
     });
     expect(tailAttempts).toBe(1);
     expect(r.ok).toBe("indeterminate"); // NOT false — no SIGTERM evidence exists
-    if (r.ok === "indeterminate") expect(r.reason).toMatch(/indeterminate|could not be checked/i);
+    if (r.ok === "indeterminate") {
+      expect(r.reason).toMatch(/indeterminate|could not be checked/i);
+      expect(r.hosts).toEqual(["100.64.0.9"]);
+    }
+  });
+
+  it("a MISSING listener fails the gate even while another listener is indeterminate", async () => {
+    const r = await verifyRequiredListeners({
+      bind: { mode: "default", hosts: ["127.0.0.1", "100.64.0.9", "100.64.0.10"], tailscaleDetected: true },
+      port: 7433,
+      probe: async (url) => url.includes("100.64.0.9") ? "indeterminate" : url.includes("100.64.0.10") ? "unhealthy" : "healthy",
+    });
+    expect(r.ok).toBe(false);
+    if (r.ok === false) expect(r.missing).toEqual(["100.64.0.10"]);
   });
 
   it("explicit mode requires exactly the declared host", async () => {
     const ok = await verifyRequiredListeners({
-      bind: { mode: "explicit", hosts: ["100.95.124.51"], tailscaleDetected: true },
+      bind: { mode: "explicit", hosts: ["100.88.0.20"], tailscaleDetected: true },
       port: 7433,
-      probe: probeUp(new Set(["100.95.124.51"])),
+      probe: probeUp(new Set(["100.88.0.20"])),
     });
     expect(ok.ok).toBe(true);
     const bad = await verifyRequiredListeners({
-      bind: { mode: "explicit", hosts: ["100.95.124.51"], tailscaleDetected: false },
+      bind: { mode: "explicit", hosts: ["100.88.0.20"], tailscaleDetected: false },
       port: 7433,
       probe: probeUp(new Set()),
     });

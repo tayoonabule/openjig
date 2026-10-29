@@ -757,19 +757,23 @@ function sliceDetail(
     return Array.isArray(candidateDeps) && candidateDeps.map(String).includes(slice.id);
   }).map((candidate) => candidate.id);
   const waitingRow = slice.lane ? waitingRowText(slice.lane) : null;
-  const hasWorkHistory = slice.workedBy.length > 0;
-  const ownership: ContentLine[] = slice.lane && !waitingRow ? [
-    cardField("seat", str(slice.lane["seat"]), open(laneKey(slice.lane))),
-    cardField("activity", str(activity["activity"], INDETERMINATE)),
-    cardField("decided by", str(activity["decided_by"] ?? activity["basis"], "basis unavailable")),
-    cardField("changed", str(activity["changed_at"], "—")),
-    ...(hasWorkHistory ? wrappedCardField("worked by", slice.workedBy.map(w => `${w.seat} (${w.done}/${w.rows} rows done)`).join(", "), width) : []),
+  const ownership: ContentLine[] = slice.lane ? [
+    cardField("seat", !waitingRow ? str(slice.lane["seat"]) : "none — no in-progress lane", !waitingRow ? open(laneKey(slice.lane)) : undefined),
+    cardField("activity", waitingRow ?? str(activity["activity"], INDETERMINATE), waitingRow ? open(laneKey(slice.lane)) : undefined),
+    cardField("decided by", !waitingRow ? str(activity["decided_by"] ?? activity["basis"], "basis unavailable") : "—"),
+    cardField("changed", !waitingRow ? str(activity["changed_at"], "—") : "—"),
+  ] : !slice.workedBy.length ? [
+    cardField("seat", "none — no claimed lane"),
+    cardField("activity", "not assigned"),
+    cardField("decided by", "—"),
+    cardField("changed", "—"),
   ] : [
-    cardField("seat", waitingRow ? "none — no in-progress lane" : hasWorkHistory ? "none open — no claimed lane" : "none — no claimed lane", waitingRow && slice.lane ? open(laneKey(slice.lane)) : undefined),
-    ...(waitingRow ? [cardField("activity", waitingRow, slice.lane ? open(laneKey(slice.lane)) : undefined)] : [cardField("activity", slice.lane ? str(activity["activity"], INDETERMINATE) : "not assigned")]),
-    ...(hasWorkHistory ? wrappedCardField("worked by", slice.workedBy.map(w => `${w.seat} (${w.done}/${w.rows} rows done)`).join(", "), width) : []),
-    cardField("decided by", slice.lane && !waitingRow ? str(activity["decided_by"] ?? activity["basis"], "basis unavailable") : hasWorkHistory ? "bound queue rows (all states)" : "—"),
-    cardField("changed", slice.lane && !waitingRow ? str(activity["changed_at"], "—") : hasWorkHistory ? slice.workedBy[0]!.last_at : "—"),
+    // No open lane, but bound queue rows (open or closed) show who actually carried the slice.
+    cardField("seat", "none open — no claimed lane"),
+    cardField("activity", "not assigned"),
+    ...wrappedCardField("worked by", slice.workedBy.map(w => `${w.seat} (${w.done}/${w.rows} rows done)`).join(", "), width),
+    cardField("decided by", "bound queue rows (all states)"),
+    cardField("changed", slice.workedBy[0]!.last_at),
   ];
   const evidence: ContentLine[] = [];
   for (const rung of RUNGS) {

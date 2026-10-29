@@ -1,6 +1,7 @@
 import { listProjects, selectedProject, projectReadResponse, projectMission, workSource, insideProject } from "../domain/workspace/project-read.js";
 // SCOPES VIEW (sealed plan d64d2f5c) — the store-direct read routes behind the scopes TUI.
 // GET /api/scopes?mission=X          -> mission slice summaries (cards/counts/locks)
+// GET /api/scopes?counts=1           -> each slice's own node file only (id/name/status/stage/locks): no readiness, proof or narrative
 // GET /api/scopes/slice?mission=&slice= -> the full detail (intent/mini-reqs/contract+drops)
 // GET /api/scopes/narrative?mission=&slice= -> PROGRESS.md RAW for the `n` DISPLAY only
 // Data path: README frontmatter locks + proof/ C1 drops — never PROGRESS.md for counts.
@@ -12,7 +13,7 @@ import * as path from "node:path";
 import { parse } from "yaml";
 import { readMissionStatus } from "../domain/scope/mission-status.js";
 import type { SliceIndexer } from "../domain/slices/slice-indexer.js";
-import { projectSliceScope, type ScopeFsDeps, type SliceScopeDetail } from "../domain/scope/scope-view-projection.js";
+import { projectSliceHeader, projectSliceScope, type ScopeFsDeps, type SliceScopeDetail } from "../domain/scope/scope-view-projection.js";
 import { readAllowedFile } from "../domain/files/file-read.js";
 
 const realFs: ScopeFsDeps = {
@@ -68,6 +69,8 @@ export function scopesRoutes(): Hono {
     const mission = c.req.query("mission");
     if (selected && mission) projectMission(selected, mission);
     const wantDetail = c.req.query("detail") === "1";
+    // A list that needs only names and statuses (Studio's Projects list) skips readiness and proof pairing, the bulk of the work.
+    const wantCounts = !wantDetail && c.req.query("counts") === "1";
     const readPolicy = createProofPolicyRead();
     // A selected catalog project's own root bounds readiness, as in `rig proof` (never an ancestor's project.yaml).
     const bound = selected?.root;
@@ -76,23 +79,41 @@ export function scopesRoutes(): Hono {
       try {
         if (selected) sourcePath = workSource(selected.root, path.join(r.root, missionName, "slices", dirName), false);
         if (selected) workSource(selected.root, path.join(r.root, missionName, "slices", dirName));
-        const proofPath = path.join(r.root, missionName, "slices", dirName, "PROOF.md");
-        if (selected && fs.existsSync(proofPath)) insideProject(selected.root, proofPath);
+        const report = path.join(r.root, missionName, "slices", dirName, "PROOF.md");
+        if (selected && realFs.exists(report)) insideProject(selected.root, report);
         const d = projectSliceScope(realFs, path.join(r.root, missionName, "slices", dirName), readPolicy, bound);
         if (!d) return null;
         // The TUI one-read hydrate: narrative CONTENT rides inline for the `n` DISPLAY —
-        // still never a data source (the projection never reads it for counts).
-        const narrative = d.progressPath ? realFs.readFile(d.progressPath) : null;
-        return { ...d, narrative, ...(selected ? { sourcePath: workSource(selected.root, path.join(r.root, missionName, "slices", dirName)) } : {}) };
+        // still never a data source (the projection never reads it for counts). Read only when detail is asked for.
+        const narrative = wantDetail && d.progressPath ? realFs.readFile(d.progressPath) : null;
+        return { ...d, narrative, ...(sourcePath ? { sourcePath } : {}) };
       } catch (err) {
         return { dirName, id: null, displayName: dirName, error: (err as Error).message, ...(sourcePath ? { sourcePath } : {}),
           status: null, stage: null, locks: { spec: null, delivery: null }, proof: { paired: 0, total: 0 },
           intent: "", miniRequirements: [], proofContract: [], progressPath: null, specShaShort: null, prdExists: false, narrative: null };
       }
     };
+    const countsFor = (missionName: string, dirName: string) => {
+      const sliceDir = path.join(r.root, missionName, "slices", dirName);
+      let sourcePath: string | undefined;
+      try {
+        if (selected) sourcePath = workSource(selected.root, sliceDir, false);
+        if (selected) workSource(selected.root, sliceDir);
+        const header = projectSliceHeader(realFs, sliceDir);
+        if (!header) return null;
+        const { content: _content, fm: _fm, ...row } = header;
+        return { ...row, ...(sourcePath ? { sourcePath } : {}) };
+      } catch (err) {
+        return { dirName, id: null, displayName: dirName, error: (err as Error).message, ...(sourcePath ? { sourcePath } : {}),
+          status: null, stage: null, locks: { spec: null, delivery: null } };
+      }
+    };
     const missionFor = (name: string) => {
       if (selected) projectMission(selected, name);
       const dir = path.join(r.root, name);
+      const dirs = realFs.listDir(path.join(dir, "slices")).filter(s => realFs.isDirectory(path.join(dir, "slices", s)));
+      if (wantCounts) return { mission: name, slices: dirs.map(s => countsFor(name, s)).filter((s): s is NonNullable<typeof s> => s !== null) };
+      const slices = dirs.map(s => detailFor(name, s)).filter((s): s is NonNullable<typeof s> => s !== null);
       const manifestPath = path.join(dir, "mission.yaml");
       if (realFs.exists(manifestPath)) insideProject(selected?.root ?? r.root, manifestPath);
       const manifest = realFs.readFile(manifestPath);
@@ -108,16 +129,14 @@ export function scopesRoutes(): Hono {
         declaration = { sourcePath: source, stage: typeof metadata?.stage === "string" ? metadata.stage : null,
           status: typeof metadata?.status === "string" ? metadata.status : null };
       }
-      const slices = realFs.listDir(path.join(dir, "slices"))
-        .filter(s => realFs.isDirectory(path.join(dir, "slices", s)))
-        .map(s => detailFor(name, s)).filter((s): s is NonNullable<typeof s> => s !== null);
-      return {
-        mission: name,
-        slices: wantDetail ? slices : slices.map(({ intent, miniRequirements, proofContract, progressPath, specShaShort, prdExists, narrative, ...summary }) => summary),
-        declaration,
-        status: readMissionStatus(dir, Date.now(), selected?.root ?? r.root),
+      return { mission: name, declaration,
+        slices: wantCounts
+          ? dirs.map(s => countsFor(name, s)).filter((s): s is NonNullable<typeof s> => s !== null)
+          : wantDetail
+            ? slices
+            : slices.map(({ intent, miniRequirements, proofContract, progressPath, specShaShort, prdExists, narrative, ...summary }) => summary),
         readiness: readMissionReadiness(dir, readPolicy, bound),
-      };
+        status: readMissionStatus(dir, Date.now(), selected?.root ?? r.root) };
     };
     if (mission) {
       if (!realFs.isDirectory(path.join(r.root, mission))) return c.json({ error: "mission_not_found", mission }, 404);
@@ -146,8 +165,8 @@ export function scopesRoutes(): Hono {
     if (selected && slice && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(slice)) return c.json({ error: "invalid_slice" }, 400);
     if (!mission || !slice) return c.json({ error: "missing_params", hint: "?mission=&slice=" }, 400);
     if (selected && slice) workSource(selected.root, path.join(r.root, mission!, "slices", slice));
-    const proofPath = path.join(r.root, mission, "slices", slice, "PROOF.md");
-    if (selected && fs.existsSync(proofPath)) insideProject(selected.root, proofPath);
+    const report = path.join(r.root, mission, "slices", slice, "PROOF.md");
+    if (selected && realFs.exists(report)) insideProject(selected.root, report);
     const detail = projectSliceScope(realFs, path.join(r.root, mission, "slices", slice), undefined, selected?.root);
     return detail ? c.json(detail) : c.json({ error: "slice_not_found", mission, slice }, 404);
   });

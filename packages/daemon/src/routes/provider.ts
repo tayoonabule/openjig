@@ -1,12 +1,23 @@
+import { OCCUPANT_GENERATION_HEADER, runtimeSwitchCustodyRefusal } from "./runtime-switch-custody.js";
+import { SeatStatusService } from "../domain/seat-status-service.js";
+import fs from "node:fs";
+import path from "node:path";
 import { Hono, type Context } from "hono";
 import { getSelfHostId, LOCAL_HOST_ID } from "../domain/hosts/fanout-contract.js";
 import { loadHostRegistry } from "../domain/hosts/hosts-registry-reader.js";
-import type { ProviderService } from "../domain/provider/provider-service.js";
-import type { EventBus } from "../domain/event-bus.js";
-import type { SettingsStore } from "../domain/user-settings/settings-store.js";
-import { parseSubscriptionMove, SubscriptionMoveInputError, SubscriptionMoves } from "../domain/provider/subscription-moves.js";
-import { requireSenderIdentity } from "./require-sender-identity.js";
+import type { ClaudeSeatRelaunch, ProviderService, SeatRestart } from "../domain/provider/provider-service.js";
+import type { RigRepository } from "../domain/rig-repository.js";
+import type { SnapshotCapture } from "../domain/snapshot-capture.js";
+import type { RestoreOrchestrator } from "../domain/restore-orchestrator.js";
+import type { TmuxAdapter } from "../adapters/tmux.js";
+import { snapshotLaunchOutcome } from "../domain/restore-orchestrator.js";
+import { resolveActiveSnapshotSession } from "../domain/active-occupant.js";
+import { readClaudeSeatTokenRef } from "../domain/claude-seat-token.js";
 import type { ProviderKind } from "../domain/provider/provider-types.js";
+import { checkMoveReport, credentialRefusal, findCredential, MOVE_REPORT_TAG, readMoveReport, renderMoveReport, type MoveReport } from "../domain/provider/subscription-move-report.js";
+import { QueueRepositoryError, type QueueRepository } from "../domain/queue-repository.js";
+import { requireSenderIdentity, resolveRecordedProvenance, transportSenderSession } from "./require-sender-identity.js";
+import { seatLifecycleService, runtimeSwitchService } from "./seat.js";
 import {
   readUsageAcrossHosts,
   selectUsageHosts,
@@ -31,6 +42,61 @@ export interface ProviderRoutesOptions {
   };
 }
 
+/** The seat's in-place restart for this request, built only when used: precheck and switch act on the Codex home the
+ *  running seat uses, and the restart keeps its conversation and launch settings. */
+function seatRestartOf(c: Context): SeatRestart {
+  return {
+    plan: (seat) => seatLifecycleService(c).restartInPlace({ seatRef: seat, plan: true }),
+    run: (seat, reason) => seatLifecycleService(c).restartInPlace({ seatRef: seat, reason }),
+  };
+}
+
+/** A Claude seat's relaunch for this request, by restore's own resume path in the seat's own pane: a snapshot, then only
+ *  that seat launched from it, its process ended in place and the pane kept, all under the seat's lifecycle lease. */
+function claudeSeatOf(c: Context): ClaudeSeatRelaunch {
+  const rigRepo = c.get("rigRepo" as never) as RigRepository;
+  return {
+    seat: (seat) => {
+      if (!rigRepo) return null;
+      const row = rigRepo.db.prepare(`SELECT n.id, n.rig_id, n.logical_id, n.runtime, r.name, s.status, b.tmux_pane FROM sessions s
+        JOIN nodes n ON n.id = s.node_id JOIN rigs r ON r.id = n.rig_id LEFT JOIN bindings b ON b.node_id = n.id
+        WHERE s.session_name = ? ORDER BY s.id DESC LIMIT 1`)
+        .get(seat) as { id: string; rig_id: string; logical_id: string; runtime: string | null; name: string; status: string; tmux_pane: string | null } | undefined;
+      return row?.runtime === "claude-code"
+        ? { nodeId: row.id, rigId: row.rig_id, rigName: row.name, logicalId: row.logical_id, running: row.status === "running", pane: row.tmux_pane ?? null } : null;
+    },
+    tokenRef: (nodeId) => readClaudeSeatTokenRef(rigRepo.db, nodeId),
+    setTokenRef: (nodeId, ref) => { rigRepo.setNodeClaudeTokenRef(nodeId, ref); },
+    snapshot: (rigId, nodeId) => {
+      const capture = c.get("snapshotCapture" as never) as SnapshotCapture | undefined;
+      if (!capture) return { snapshotId: "(none)", resumes: false, why: "can't be taken: this daemon has no snapshot capture" };
+      const snapshot = capture.captureSnapshot(rigId, "provider-switch");
+      const outcome = snapshotLaunchOutcome(snapshot.data, nodeId, "claude-code", "claude-code");
+      if (outcome.kind !== "resume") return { snapshotId: snapshot.id, resumes: false, why: outcome.why };
+      const occupant = resolveActiveSnapshotSession(snapshot.data, nodeId);
+      return { snapshotId: snapshot.id, resumes: true, conversation: occupant.kind === "resolved" ? occupant.session.resumeToken ?? null : null };
+    },
+    exclusive: (nodeId, fn) => {
+      const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter | undefined)?.deliveryGuard;
+      return guard ? guard.lifecycle([nodeId], fn) : fn();
+    },
+    relaunchInPane: async (rigId, logicalId, snapshotId) => {
+      const restore = c.get("restoreOrchestrator" as never) as RestoreOrchestrator | undefined;
+      if (!restore) return { ok: false, effect: "none", code: "restore_unavailable", message: "This daemon has no restore orchestrator." };
+      const adapters = (c.get("runtimeAdapters" as never) as Record<string, import("../domain/runtime-adapter.js").RuntimeAdapter> | undefined) ?? {};
+      const result = await restore.launchSingleNode(rigId, logicalId, { snapshotId, adapters, fsOps: { exists: (p: string) => fs.existsSync(p) }, keepPane: true });
+      // A refusal of the whole launch (no usable snapshot, no such seat) comes before anything is touched.
+      if (!result.ok) return { ok: false, effect: "none", code: result.code ?? "launch_failed", message: result.message ?? "The seat wasn't launched from the snapshot." };
+      const node = result.launched?.find((n) => n.logicalId === logicalId);
+      if (node?.status === "resumed") return { ok: true, status: "resumed", warnings: result.warnings ?? [] };
+      // Restore stops for a decision, or leaves an attached CLI alone, before it touches the seat.
+      const untouched = !node?.launchStarted && (node?.status === "awaiting-decision" || node?.status === "left_attached");
+      return { ok: false, effect: untouched ? "none" : "unknown", code: node?.status ?? "not_launched", message: node?.error ?? "The seat wasn't launched from the snapshot." };
+    },
+  };
+}
+
+/** Expose provider views and switches, delegating isolated account homes to the successor-first runtime switch service. */
 export function providerRoutes(opts: ProviderRoutesOptions = {}): Hono {
   const router = new Hono();
   // Refresh legs across hosts live as long as these routes: overlapping requests join a running leg, and the last
@@ -91,7 +157,17 @@ export function providerRoutes(opts: ProviderRoutesOptions = {}): Hono {
     if (provider !== "codex" && provider !== "claude") {
       return c.json({ error: `usage windows can be refreshed for codex or claude (got ${String(provider)})` }, 400);
     }
-    const result = await svc.refreshUsage(provider);
+    const token = (raw as Record<string, unknown> | null)?.["claudeToken"];
+    if (token !== undefined) {
+      const t = token as Record<string, unknown> | null;
+      if (provider !== "claude" || !t || typeof t !== "object" || Array.isArray(t) ||
+        Object.keys(t).some(key => key !== "label" && key !== "tokenFile") ||
+        typeof t.label !== "string" || !t.label.trim() || t.label.length > 120 || /[\x00-\x1f\x7f]/.test(t.label) ||
+        typeof t.tokenFile !== "string" || !path.isAbsolute(t.tokenFile) || t.tokenFile.length > 4096 || /[\x00-\x1f\x7f]/.test(t.tokenFile) || findCredential(t)) {
+        return c.json({ error: "invalid_claude_token_selection", message: "select Claude with a non-secret label and absolute token-file reference; never send token contents" }, 400);
+      }
+    }
+    const result = await svc.refreshUsage(provider, token === undefined ? undefined : { label: String((token as Record<string, unknown>).label), tokenFile: path.normalize(String((token as Record<string, unknown>).tokenFile)) });
     if ("disabled" in result) {
       return c.json({
         error: "usage_windows_disabled",
@@ -229,69 +305,6 @@ export function providerRoutes(opts: ProviderRoutesOptions = {}): Hono {
     return c.json({ signals }, 200);
   });
 
-  // OPR.0.7.0.18 — the subscription move record: what an agent reports after it moves (or tries to move)
-  // a Codex home's seats. Stored in the event log; it holds labels and references only, and decides nothing.
-  // Off unless provider.subscription_moves is on (read per call): while it's off these routes answer 409 and write
-  // nothing. The other provider routes don't depend on it.
-  const movesEnabled = (c: Context): boolean => {
-    const store = c.get("settingsStore" as never) as SettingsStore | undefined;
-    try {
-      return store?.resolveOne("provider.subscription_moves").value === true;
-    } catch {
-      return false;
-    }
-  };
-  const movesOff = {
-    error: "subscription_moves_disabled",
-    message: "The subscription move record is off on this daemon. Turn it on with: rig config set provider.subscription_moves true",
-  };
-  const movesOf = (c: Context): SubscriptionMoves | null => {
-    const bus = c.get("eventBus" as never) as EventBus | undefined;
-    return bus ? new SubscriptionMoves(bus) : null;
-  };
-
-  router.get("/moves", (c) => {
-    if (!movesEnabled(c)) return c.json(movesOff, 409);
-    const moves = movesOf(c);
-    if (!moves) return c.json({ error: "event_log_unavailable" }, unavailable);
-    const limitRaw = c.req.query("limit");
-    const limit = limitRaw === undefined ? undefined : Number(limitRaw);
-    if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) return c.json({ error: "limit must be a positive integer" }, 400);
-    return c.json({ moves: moves.list({ home: c.req.query("home"), seat: c.req.query("seat"), limit }) }, 200);
-  });
-
-  router.get("/moves/:id", (c) => {
-    if (!movesEnabled(c)) return c.json(movesOff, 409);
-    const moves = movesOf(c);
-    if (!moves) return c.json({ error: "event_log_unavailable" }, unavailable);
-    const move = moves.show(c.req.param("id"));
-    return move ? c.json({ move }, 200) : c.json({ error: "move_not_found" }, 404);
-  });
-
-  router.post("/moves", async (c) => {
-    if (!movesEnabled(c)) return c.json(movesOff, 409);
-    const moves = movesOf(c);
-    if (!moves) return c.json({ error: "event_log_unavailable" }, unavailable);
-    let raw: unknown;
-    try {
-      raw = await c.req.json();
-    } catch {
-      return c.json({ error: "invalid JSON body" }, 400);
-    }
-    let input;
-    try {
-      input = parseSubscriptionMove(raw);
-    } catch (error) {
-      if (error instanceof SubscriptionMoveInputError) return c.json({ error: error.message }, 400);
-      throw error;
-    }
-    // A person recording from a terminal with no seat identity can name themselves; a transport identity wins.
-    const operator = (raw as Record<string, unknown>)["operator"];
-    const identity = requireSenderIdentity(c, { verb: "a subscription move", bodyClaim: typeof operator === "string" ? operator : null });
-    if (!identity.ok) return identity.response;
-    return c.json({ move: moves.record(input, identity.session, identity.provenance) }, 201);
-  });
-
   router.get("/precheck", async (c) => {
     const svc = svcOf(c);
     if (!svc) return c.json({ error: "provider_service_unavailable" }, unavailable);
@@ -301,13 +314,13 @@ export function providerRoutes(opts: ProviderRoutesOptions = {}): Hono {
     if (!seat || !seat.trim() || !toAccount || !toAccount.trim()) {
       return c.json({ error: "seat and toAccount are required" }, 400);
     }
+    // A Claude seat's own token file, or `storedLogin=1` for its config dir's stored login.
+    const tokenFile = c.req.query("storedLogin") === "1" ? null : c.req.query("tokenFile");
     // An unsafe verdict is a valid 200 response, not an error.
-    return c.json(await svc.precheck({ seat, toAccount }), 200);
+    return c.json(await svc.precheck({ seat, toAccount, ...(tokenFile !== undefined ? { tokenFile } : {}), ...(c.req.query("apiKeyFile") !== undefined ? { apiKeyFile: c.req.query("apiKeyFile") } : {}) }, seatRestartOf(c), claudeSeatOf(c)), 200);
   });
 
   router.post("/switch", async (c) => {
-    const svc = svcOf(c);
-    if (!svc) return c.json({ error: "provider_service_unavailable" }, unavailable);
     let raw: unknown;
     try {
       raw = await c.req.json();
@@ -319,8 +332,16 @@ export function providerRoutes(opts: ProviderRoutesOptions = {}): Hono {
       return c.json({ error: "body must be a JSON object" }, 400);
     }
     const body = raw as Record<string, unknown>;
+    if (body["apiKeyFile"] !== undefined && (body["accountHome"] !== undefined || body["clearAccountHome"] === true)) {
+      return c.json({ error: "apiKeyFile cannot be combined with accountHome or clearAccountHome; switch credentials in place separately" }, 400);
+    }
     const seat = body["seat"];
-    const toAccount = body["toAccount"];
+    const clearAccountHome = body["clearAccountHome"] === true;
+    if (body["clearAccountHome"] !== undefined && typeof body["clearAccountHome"] !== "boolean") return c.json({ error: "clearAccountHome must be true or false" }, 400);
+    if (clearAccountHome && (body["toAccount"] !== undefined || body["accountHome"] !== undefined || body["tokenFile"] !== undefined)) {
+      return c.json({ error: "clearAccountHome cannot select an account or token" }, 400);
+    }
+    const toAccount = body["toAccount"] ?? (clearAccountHome ? "default" : undefined);
     const forceUnsafe = body["forceUnsafe"] ?? false;
     if (typeof seat !== "string" || seat.trim() === "" || typeof toAccount !== "string" || toAccount.trim() === "") {
       return c.json({ error: "seat and toAccount are required" }, 400);
@@ -328,8 +349,117 @@ export function providerRoutes(opts: ProviderRoutesOptions = {}): Hono {
     if (typeof forceUnsafe !== "boolean") {
       return c.json({ error: "forceUnsafe must be a boolean" }, 400);
     }
+    if (body["accountHome"] !== undefined || clearAccountHome) {
+      if ((body["tokenFile"] !== undefined && typeof body["tokenFile"] !== "string") || (!clearAccountHome && typeof body["accountHome"] !== "string") || typeof body["reason"] !== "string" ||
+          (body["model"] !== undefined && typeof body["model"] !== "string") ||
+          (body["codexConfigProfile"] !== undefined && typeof body["codexConfigProfile"] !== "string") ||
+          (body["dryRun"] !== undefined && typeof body["dryRun"] !== "boolean")) {
+        return c.json({ ok: false, code: "invalid_runtime_settings", message: "Account-home switching needs a path and reason, with optional model/profile and a Claude token-file reference." }, 400);
+      }
+      const rigRepo = c.get("rigRepo" as never) as RigRepository;
+      const custody = runtimeSwitchCustodyRefusal(rigRepo.db, transportSenderSession(c), c.req.header(OCCUPANT_GENERATION_HEADER));
+      if (custody) return c.json(custody.body, custody.status);
+      const resolved = new SeatStatusService({ rigRepo }).getStatus(seat);
+      if (!resolved.ok) return c.json(resolved, 404);
+      const result = await runtimeSwitchService(c).setRuntime({ seatRef: seat, runtime: resolved.status.runtime ?? "",
+        ...(clearAccountHome ? { clearAccountHome: true } : { accountHome: body["accountHome"] as string }), reason: body["reason"], dryRun: body["dryRun"] === true,
+        ...(typeof body["tokenFile"] === "string" ? { accountToken: { label: toAccount, tokenFile: body["tokenFile"] } } : {}),
+        requestedBy: transportSenderSession(c) ?? null,
+        ...(typeof body["model"] === "string" ? { model: body["model"] } : {}),
+        ...(typeof body["codexConfigProfile"] === "string" ? { codexConfigProfile: body["codexConfigProfile"] } : {}),
+      });
+      return c.json(result, result.ok ? "recoveryPending" in result && result.recoveryPending ? 202 : 200
+        : result.code === "invalid_runtime_settings" ? 400 : 409);
+    }
+    const tokenFile = body["tokenFile"];
+    if (tokenFile !== undefined && tokenFile !== null && typeof tokenFile !== "string") {
+      return c.json({ error: "tokenFile must be a path, or null for the stored login" }, 400);
+    }
+    const svc = svcOf(c);
+    if (!svc) return c.json({ error: "provider_service_unavailable" }, unavailable);
+    const apiKeyFile = body["apiKeyFile"];
+    if (apiKeyFile !== undefined && (typeof apiKeyFile !== "string" || tokenFile !== undefined)) {
+      return c.json({ error: "apiKeyFile must be a path and cannot be combined with tokenFile" }, 400);
+    }
     // Business outcome (incl. failed_safely / rebind_in_progress) is an explicit 200 payload.
-    return c.json(await svc.switchAccount({ seat, toAccount, forceUnsafe }), 200);
+    return c.json(await svc.switchAccount({ seat, toAccount, forceUnsafe, ...(tokenFile !== undefined ? { tokenFile } : {}), ...(typeof apiKeyFile === "string" ? { apiKeyFile } : {}) },
+      seatRestartOf(c), claudeSeatOf(c)), 200);
+  });
+
+  // Slice 18 — subscription move reports: queue items tagged subscription-move, filed by the agent that moved a Codex
+  // home and read back by it (and by the Fleet app, once its page is connected). Filing one checks and keeps the report;
+  // it never switches or restarts.
+  const NOTHING_RECORDED = "Nothing was recorded, and the move itself is unchanged. Correct the report and file it again; don't repeat the switch or restart.";
+  const queueOf = (c: Context): QueueRepository | null => (c.get("queueRepo" as never) as QueueRepository | undefined) ?? null;
+
+  router.get("/moves", (c) => {
+    const queue = queueOf(c);
+    if (!queue) return c.json({ error: "queue_unavailable" }, unavailable);
+    const limitRaw = c.req.query("limit");
+    const limit = limitRaw === undefined ? 50 : Number(limitRaw);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) return c.json({ error: "limit_invalid", message: "limit must be an integer from 1 to 200" }, 400);
+    const seat = c.req.query("seat") || undefined;
+    const items = queue.list({ tag: MOVE_REPORT_TAG, limit });
+    const moves: Array<{ qitemId: string; reportedAt: string; reportedBy: string; reportedTo: string; state: string; report: MoveReport; followedBy: string[] }> = [];
+    const unreadable: Array<{ qitemId: string; reason: string }> = [];
+    for (const item of items) {
+      const read = readMoveReport(item.body);
+      if (!read.ok) { unreadable.push({ qitemId: item.qitemId, reason: read.errors.join("; ") }); continue; }
+      moves.push({ qitemId: item.qitemId, reportedAt: item.tsCreated, reportedBy: item.sourceSession, reportedTo: item.destinationSession, state: item.state, report: read.report, followedBy: [] });
+    }
+    for (const move of moves) move.followedBy = moves.filter((later) => later.report.follows === move.qitemId).map((later) => later.qitemId);
+    const shown = seat ? moves.filter((move) => [...move.report.seats, ...(move.report.peers ?? [])].some((entry) => entry.seat === seat)) : moves;
+    // A bounded recent window: the newest `limit` tagged items, before the seat filter. `truncated` says the window was
+    // full, so older reports may exist; it isn't a seat's complete history.
+    return c.json({ moves: shown, unreadable, truncated: items.length === limit }, 200);
+  });
+
+  router.post("/moves", async (c) => {
+    const queue = queueOf(c);
+    if (!queue) return c.json({ error: "queue_unavailable" }, unavailable);
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return c.json({ error: "invalid JSON body" }, 400);
+    }
+    const body = (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as { to?: unknown; report?: unknown; evidenceRef?: unknown };
+    // Before anything else, and over everything the queue would keep or echo: nothing in a recognized credential format
+    // is persisted or repeated back, in a value or a key.
+    const credential = findCredential(body.to, "to") ?? findCredential(body.evidenceRef, "evidenceRef") ?? findCredential(body.report);
+    if (credential) {
+      return c.json({ error: "move_report_invalid", errors: [credentialRefusal(credential)], message: NOTHING_RECORDED }, 400);
+    }
+    if (typeof body.to !== "string" || body.to.trim() === "") {
+      return c.json({ error: "to_required", message: "to must name the seat the report goes to: whoever asked for the move, or the person" }, 400);
+    }
+    const check = checkMoveReport(body.report);
+    if (!check.ok) {
+      return c.json({
+        error: "move_report_invalid",
+        errors: check.errors,
+        message: NOTHING_RECORDED,
+      }, 400);
+    }
+    const identity = requireSenderIdentity(c, { verb: "a subscription move report" });
+    if (!identity.ok) return identity.response;
+    const { summary, body: text } = renderMoveReport(check.report);
+    try {
+      const item = await queue.create({
+        sourceSession: identity.session,
+        destinationSession: body.to.trim(),
+        body: text,
+        summary,
+        tags: [MOVE_REPORT_TAG],
+        // A report to a person's seat follows the queue's rule for human-routed items: it names its evidence.
+        ...(typeof body.evidenceRef === "string" && body.evidenceRef.trim() ? { evidenceRef: body.evidenceRef.trim() } : {}),
+        identityProvenance: resolveRecordedProvenance(c, identity),
+      });
+      return c.json({ qitemId: item.qitemId, report: check.report }, 201);
+    } catch (error) {
+      if (!(error instanceof QueueRepositoryError)) throw error;
+      return c.json({ error: error.code, message: `${error.message} ${NOTHING_RECORDED}` }, 400);
+    }
   });
 
   return router;

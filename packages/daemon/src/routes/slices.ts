@@ -1,3 +1,4 @@
+import type { EventBus } from "../domain/event-bus.js";
 import { selectedProject, projectMission, workSource, projectReadResponse } from "../domain/workspace/project-read.js";
 // Slice Story View v0 — HTTP routes.
 //
@@ -55,7 +56,7 @@ export function slicesRoutes(): Hono {
     if (refresh === "1" || refresh === "true") {
       deps.indexer.invalidate();
     }
-    // qitem-ccf87c0d corrective — ONE HTTP request is ONE composite
+    // ONE HTTP request is ONE composite
     // operation: the list rebuild, the boundToWorkflow per-slice get loop,
     // and the mission sidecar share ONE membership batch (pre-scope, each
     // uncached get built its own 2-scan batch: 2+2N total queue scans).
@@ -120,6 +121,7 @@ export function slicesRoutes(): Hono {
     const deps = getDeps(c);
     if (!deps) return c.json({ error: "slices_indexer_unavailable" }, 503);
     deps.indexer.invalidate();
+    (c.get("eventBus" as never) as EventBus | undefined)?.emit({ type: "scope.sources_changed", scope: deps.indexer.slicesRoot });
     return c.json({ ok: true });
   });
 
@@ -183,12 +185,12 @@ export function slicesRoutes(): Hono {
         const mission = c.req.query("mission");
         if (!mission || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name)) return c.json({ error: "exact_mission_and_slice_required" }, 400);
         const dir = projectMission(project, mission);
-        const slicesRoot = path.join(dir, "slices");
-        workSource(project.root, path.join(slicesRoot, name));
+        const slicesRoot = project.missionsRoot;
+        workSource(project.root, path.join(dir, "slices", name));
         // A project-scoped detail request names one exact mission and slice.
-        // Anchor lookup at that mission's validated slices directory so an
-        // identically named slice in an earlier mission cannot win the index.
-        const indexer = new SliceIndexer({ db: deps.indexer.db, slicesRoot, dogfoodEvidenceRoot: null, projectId: project.id, projectRigs: project.rigs });
+        // Keep the indexer's missions-root layout while restricting lookup to
+        // this exact validated mission.
+        const indexer = new SliceIndexer({ db: deps.indexer.db, slicesRoot, dogfoodEvidenceRoot: null, projectId: project.id, projectRigs: project.rigs, missionId: mission });
         deps = { indexer, projector: deps.projector.withIndexer(indexer) };
       }
     } catch (err) { return projectReadResponse(err); }

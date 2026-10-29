@@ -42,13 +42,14 @@ function respond(cmd: string, failing: string[], composer = false): string {
   // #1072's composer snapshot reads a cursor and a screen before its mode check; other calls keep their replies.
   if (composer && sub === "display-message" && cmd.includes("cursor_x")) return "2|0|80|24\n";
   if (composer && sub === "capture-pane") return "❯ \n";
+  if (sub === "show-options" && cmd.includes("default-shell")) return "/bin/sh\n";
   switch (sub) {
     case "list-sessions": return `${SESSION}\nalpha\n`;
     case "list-panes": return "%1|0|/w|80|24|1\n";
     case "display-message":
       return cmd.includes("session_id") ? "$7\n" : cmd.includes("pane_pid") ? "4242\n" : "1\n";
     case "show-environment": return "OPENRIG_NODE_ID=n1\nCLAUDECODE=1\nHERDR_PANE_ID=p1\n";
-    case "new-session": return "%1\n";
+    case "new-session": case "source-file": case "start-server": return "%1\n";
     default: return "";
   }
 }
@@ -112,6 +113,11 @@ async function driveEveryMethod(): Promise<RunCall[]> {
   await a.sendShellCommand(SESSION, "echo 'hi there'", undefined, { sourceInPane: true });
   await a.sendKeys(SESSION, ["Enter; rm -rf /", "C-c"]);
   await a.setWindowOption(SESSION, "@openrig x", "a b'c");
+  await a.getWindowLocalOption(SESSION, "window-size");
+  await a.readWindow(SESSION, "@openrig-window-size-prior");
+  await a.readWindow("@3", "@openrig-window-size-prior");
+  await a.restoreWindowOption(SESSION, "window-size", "a b'c");
+  await a.restoreWindowOption(SESSION, "window-size", null);
   await a.resizeWindow(SESSION, 120, 40);
   await a.killSession(SESSION);
   await a.respawnPane("%1", "codex resume 'tok en'", { cwd: "/w x", env: { A: "b c", Q: "it's" } });
@@ -120,6 +126,7 @@ async function driveEveryMethod(): Promise<RunCall[]> {
   await a.restorePaneOption("%1", "remain-on-exit", "on");
   await a.restorePaneOption("%1", "remain-on-exit", null);
   await a.capturePaneHistory("%1");
+  await a.capturePaneHistoryParts("%1");
   await a.setRemainOnExit("%1", true);
   await a.isPaneDead("%1");
   await a.isPaneInMode("%1");
@@ -131,6 +138,7 @@ async function driveEveryMethod(): Promise<RunCall[]> {
   await a.setSessionEnv(SESSION, "SEAT_FLAG", "it's a value");
   await a.unsetSessionEnv(SESSION, "SEAT_FLAG");
   await a.hasSessionEnv(SESSION, "OPENRIG_NODE_ID");
+  await a.hasSessionEnvBatch(SESSION, ["OPENRIG_NODE_ID", "OPENRIG_RUNTIME"]);
   await a.startPipePane(SESSION, "/tmp/out dir/it's.log");
   await a.stopPipePane(SESSION);
   await a.capturePanesContent([SESSION, "alpha", "missing"], 50);
@@ -148,10 +156,17 @@ async function driveEveryMethod(): Promise<RunCall[]> {
   await a.readPaneLastActivity(SESSION);
   await a.listClients();
   await a.switchClient("/dev/ttys001", SESSION);
+  // A runtime switch's exchange: two session-id reads, then the guarded if-shell swap (nested quoting); and its env writes.
+  await a.swapRuntimeSwitchPanes({ nodeId: "n1", stagingSession: "staging'q a", canonicalSession: SESSION, canonicalPane: "%1", stagedPane: "%1" });
+  await a.setRuntimeSwitchEnvironment(SESSION, "claude-code", "gen 'q 1");
   // A failed paste deletes the loaded buffer; the guarded kill reads the session id first.
   await recordingAdapter(calls, { failing: ["paste-buffer"] }).sendText(SESSION, "hello");
   await recordingAdapter(calls, { guard: true }).killSession(SESSION);
   await recordingAdapter(calls, { composer: true }).captureComposerSnapshot("%1");
+  const scoped = recordingAdapter(calls);
+  scoped.launchEnvironment = () => ({ inheritTmuxEnvironment: false, env: { PATH: "/a b:$HOME", PRIVATE_SYNTHETIC: "it's a\nvalue" } });
+  await scoped.createSession(SESSION, "/w x", { OPENRIG_NODE_ID: "n1", Q: "it's" });
+  await scoped.respawnPane("%1", "printf '$HOME'", { env: { OPENRIG_NODE_ID: "n1", A: "b c" } });
   return calls;
 }
 

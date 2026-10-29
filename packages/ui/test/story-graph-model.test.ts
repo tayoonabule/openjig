@@ -136,7 +136,8 @@ describe("formatStoryDate (date-not-time bug fix)", () => {
     const formatted = formatStoryDate(now);
     expect(formatted).not.toMatch(/today|yesterday/i);
     // month abbrev + numeric day + h:mm time, e.g. "Jun 23, 4:50 PM" / "Jun 23 4:50"
-    expect(formatted).toMatch(/[A-Za-z]{3}\s+\d{1,2}/);
+    // Intl controls whether the abbreviated month comes before or after the day.
+    expect(formatted).toMatch(/(?:\p{L}{2,}\.?\s+\d{1,2}|\d{1,2}\s+\p{L}{2,}\.?)/u);
     expect(formatted).toMatch(/\d{1,2}:\d{2}/);
   });
 

@@ -4,7 +4,24 @@ import { readOpenRigEnv } from "../openrig-compat.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
+
+/** tmux's arguments for the session that runs `rig chatroom watch`. The watcher goes to tmux as separate arguments, so
+ *  tmux runs it without a shell and the rig name arrives as one argument; `--` keeps a name that starts with `-` from
+ *  reading as an option. tmux reads the `-s` value as a format, where `##` is one `#` and a run of `#` before `[` is a
+ *  style it keeps as written, so every other `#` is doubled and the session is `chatroom@<rig>`. Some tmux versions
+ *  still change a session name (3.5a writes `_` for `:` and `.`, and escapes a backslash or a control character such
+ *  as a newline or tab), so `-P -F` prints the name tmux used. */
+export function chatroomWatchTmuxArgs(rig: string): string[] {
+  const session = `chatroom@${rig}`.replace(/#+(\[)?/g, (run, style?: string) => style ? run : run + run);
+  return ["new-session", "-d", "-P", "-F", "#{session_name}", "-s", tmuxArg(session),
+    "rig", "chatroom", "watch", "--", tmuxArg(rig)];
+}
+
+/** tmux ends a command at an argument that ends in `;`, unless a `\` comes before it, so a final `;` gets that `\`. */
+function tmuxArg(value: string): string {
+  return value.endsWith(";") ? `${value.slice(0, -1)}\\;` : value;
+}
 
 interface RigSummary {
   id: string;
@@ -53,6 +70,7 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
   // chatroom send <rig> "message" [--sender <name>]
   cmd
     .command("send")
+    .description("Post a message to a rig's chat room; the sender is this seat")
     .argument("<rig>", "Rig name")
     .argument("<message>", "Message to send")
     .option("--sender <name>", "(deprecated, ignored) the sender is derived from the seat env (X-OpenRig-Session); P21 made the chat route derive it from the transport header")
@@ -91,6 +109,7 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
   // chatroom history <rig> [--topic <name>] [--limit N] [--json]
   cmd
     .command("history")
+    .description("Print a rig's chat messages and topic markers, with filters")
     .argument("<rig>", "Rig name")
     .option("--topic <name>", "Filter by topic")
     .option("--after <id>", "Messages after this message ID")
@@ -154,6 +173,7 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
   // chatroom watch <rig> [--tmux]
   cmd
     .command("watch")
+    .description("Print a rig's chat messages as they arrive; --tmux runs it in its own tmux session")
     .argument("<rig>", "Rig name")
     .option("--tmux", "Run watch in a dedicated tmux session")
     .action(async (rig: string, opts: { tmux?: boolean }) => {
@@ -172,9 +192,11 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
       if (opts.tmux) {
         const sessionName = `chatroom@${rig}`;
         try {
-          execSync(`tmux new-session -d -s ${JSON.stringify(sessionName)} "rig chatroom watch ${JSON.stringify(rig)}"`, { stdio: "ignore" });
-          console.log(`Started watch in tmux session: ${sessionName}`);
-          console.log(`Attach with: tmux attach -t ${sessionName}`);
+          // The name tmux used, which differs from sessionName when tmux changed it (a `.` in a rig name, for example).
+          const created = execFileSync("tmux", chatroomWatchTmuxArgs(rig), { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+            .trim() || sessionName;
+          console.log(`Started watch in tmux session: ${created}`);
+          console.log(`Attach with: tmux attach -t ${created}`);
         } catch {
           console.error(`Failed to create tmux session '${sessionName}'. It may already exist.`);
           process.exitCode = 1;
@@ -185,6 +207,7 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
       // Direct SSE watch
       const url = `${client.baseUrl}/api/rigs/${encodeURIComponent(rigId)}/chat/watch`;
       try {
+        await client.assertLocalOwner();
         const res = await fetch(url, {
           headers: { Accept: "text/event-stream" },
         });
@@ -234,6 +257,7 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
   // chatroom topic <rig> <topic-name> [--body "text"]
   cmd
     .command("topic")
+    .description("Start a new topic in a rig's chat room")
     .argument("<rig>", "Rig name")
     .argument("<topic-name>", "Topic name")
     .option("--body <text>", "Optional body text")
@@ -269,6 +293,7 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
   // chatroom wait <rig>
   cmd
     .command("wait")
+    .description("Wait for the next matching message in a rig's chat room; exits 1 when --timeout passes")
     .argument("<rig>", "Rig name")
     .option("--after <id>", "Only messages after this ID")
     .option("--topic <name>", "Filter by topic")
@@ -381,6 +406,7 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
   // chatroom clear <rig>
   cmd
     .command("clear")
+    .description("Delete every message in a rig's chat room")
     .argument("<rig>", "Rig name")
     .action(async (rig: string) => {
       const client = await getClient();

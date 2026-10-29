@@ -185,7 +185,7 @@ describe("rig up <name> on a stopped managed rig", () => {
     const { out, exitCode } = await run(port, ["alpha"]);
     expect(out).toContain("Detached seats (no running session): dev.qa, orch.lead");
     expect(out).toContain("dev.qa: relaunch with  rig launch rig-a dev.qa");
-    expect(out).toContain("--fresh orch.lead");
+    expect(out).toContain('rig seat launch orch.lead@alpha --fresh --reason "fresh-prime after restore"');
     expect(out).toContain("Live seats waiting on a prompt (not detached): rev.r1");
     expect(out).not.toMatch(/Detached seats.*(dev\.impl|rev\.r1)/);
     expect(upBodies).toHaveLength(1); // headless: no auto fresh-prime

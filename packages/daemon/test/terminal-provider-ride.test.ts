@@ -1,3 +1,5 @@
+import { tileAttachArgv } from "../src/domain/terminal/tile-attach.js";
+import { shellQuote } from "../src/adapters/shell-quote.js";
 // OPR.0.4.6.02 C2 — the terminal-provider ride core commit.
 //
 // Covers the plan's C2 test contract:
@@ -80,7 +82,7 @@ describe("view-composer partition vectors", () => {
   it("local live seat → tmux attach -t (no -r)", () => {
     const v = composeView("v", [member({ seat: "dev-a@rig" })], ctxWith([]));
     expect(v.opened).toHaveLength(1);
-    expect(v.opened[0]!.paneCommand).toBe("tmux attach -t 'dev-a@rig'");
+    expect(v.opened[0]!.paneCommand).toBe(tileAttachArgv("tmux", [], "dev-a@rig", false).map(shellQuote).join(" "));
     expect(v.opened[0]!.readOnly).toBe(false);
     expect(v.absent).toHaveLength(0);
     expect(v.degraded).toHaveLength(0);
@@ -88,19 +90,19 @@ describe("view-composer partition vectors", () => {
 
   it("view-only / cross-rig read-only seat → tmux attach -r -t", () => {
     const v = composeView("v", [member({ seat: "dev-a@rig", readOnly: true })], ctxWith([]));
-    expect(v.opened[0]!.paneCommand).toBe("tmux attach -r -t 'dev-a@rig'");
+    expect(v.opened[0]!.paneCommand).toBe(tileAttachArgv("tmux", [], "dev-a@rig", true).map(shellQuote).join(" "));
     expect(v.opened[0]!.readOnly).toBe(true);
   });
 
   it("ssh host → ssh '<user@target>' tmux attach -t (destination shell-quoted); read-only adds -r", () => {
     const rw = composeView("v", [member({ seat: "s@r", host: "vm1", tmuxSession: "s@r" })], ctxWith([SSH_HOST]));
-    expect(rw.opened[0]!.paneCommand).toBe("ssh 'admin@vm1.local' 'tmux attach -t '\"'\"'s@r'\"'\"''");
+    expect(rw.opened[0]!.paneCommand).toBe(`ssh ${shellQuote('admin@vm1.local')} ${shellQuote(tileAttachArgv("tmux", [], "s@r", false).map(shellQuote).join(" "))}`);
 
     const ro = composeView("v", [member({ seat: "s@r", host: "vm1", readOnly: true })], ctxWith([SSH_HOST]));
-    expect(ro.opened[0]!.paneCommand).toBe("ssh 'admin@vm1.local' 'tmux attach -r -t '\"'\"'s@r'\"'\"''");
+    expect(ro.opened[0]!.paneCommand).toBe(`ssh ${shellQuote('admin@vm1.local')} ${shellQuote(tileAttachArgv("tmux", [], "s@r", true).map(shellQuote).join(" "))}`);
 
     const nouser = composeView("v", [member({ seat: "s@r", host: "vm2" })], ctxWith([SSH_HOST_NO_USER]));
-    expect(nouser.opened[0]!.paneCommand).toBe("ssh '10.0.0.9' 'tmux attach -t '\"'\"'s@r'\"'\"''");
+    expect(nouser.opened[0]!.paneCommand).toBe(`ssh ${shellQuote('10.0.0.9')} ${shellQuote(tileAttachArgv("tmux", [], "s@r", false).map(shellQuote).join(" "))}`);
   });
 
   // Guard G1 — the ssh destination is STRUCTURED registry data injected into a
@@ -111,7 +113,7 @@ describe("view-composer partition vectors", () => {
     const v = composeView("v", [member({ seat: "s@r", host: "evil", tmuxSession: "s@r" })], ctxWith([NASTY]));
     expect(v.opened).toHaveLength(1);
     // single-quoted, embedded quote POSIX-escaped ('\'') — metacharacters are literal.
-    expect(v.opened[0]!.paneCommand).toBe("ssh 'u'\"'\"'x@a b; rm -rf /' 'tmux attach -t '\"'\"'s@r'\"'\"''");
+    expect(v.opened[0]!.paneCommand).toBe(`ssh ${shellQuote("u'x@a b; rm -rf /")} ${shellQuote(tileAttachArgv("tmux", [], "s@r", false).map(shellQuote).join(" "))}`);
     // the dangerous run never becomes its own shell word:
     expect(v.opened[0]!.paneCommand).not.toContain("; rm -rf / tmux");
   });
@@ -192,11 +194,13 @@ describe("view-composer partition vectors", () => {
     expect(() => chunkPanes([], 0)).toThrow();
   });
 
-  it("carries live Claude and Codex runtimes into Herdr tile hints but leaves terminal seats unchanged", () => {
+  it("carries known runtimes into Herdr tile hints but leaves terminal and unknown seats unchanged", () => {
     const members = deriveViewMembers([
       { canonicalSessionName: "claude@rig", attachmentType: "tmux", runtime: "claude-code" },
       { canonicalSessionName: "codex@rig", attachmentType: "tmux", runtime: "codex" },
+      { canonicalSessionName: "pi@rig", attachmentType: "tmux", runtime: "pi" },
       { canonicalSessionName: "operator@rig", attachmentType: "tmux", runtime: "terminal" },
+      { canonicalSessionName: "unknown@rig", attachmentType: "tmux", runtime: "unknown" },
     ]);
     const view = composeView("rig:rig", members, ctxWith([]));
     const grid = buildGridRoot(view.opened).root;
@@ -208,9 +212,11 @@ describe("view-composer partition vectors", () => {
     collect(grid);
 
     expect(panes.filter((pane) => pane.label).map((pane) => pane.command)).toEqual([
-      ["sh", "-c", "env HERDR_AGENT=claude tmux attach -t 'claude@rig'"],
-      ["sh", "-c", "env HERDR_AGENT=codex tmux attach -t 'codex@rig'"],
-      ["sh", "-c", "tmux attach -t 'operator@rig'"],
+      ["sh", "-c", `env HERDR_AGENT=claude ${tileAttachArgv("tmux", [], "claude@rig", false).map(shellQuote).join(" ")}`],
+      ["sh", "-c", `env HERDR_AGENT=codex ${tileAttachArgv("tmux", [], "codex@rig", false).map(shellQuote).join(" ")}`],
+      ["sh", "-c", `env HERDR_AGENT=pi ${tileAttachArgv("tmux", [], "pi@rig", false).map(shellQuote).join(" ")}`],
+      ["sh", "-c", tileAttachArgv("tmux", [], "operator@rig", false).map(shellQuote).join(" ")],
+      ["sh", "-c", tileAttachArgv("tmux", [], "unknown@rig", false).map(shellQuote).join(" ")],
     ]);
     expect(panes.at(-1)?.command).toEqual(["sh"]);
   });
@@ -448,6 +454,7 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
         requests.push({ method, params });
         if (opts?.respond) return opts.respond(method, params);
         if (method === "workspace.create") return { type: "workspace_created", workspace_id: "wG" };
+        if (method === "pane.list") return { type: "pane_list", panes: [{ tab_id: "wG:t2", label: pane.label }] };
         return { type: "layout_apply", layout: { workspace_id: "wG", tab_id: "wG:t2" } };
       },
     };
@@ -499,10 +506,13 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
     expect(res.pages).toBe(1);
     // OPR.0.6.0.8: after the page is applied, its tab is focused (no blank-tab close here:
     // this create reply carries no default tab id).
-    // #707: the applied page is followed by one pane.list read (this fake's reply has no panes, so nothing changes).
-    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "layout.apply", "pane.list", "tab.focus"]);
-    expect(requests[2]!.params).toEqual({ focus: false, label: "v" });
-    expect(requests[3]!.params).toEqual({
+    // Existing-workspace detection is read-only. The new workspace then gets a page
+    // applied, positively checked, and focused.
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.list", "workspace.create", "layout.apply", "pane.list", "tab.focus"]);
+    expect(requests[3]!.params).toEqual({ focus: false, label: "v" });
+    expect(requests[5]!.params).toEqual({ workspace_id: "wG" });
+    expect(requests[6]!.params).toEqual({ tab_id: "wG:t2" });
+    expect(requests[4]!.params).toEqual({
       workspace_id: "wG",
       tab_label: "openrig:v#tok",
       focus: true,
@@ -540,7 +550,7 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
       expect(r.method).not.toContain("--help");
       expect(r.method).not.toContain(" ");
     }
-    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "layout.apply", "pane.list", "tab.focus"]);
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.list", "workspace.create", "layout.apply", "pane.list", "tab.focus"]);
   });
 
   it("a labeled workspace.create failure falls back ONCE to a bare create (uncaptured-param defense)", async () => {
@@ -550,6 +560,8 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
           if ((params as Record<string, unknown>)["label"] != null) throw new Error("unknown param: label");
           return { type: "workspace_created", workspace_id: "wH" };
         }
+        if (method === "layout.apply") return { type: "layout_apply", layout: { workspace_id: "wH", tab_id: "wH:t1" } };
+        if (method === "pane.list") return { type: "pane_list", panes: [{ tab_id: "wH:t1", label: pane.label }] };
         return { type: "layout_apply" };
       },
     });
@@ -558,16 +570,37 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
     expect(res.ok).toBe(true);
     expect(res.opened).toEqual(["a@r"]);
     // Existing workspace/tab checks run before creation; the label retry then falls back once.
-    // This create reply has no tab id, so the adapter cannot verify panes or focus a tab.
-    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.create", "workspace.list", "workspace.create", "layout.apply"]);
-    expect((requests[5]!.params as Record<string, unknown>)["workspace_id"]).toBe("wH");
+    // The create reply has no tab id; layout.apply supplies the tab identity for confirmation.
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.list", "workspace.create", "workspace.list", "workspace.create", "layout.apply", "pane.list", "tab.focus"]);
+    expect((requests[6]!.params as Record<string, unknown>)["workspace_id"]).toBe("wH");
     expect(res.notes?.join(" ")).toContain('refused the workspace name "v"');
   });
 
-  it("an already-open view is found by its tab key, relabelled readable, focused, not duplicated", async () => {
+  it("an existing complete roster gets a fresh workspace on relaunch", async () => {
+    const { transport, requests } = fakeSocketTransport({
+      respond: async (method, params) => {
+        if (method === "tab.list") return { tabs: [{ workspace_id: "wOld", label: "openrig:v#old" }] };
+        if (method === "workspace.list") return { workspaces: [{ workspace_id: "wOld", label: "v" }] };
+        if (method === "pane.list") {
+          const workspaceId = (params as Record<string, unknown>)["workspace_id"];
+          return { panes: [{ tab_id: workspaceId === "wOld" ? "wOld:t1" : "wNew:t2", label: "pod.a · s02" }] };
+        }
+        if (method === "workspace.create") return { type: "workspace_created", workspace: { workspace_id: "wNew", tab: { tab_id: "wNew:t1" } } };
+        if (method === "layout.apply") return { type: "layout_apply", layout: { workspace_id: "wNew", tab_id: "wNew:t2" } };
+        return { type: "ok" };
+      },
+    });
+    const adapter = new HerdrAdapter({ transportFactory: () => transport, newLaunchToken: () => "new" });
+    const res = await adapter.openView(view);
+    expect(res.ok).toBe(true);
+    expect(requests.map((request) => request.method)).toContain("workspace.create");
+    expect(requests.find((request) => request.method === "layout.apply")?.params).toMatchObject({ workspace_id: "wNew" });
+  });
+
+  it("reuses an exact launch-token tab", async () => {
     const { transport, requests } = fakeSocketTransport({
       respond: async (method) => {
-        if (method === "tab.list") return { tabs: [{ workspace_id: "wX", label: "openrig:vv#l2" }, { workspace_id: "wOld", label: "openrig:v#l1" }] };
+        if (method === "tab.list") return { tabs: [{ workspace_id: "wOld", label: "openrig:v#tok" }] };
         if (method === "pane.list") return { panes: [{ pane_id: "wOld:p2", label: "pod.a · s02" }] };
         return { type: "ok" };
       },
@@ -631,19 +664,25 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
     expect(res.degraded[0]!.reason).toContain("adding new seats");
   });
 
-  it("a workspace from an older build (key in its own label) is still reused and migrated", async () => {
+  it("an older complete workspace is left intact while a fresh relaunch opens separately", async () => {
     const { transport, requests } = fakeSocketTransport({
-      respond: async (method) => {
+      respond: async (method, params) => {
         if (method === "workspace.list") return { workspaces: [{ workspace_id: "wOld", label: "openrig:v#l1" }, { workspace_id: "wX", label: "openrig:vv#l2" }] };
-        if (method === "pane.list") return { panes: [{ label: "pod.a · s02" }] };
+        if (method === "pane.list") {
+          const workspaceId = (params as Record<string, unknown>)["workspace_id"];
+          return { panes: [{ tab_id: workspaceId === "wOld" ? "wOld:t1" : "wNew:t2", label: "pod.a · s02" }] };
+        }
+        if (method === "workspace.create") return { type: "workspace_created", workspace: { workspace_id: "wNew", tab: { tab_id: "wNew:t1" } } };
+        if (method === "layout.apply") return { type: "layout_apply", layout: { workspace_id: "wNew", tab_id: "wNew:t2" } };
         return { type: "ok" };
       },
     });
     const adapter = new HerdrAdapter({ transportFactory: () => transport, newLaunchToken: () => "tok" });
     const res = await adapter.openView(view);
     expect(res.ok).toBe(true);
-    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "workspace.rename", "workspace.focus", "pane.list"]);
-    expect(requests[2]!.params).toEqual({ workspace_id: "wOld", label: "v" });
+    expect(res.opened).toEqual(["a@r"]);
+    expect(requests.map((r) => r.method)).toEqual(["tab.list", "workspace.list", "pane.list", "workspace.list", "workspace.create", "layout.apply", "pane.list", "tab.focus"]);
+    expect(requests.some((r) => r.method === "workspace.focus" || r.method === "workspace.rename")).toBe(false);
   });
 
   it("total workspace.create failure degrades EVERY pane honestly (herdr_workspace_failed)", async () => {
@@ -678,9 +717,11 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
       respond: async (method) => {
         if (method === "workspace.create") return { type: "workspace_created", workspace_id: "wG" };
         if (method === "workspace.list" || method === "tab.list") return {};
+        if (method === "pane.list") return { type: "pane_list", panes: [{ tab_id: "wG:t2", label: pane.label }] };
+        if (method !== "layout.apply") return { type: "ok" };
         applies += 1;
         if (applies === 2) throw new Error("herdr error: bad tree");
-        return { type: "layout_apply" };
+        return { type: "layout_apply", layout: { tab_id: "wG:t2" } };
       },
     });
     const adapter = new HerdrAdapter({ transportFactory: () => transport });

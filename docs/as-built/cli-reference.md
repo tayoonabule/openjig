@@ -9,23 +9,23 @@ applies-when: |
   the source that implements a command. Use command help for invocation details.
 siblings: [README.md, codemap.md]
 prerequisite-reads: [../reference/help.md]
-last-verified-against-source: 92a2b8f7157661716a9c79de742cd82a96d1e6f7
-last-updated: 2026-10-09
+last-verified-against-source: 34fdcb80543903b054a982cc48bb302ae6871682
+last-updated: 2026-10-26
 ---
 
 # CLI Reference — Registered Commands and Options
 
-Verified against source commit `92a2b8f7157661716a9c79de742cd82a96d1e6f7`.
+Verified against source commit `34fdcb80543903b054a982cc48bb302ae6871682`.
 The inventory below comes from the actual Commander tree returned by
 [`createProgram()`](../../packages/cli/src/index.ts), not a grep of command
 strings or an installed CLI from a different commit.
 
-There are **87 top-level registrations**, **356 registered command objects**
+There are **90 top-level registrations**, **410 registered command objects**
 below `rig` (including groups and the hidden `restore apply` command), and
-**1,084 explicitly registered option objects**, including the root version
+**1,304 explicitly registered option objects**, including the root version
 option. Aliases do not add command objects; short/long spellings of one
 option do not add option objects. Commander-generated help is additional.
-These are source counts, not a claim about a deployed release.
+These are counts for that source snapshot, not a claim about a deployed release. The provider-switch and set-runtime rows include the later account-home options; those additions are not included in the snapshot counts.
 
 ## Reading this reference
 
@@ -143,7 +143,7 @@ Root: `rig`; declared option: `-V, --version`.
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig daemon` | — | — |
-| `rig daemon start` | — | `--port <port>`<br>`--host <host>`<br>`--db <path>`<br>`--no-kernel`<br>`--wait-for-kernel`<br>`--wait-for-kernel-ms <ms>` |
+| `rig daemon start` | — | `--port <port>`<br>`--host <host>`<br>`--db <path>`<br>`--allow-db-conflict`<br>`--no-kernel`<br>`--wait-for-kernel`<br>`--wait-for-kernel-ms <ms>` |
 | `rig daemon stop` | — | — |
 | `rig daemon status` | — | — |
 | `rig daemon logs` | — | `--follow` |
@@ -165,16 +165,16 @@ the sections that were not read are `null`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig snapshot <rigId>` | — | `--intended-seats <ids>` |
-| `rig snapshot list <rigId>` | — | — |
+| `rig snapshot <rig>` | — | `--intended-seats <ids>` |
+| `rig snapshot list <rig>` | — | — |
 
 ### restore
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig restore` | — | — |
-| `rig restore apply <snapshotId>` (hidden) | — | `--rig <rigId>` **required** |
-| `rig restore status <attemptId>` | — | `--rig <rigId>` **required**<br>`--json` |
+| `rig restore apply <snapshotId>` (hidden) | — | `--rig <rig>` **required** |
+| `rig restore status <attemptId>` | — | `--rig <rig>` **required**<br>`--json` |
 
 ### crash-cart
 
@@ -188,11 +188,44 @@ the sections that were not read are `null`.
 |---|---|---|
 | `rig gateway` | — | — |
 | `rig gateway human` | — | — |
-| `rig gateway human add <entityId>` | — | `--display-name <name>` **required**<br>`--binding <kind:connectorRef:secretsRef:role[:handle=<id>]>` **required** (repeatable)<br>`--delivery-class <A\|B\|C\|D>` **required**<br>`--away`<br>`--replace`<br>`--reason <reason>`<br>`--actor <actor>` |
+| `rig gateway human add <entityId>` | — | `--display-name <name>` **required**<br>`--binding <kind:connectorRef:secretsRef:role[:handle=<id>]>` **required** (repeatable)<br>`--delivery-class <A\|B\|C\|D>` **required**<br>`--away`<br>`--replace`<br>`--reason <reason>`<br>`--actor <actor>`<br>`--organization <id>`<br>`--group <id>` (repeatable)<br>`--policy <text>`<br>`--policy-file <path>`<br>`--default` |
 | `rig gateway human list` | — | `--json` |
+| `rig gateway human quiet` | — | — |
+| `rig gateway human quiet set <entityId>` | — | `--daily <window>`<br>`--until <time>`<br>`--tz <zone>`<br>`--actor <actor>`<br>`--json` |
+| `rig gateway human quiet end <entityId>` | — | `--actor <actor>`<br>`--json` |
+| `rig gateway human quiet clear <entityId>` | — | `--actor <actor>`<br>`--json` |
+| `rig gateway human quiet show <entityId>` | — | `--json` |
+| `rig gateway human mode` | — | — |
+| `rig gateway human mode save <entityId> <name>` | — | `--availability <value>`<br>`--expected-back <when>`<br>`--decision-room <words>`<br>`--exclude <item...>`<br>`--quiet <rule>`<br>`--tz <zone>`<br>`--account <where>`<br>`--actor <actor>`<br>`--json` |
+| `rig gateway human mode saved <entityId> [name]` | — | `--json` |
+| `rig gateway human mode apply <entityId> <name>` | — | `--until <time>`<br>`--tz <zone>`<br>`--actor <actor>`<br>`--json` |
+| `rig gateway human mode current <entityId>` | — | `--json` |
+| `rig gateway human mode end <entityId>` | — | `--scheduled`<br>`--actor <actor>`<br>`--json` |
+| `rig gateway human mode account <entityId> <applicationId>` | — | `--json` |
+| `rig gateway human mode room <entityId>` | — | `--json` |
+| `rig gateway human mode decide <qitemId>` | — | `--application <id>` **required**<br>`--choose <question=option...>`<br>`--reason <why>` **required**<br>`--reversible`<br>`--irreversible`<br>`--actor <actor>`<br>`--json` |
+| `rig gateway human mode decisions <entityId> <applicationId>` | — | `--json` |
 | `rig gateway human show <entityId>` | — | `--json` |
 | `rig gateway human set <entityId> <field> <value>` | — | `--reason <reason>`<br>`--actor <actor>` |
 | `rig gateway human remove <entityId>` | — | `--force` |
+| `rig gateway channel` | — | — |
+| `rig gateway channel add <id>` | — | `--display-name <name>` **required**<br>`--binding <slack:connectorRef:secretsRef:channelId>` **required**<br>`--organization <id>`<br>`--group <id>` (repeatable)<br>`--policy <text>`<br>`--policy-file <path>`<br>`--replace` |
+| `rig gateway channel remove <id>` | — | `--force` |
+| `rig gateway org` | — | — |
+| `rig gateway org set <id>` | — | `--name <name>`<br>`--policy <text>`<br>`--policy-file <path>` |
+| `rig gateway group` | — | — |
+| `rig gateway group set <id>` | — | `--organization <id>`<br>`--name <name>`<br>`--policy <text>`<br>`--policy-file <path>` |
+| `rig gateway participants` | — | `--organization <id>`<br>`--json` |
+| `rig gateway default [entityId]` | — | `--clear` |
+
+- Several people may be registered. Organizations, groups, readable policy, shared channels and the default person are
+  kept in `$OPENRIG_HOME/gateway/participants.yaml`, never in a person's fragment, so an older daemon still loads every
+  person after a rollback. `human set <entityId> organization|groups|policy <value>` writes there (`unset` clears;
+  `@<path>` reads a policy file). `participants --json` carries each participant's `kind`, `address`, `organization`,
+  `groups`, `default` and `policy` (a list of `{ source, text }`, organization first), plus `default`, `organizations`,
+  `groups`, `warnings` and `participantFile`. `default` with no argument prints the current default and its source
+  (`chosen` or `only-person`), or `null` with the reason. See `docs/reference/gateway-participants.md`.
+- `human set <entityId> slack-subscription <value>` — sets the person's Slack subscription: `every-ask` (the default) posts every ask to them to Slack; `urgent-only` posts only asks created with `--alert`, and other asks wait on Steering and the TUI; `unset` removes the authored subscription so the default applies. `human show` prints the value with its origin, `authored` or `default` (`slack-subscription: every-ask (default)`); `--json` carries it as `record.slackSubscription` `{ value, source }`.
 
 ### parked
 
@@ -204,7 +237,7 @@ the sections that were not read are `null`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig export <rigId>` | — | `-o, --output <path>` |
+| `rig export <rig>` | — | `-o, --output <path>` |
 
 ### import
 
@@ -278,7 +311,7 @@ the sections that were not read are `null`.
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig bundle` | — | — |
-| `rig bundle create <spec>` | — | `-o, --output <path>` **required**<br>`--name <name>`<br>`--bundle-version <ver>`<br>`--include-packages <refs...>`<br>`--rig-root <root>`<br>`--context-pack <dir>` (repeatable)<br>`--project-dir <dir>`<br>`--preset <name>`<br>`--seat <member=runtime>` (repeatable)<br>`--notes <text>`<br>`--min-daemon-version <ver>`<br>`--min-cli-version <ver>`<br>`--allow-drift`<br>`--json` |
+| `rig bundle create <spec>` | — | `-o, --output <path>` **required**<br>`--name <name>`<br>`--bundle-version <ver>`<br>`--include-login-files`<br>`--include-packages <refs...>`<br>`--rig-root <root>`<br>`--context-pack <dir>` (repeatable)<br>`--project-dir <dir>`<br>`--preset <name>`<br>`--seat <member=runtime>` (repeatable)<br>`--notes <text>`<br>`--min-daemon-version <ver>`<br>`--min-cli-version <ver>`<br>`--allow-drift`<br>`--json` |
 | `rig bundle configurations <spec>` | — | `--json` |
 | `rig bundle inspect <path>` | — | `--preset <name>`<br>`--seat <member=runtime>` (repeatable)<br>`--json` |
 | `rig bundle install <path>` | — | `--preset <name>`<br>`--seat <member=runtime>` (repeatable)<br>`--non-interruptive`<br>`--no-non-interruptive`<br>`--plan`<br>`--yes`<br>`--target <root>`<br>`--cwd <path>`<br>`--skip-version-check`<br>`--force`<br>`--json` |
@@ -289,25 +322,25 @@ the sections that were not read are `null`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig up <source>` | — | `--non-interruptive`<br>`--no-non-interruptive`<br>`--plan`<br>`--yes`<br>`--cwd <path>`<br>`--env <KEY=VALUE>` (repeatable)<br>`--target <root>`<br>`--preset <name>`<br>`--seat <member=runtime>` (repeatable)<br>`--existing`<br>`--fresh <seats...>`<br>`--json`<br>`--host <id>` |
+| `rig up <source>` | — | `--non-interruptive`<br>`--no-non-interruptive`<br>`--plan`<br>`--yes`<br>`--cwd <path>`<br>`--env <KEY=VALUE>` (repeatable)<br>`--name <rig>`<br>`--target <root>`<br>`--preset <name>`<br>`--seat <member=runtime>` (repeatable)<br>`--existing`<br>`--fresh <seats...>`<br>`--json`<br>`--host <id>` |
 
 ### down
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig down <rig>` | — | `--delete`<br>`--force`<br>`--snapshot`<br>`--json`<br>`--host <id>` |
+| `rig down <rig>` | — | `--delete`<br>`--force`<br>`--snapshot`<br>`--yes`<br>`--json`<br>`--host <id>` |
 
 ### archive
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig archive <rigId>` | — | `--force`<br>`--json` |
+| `rig archive <rig>` | — | `--force`<br>`--json` |
 
 ### unarchive
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig unarchive <rigId>` | — | `--json` |
+| `rig unarchive <rig>` | — | `--json` |
 
 ### host
 
@@ -321,11 +354,30 @@ the sections that were not read are `null`.
 | `rig host list` | `ls` | `--json` |
 | `rig host doctor <id>` | — | `--posture <profile>`<br>`--public-addr <ip>`<br>`--json` |
 
+Registration makes a host visible in topology; remote FEED attention remains opt-in.
+The human-readable success output of `host add` and `host pair` now includes the FEED
+next step alongside the existing `host doctor` suggestion. For an HTTP entry named
+`laptop`, run this on the local instance to include its attention items:
+
+```sh
+rig config set feed.subscriptions.laptop.enabled true
+```
+
+The key uses the registry id, including any dots, and defaults to `false`. Registration
+does not change that setting. SSH entries instead explain that FEED needs an HTTP entry;
+ids reserved by feed settings (such as `progress`) get a different-id suggestion rather
+than an invalid command. `--json` keeps its single JSON result without these hints.
+The host CLI tests execute the advertised command against an isolated config and cover
+registration, reserved names and JSON output; pairing responses are simulated, so they
+do not establish connectivity to a live peer.
+
 ### ps
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig ps` | — | `--json`<br>`--no-cleanup`<br>`--resources`<br>`--nodes`<br>`--full`<br>`--verbose`<br>`--limit <n>`<br>`--fields <list>`<br>`--summary`<br>`--filter <key=value>`<br>`--active`<br>`--running`<br>`-A, --all-rigs`<br>`--rig <name>`<br>`--session <name>`<br>`--include-archived`<br>`--host <id>`<br>`--all-hosts`<br>`--hosts <ids>` |
+
+- `--nodes --json` — each seat carries the daemon's served `needsAttention` flag; the CLI doesn't re-derive it, and it is absent when an older daemon doesn't serve it. `arbitratedNeedsInput` and `needsInputEvidence` (`{ rung, observedAt }` or null) come with `--full`, or by name through `--fields`.
 
 ### roster
 
@@ -341,7 +393,20 @@ the sections that were not read are `null`.
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig mcp` | — | — |
-| `rig mcp serve` | — | `--port <port>` |
+| `rig mcp serve` | — | `--port <port>`<br>`--http`<br>`--bind <host:port>`<br>`--grant-service <url>`<br>`--grant-service-header-file <path>`<br>`--oauth-resource <url>`<br>`--oauth-issuer <url>` |
+| `rig mcp token` | — | — |
+| `rig mcp token add <name>` | — | `--seat <session>` **required**<br>`--rig <name...>`<br>`--root <name...>`<br>`--workspace`<br>`--owner` |
+| `rig mcp token list` | — | `--json` |
+| `rig mcp token revoke <name>` | — | — |
+
+### acp
+
+| Invocation | Aliases | Declared options |
+|---|---|---|
+| `rig acp` | — | — |
+| `rig acp run <qitemId> <agent...>` | — | `--cwd <dir>`<br>`--permissions-to <session>`<br>`--load-session <id>`<br>`--poll-seconds <n>` |
+| `rig acp cancel <runId>` | — | — |
+| `rig acp stop <runId> [stopCommand...]` | — | — |
 
 ### agent
 
@@ -370,7 +435,7 @@ the sections that were not read are `null`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig send [session] [text]` | — | `--to <sessions>` (repeatable)<br>`--pod <name>`<br>`--rig <name>`<br>`--verify`<br>`--force`<br>`--wait-for-idle <seconds>`<br>`--raw`<br>`--dangerously-interact`<br>`--reason <text>`<br>`--host <id>`<br>`--from <session>`<br>`--context <ref>`<br>`--json` |
+| `rig send [session] [text]` | — | `--to <sessions>` (repeatable)<br>`--pod <name>`<br>`--rig <name>`<br>`--verify`<br>`--force`<br>`--wait-for-idle <seconds>`<br>`--raw`<br>`--dangerously-interact`<br>`--type-without-checking`<br>`--reason <text>`<br>`--urgent`<br>`--host <id>`<br>`--from <session>`<br>`--context <ref>`<br>`--json` |
 
 ### stream
 
@@ -382,24 +447,29 @@ the sections that were not read are `null`.
 | `rig stream watch` | — | `--json` |
 | `rig stream show <streamItemId>` | — | `--json` |
 | `rig stream archive <streamItemId>` | — | `--json` |
+| `rig stream subscribe <readerSession>` | — | `--tags <tags>`<br>`--type <hintType>`<br>`--actor <session>`<br>`--json` |
+| `rig stream unsubscribe <readerSession>` | — | `--json` |
+| `rig stream subscriptions` | — | `--json` |
+| `rig stream read` | — | `--limit <n>`<br>`--reader <session>`<br>`--json` |
+| `rig stream act <streamItemId>` | — | `--work <qitemId>`<br>`--decline <reason>`<br>`--duplicate <id>`<br>`--reader <session>`<br>`--json` |
 
 ### queue
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig queue` | — | — |
-| `rig queue create` | — | `--source <session>`<br>`--destination <session>` **required**<br>`--body <text>`<br>`--body-file <path>`<br>`--body-context <ref>`<br>`--mission <id>`<br>`--slice <id>`<br>`--gate <role>`<br>`--priority <priority>`<br>`--tier <tier>`<br>`--tags <tags>`<br>`--expires-at <iso>`<br>`--id <qitemId>`<br>`--target-repo <name>`<br>`--summary <text>`<br>`--human-intent <intent>`<br>`--human-detail-file <path>`<br>`--reply-to <qitemId>`<br>`--human-questions-file <path>`<br>`--evidence-ref <path>`<br>`--host <id>`<br>`--no-nudge`<br>`--verify`<br>`--full`<br>`--json` |
+| `rig queue create` | — | `--source <session>`<br>`--destination <session>` **required**<br>`--body <text>`<br>`--body-file <path>`<br>`--body-context <ref>`<br>`--mission <id>`<br>`--slice <id>`<br>`--gate <role>`<br>`--priority <priority>`<br>`--tier <tier>`<br>`--tags <tags>`<br>`--expires-at <iso>`<br>`--id <qitemId>`<br>`--target-repo <name>`<br>`--summary <text>`<br>`--human-intent <intent>`<br>`--alert`<br>`--human-detail-file <path>`<br>`--reply-to <qitemId>`<br>`--human-questions-file <path>`<br>`--evidence-ref <path>`<br>`--host <id>`<br>`--no-nudge`<br>`--verify`<br>`--full`<br>`--json` |
 | `rig queue claim <qitemId>` | — | `--destination <session>`<br>`--full`<br>`--json` |
 | `rig queue unclaim <qitemId>` | — | `--destination <session>`<br>`--reason <text>`<br>`--full`<br>`--json` |
 | `rig queue update <qitemId>` | — | `--actor <session>`<br>`--state <state>`<br>`--reopen`<br>`--closure-reason <reason>`<br>`--closure-target <target>`<br>`--resolution <text>`<br>`--blocked-on <blocker>`<br>`--wake-watchdog <jobId>`<br>`--wake-after <duration>`<br>`--summary <text>`<br>`--evidence-ref <path>`<br>`--note <text>`<br>`--full`<br>`--json` |
 | `rig queue block <qitemId>` | — | `--on <blocker>` **required**<br>`--actor <session>`<br>`--summary <text>`<br>`--evidence-ref <path>`<br>`--note <text>`<br>`--continuation <text>`<br>`--wake-watchdog <jobId>`<br>`--wake-after <duration>`<br>`--full`<br>`--json` |
 | `rig queue resolve <qitemId>` | — | `--decision <text>` **required**<br>`--actor <session>`<br>`--bearer <token>`<br>`--no-notify`<br>`--json` |
-| `rig queue handoff <qitemId>` | — | `--from <session>`<br>`--to <session>` **required**<br>`--body <text>`<br>`--body-file <path>`<br>`--note <text>`<br>`--priority <priority>`<br>`--tier <tier>`<br>`--tags <tags>`<br>`--gate <role>`<br>`--target-repo <name>`<br>`--summary <text>`<br>`--evidence-ref <path>`<br>`--host <id>`<br>`--no-nudge`<br>`--full`<br>`--json` |
-| `rig queue handoff-and-complete <qitemId>` | — | `--from <session>`<br>`--to <session>` **required**<br>`--body <text>`<br>`--body-file <path>`<br>`--note <text>`<br>`--priority <priority>`<br>`--tier <tier>`<br>`--tags <tags>`<br>`--gate <role>`<br>`--target-repo <name>`<br>`--summary <text>`<br>`--evidence-ref <path>`<br>`--host <id>`<br>`--no-nudge`<br>`--full`<br>`--json` |
+| `rig queue handoff <qitemId>` | — | `--from <session>`<br>`--to <session>` **required**<br>`--body <text>`<br>`--body-file <path>`<br>`--note <text>`<br>`--priority <priority>`<br>`--tier <tier>`<br>`--tags <tags>`<br>`--gate <role>`<br>`--target-repo <name>`<br>`--summary <text>`<br>`--evidence-ref <path>`<br>`--alert`<br>`--host <id>`<br>`--no-nudge`<br>`--full`<br>`--json` |
+| `rig queue handoff-and-complete <qitemId>` | — | `--from <session>`<br>`--to <session>` **required**<br>`--body <text>`<br>`--body-file <path>`<br>`--note <text>`<br>`--priority <priority>`<br>`--tier <tier>`<br>`--tags <tags>`<br>`--gate <role>`<br>`--target-repo <name>`<br>`--summary <text>`<br>`--evidence-ref <path>`<br>`--alert`<br>`--host <id>`<br>`--no-nudge`<br>`--full`<br>`--json` |
 | `rig queue whoami` | — | `--session <session>`<br>`--recent-limit <n>`<br>`--work-candidates`<br>`--json` |
 | `rig queue fallback <qitemId>` | — | `--destination <session>` **required**<br>`--reason <text>`<br>`--json` |
 | `rig queue show <qitemId>` | — | `--full`<br>`--json` |
-| `rig queue transitions <qitemId>` | — | `--json` |
+| `rig queue transitions <qitemId>` | — | `--json`<br>`--full` |
 | `rig queue list` | — | `-a, --all`<br>`-A, --all-rigs`<br>`--full`<br>`--owned`<br>`--mine`<br>`-o <format>`<br>`--destination <session>`<br>`--source <session>`<br>`--state <state>`<br>`--target-repo <name>`<br>`--limit <n>`<br>`--json` |
 | `rig queue overdue` | — | `--rig <name>`<br>`-A, --all-rigs`<br>`--full`<br>`--limit <n>`<br>`--json` |
 | `rig queue undelivered` | — | `--rig <name>`<br>`-A, --all-rigs`<br>`--full`<br>`--limit <n>`<br>`--json` |
@@ -415,16 +485,17 @@ the sections that were not read are `null`.
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig slack` | — | — |
-| `rig slack setup` | — | `--channel <id>`<br>`--inbound-destination <session>`<br>`--minimum-level-that-posts <level>`<br>`--minimum-level-that-interrupts <level>`<br>`--source-label <label>`<br>`--secrets-env-file <path>`<br>`--required-scopes <csv>`<br>`--reason <reason>`<br>`--actor <actor>` |
+| `rig slack setup` | — | `--channel <id>`<br>`--inbound-destination <session>`<br>`--minimum-level-that-posts <level>`<br>`--minimum-level-that-interrupts <level>`<br>`--source-label <label>`<br>`--secrets-env-file <path>`<br>`--required-scopes <csv>`<br>`--reactions <mode>`<br>`--reason <reason>`<br>`--actor <actor>` |
 | `rig slack status` | — | `--json` |
 | `rig slack manifest` | — | `--url`<br>`--json` |
-| `rig slack verify` | — | `--json`<br>`--reason <reason>`<br>`--actor <actor>` |
+| `rig slack verify` | — | `--json` |
 | `rig slack channel-map` | — | — |
 | `rig slack channel-map list` | — | `--json` |
-| `rig slack channel-map set <match> <channel>` | — | `--reason <reason>`<br>`--actor <actor>` |
+| `rig slack channel-map set <match> <channel>` | — | `--inbound <seat>`<br>`--reason <reason>`<br>`--actor <actor>` |
 | `rig slack channel-map remove <match>` | — | `--reason <reason>`<br>`--actor <actor>` |
 | `rig slack enable` | — | `--reason <reason>`<br>`--actor <actor>` |
 | `rig slack disable` | — | `--reason <reason>` **required**<br>`--actor <actor>` |
+| `rig slack post-open-asks` | — | `--reason <reason>`<br>`--wait <seconds>`<br>`--actor <actor>`<br>`--json` |
 | `rig slack outbound` | — | `--json` |
 | `rig slack inbound` | — | — |
 
@@ -438,8 +509,10 @@ the sections that were not read are `null`.
 | `rig project experimental disable` | — | `--config <file>` **required**<br>`--max-requests <n>`<br>`--timeout-ms <n>`<br>`--json` |
 | `rig project experimental status` | — | `--config <file>` **required**<br>`--max-requests <n>`<br>`--timeout-ms <n>`<br>`--json` |
 | `rig project experimental capture` | — | `--config <file>` **required**<br>`--input <file>` **required**<br>`--output <file>` **required**<br>`--json` |
-| `rig project candidates` | — | `--project <id>` **required**<br>`--taxonomy <file>` **required**<br>`--classifier-version <version>` **required**<br>`--evidence-epoch <epoch>` **required**<br>`--decisions <file>`<br>`--experiment <file>`<br>`--limit <count>`<br>`--json` |
-| `rig project wake` | — | `--project <id>` **required**<br>`--taxonomy <file>` **required**<br>`--classifier-version <version>` **required**<br>`--evidence-epoch <epoch>` **required**<br>`--decisions <file>`<br>`--experiment <file>`<br>`--limit <count>`<br>`--json` |
+| `rig project decisions` | — | — |
+| `rig project decisions status` | — | `--json` |
+| `rig project candidates` | — | `--project <id>` **required**<br>`--taxonomy <file>` **required**<br>`--classifier-version <version>` **required**<br>`--evidence-epoch <epoch>` **required**<br>`--decisions <file>`<br>`--experiment <file>`<br>`--decide`<br>`--limit <count>`<br>`--json` |
+| `rig project wake` | — | `--project <id>` **required**<br>`--taxonomy <file>` **required**<br>`--classifier-version <version>` **required**<br>`--evidence-epoch <epoch>` **required**<br>`--decisions <file>`<br>`--experiment <file>`<br>`--decide`<br>`--limit <count>`<br>`--json` |
 | `rig project shadow-status` | — | — |
 | `rig project shadow-drain` | — | `--actor <name>` |
 | `rig project shadow-stop` | — | `--actor <name>` |
@@ -465,20 +538,24 @@ the sections that were not read are `null`.
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig terminal` | — | — |
-| `rig terminal open <view>` | — | `--provider <name>`<br>`--window`<br>`--expected-plan <id>`<br>`--json` |
+| `rig terminal open <view>` | — | `--provider <name>`<br>`--session <name>`<br>`--window`<br>`--expected-plan <id>`<br>`--json` |
 | `rig terminal views` | — | `--json` |
-| `rig terminal status` | — | `--provider <name>`<br>`--json` |
+| `rig terminal status` | — | `--provider <name>`<br>`--session <name>`<br>`--json` |
+
+See [named terminal sessions](../reference/terminal-sessions.md) to select a
+Herdr session per request, including session-bound previews and window reuse.
 
 ### watchdog
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig watchdog` | — | — |
-| `rig watchdog register` | — | `--spec <path>`<br>`--policy <policy>` **required**<br>`--target-session <session>` **required**<br>`--interval-seconds <n>` **required**<br>`--registered-by <session>` **required**<br>`--threshold-bytes <n>`<br>`--threshold-mb <n>`<br>`--watched-file <path>`<br>`--requires-job <jobId>`<br>`--message <text>`<br>`--active-wake-interval-seconds <n>`<br>`--scan-interval-seconds <n>`<br>`--json` |
+| `rig watchdog register` | — | `--spec <path>`<br>`--policy <policy>` **required**<br>`--target-session <session>` **required**<br>`--interval-seconds <n>` **required**<br>`--registered-by <session>` **required**<br>`--threshold-bytes <n>`<br>`--threshold-mb <n>`<br>`--threshold-tokens <n>`<br>`--threshold-percent <n>`<br>`--watched-file <path>`<br>`--requires-job <jobId>`<br>`--message <text>`<br>`--active-wake-interval-seconds <n>`<br>`--scan-interval-seconds <n>`<br>`--json` |
 | `rig watchdog list` | — | `-a, --all`<br>`--full`<br>`--limit <n>`<br>`--json` |
 | `rig watchdog show <jobId>` | — | `--json` |
 | `rig watchdog status <jobId>` | — | `--json` |
 | `rig watchdog stop <jobId>` | — | `--reason <text>`<br>`--json` |
+| `rig watchdog update <jobId>` | — | `--interval-seconds <n>`<br>`--message <text>`<br>`--spec <path>`<br>`--json` |
 
 ### workflow
 
@@ -491,7 +568,7 @@ the sections that were not read are `null`.
 | `rig workflow operation <key>` | — | `--json` |
 | `rig workflow instantiate-lifecycle <missionPath>` | — | `--operation-key <key>` **required**<br>`--root-objective <text>` **required**<br>`--created-by <session>` **required**<br>`--entry-owner <session>`<br>`--rig <name>`<br>`--json` |
 | `rig workflow instantiate <specPath>` | — | `--root-objective <text>` **required**<br>`--created-by <session>` **required**<br>`--entry-owner <session>`<br>`--rig <name>`<br>`--project <id>`<br>`--mission <id>`<br>`--slice <id>`<br>`--tags <tags>`<br>`--json` |
-| `rig workflow project` | — | `--instance <id>` **required**<br>`--current-packet <qitem-id>` **required**<br>`--exit <kind>` **required**<br>`--actor-session <session>` **required**<br>`--result-note <text>`<br>`--evidence-ref <ref>`<br>`--wait-for-proof <scope>`<br>`--blocked-on <ref>`<br>`--next-owner <session>`<br>`--acceptance-candidate <identity>`<br>`--acceptance-verdict <verdict>`<br>`--acceptance-evidence-ref <path>`<br>`--json` |
+| `rig workflow project` | — | `--instance <id>` **required**<br>`--current-packet <qitem-id>` **required**<br>`--exit <kind>` **required**<br>`--actor-session <session>` (only when the caller's session can't be derived)<br>`--result-note <text>`<br>`--evidence-ref <ref>`<br>`--wait-for-proof <scope>`<br>`--blocked-on <ref>`<br>`--next-owner <session>`<br>`--acceptance-candidate <identity>`<br>`--acceptance-verdict <verdict>`<br>`--acceptance-evidence-ref <path>`<br>`--json` |
 | `rig workflow list` | — | `--status <s>`<br>`--json` |
 | `rig workflow specs` | — | `--json` |
 | `rig workflow guidance <instanceId>` | — | `--packet <id>`<br>`--component <id>`<br>`--full`<br>`--json` |
@@ -500,16 +577,16 @@ the sections that were not read are `null`.
 | `rig workflow continue <instanceId>` | — | `--json` |
 | `rig workflow run <specPath>` | — | `--root-objective <text>` **required**<br>`--created-by <session>` **required**<br>`--entry-owner <session>`<br>`--rig <name>`<br>`--project <id>`<br>`--mission <id>`<br>`--slice <id>`<br>`--tags <tags>`<br>`--json` |
 | `rig workflow watch <instanceId>` | — | `--json` |
-| `rig workflow route <instanceId>` | — | `--to <session>` **required**<br>`--actor-session <session>` **required**<br>`--packet <qitem-id>`<br>`--reason <text>`<br>`--json` |
-| `rig workflow resume <instanceId>` | — | `--actor-session <session>` **required**<br>`--occurrence <failed-qitem-id>`<br>`--decision <text>`<br>`--json` |
-| `rig workflow abort <instanceId>` | — | `--reason <text>` **required**<br>`--actor-session <session>` **required**<br>`--json` |
+| `rig workflow route <instanceId>` | — | `--to <session>` **required**<br>`--actor-session <session>` (only when the caller's session can't be derived)<br>`--packet <qitem-id>`<br>`--reason <text>`<br>`--json` |
+| `rig workflow resume <instanceId>` | — | `--actor-session <session>` (only when the caller's session can't be derived)<br>`--occurrence <failed-qitem-id>`<br>`--decision <text>`<br>`--json` |
+| `rig workflow abort <instanceId>` | — | `--reason <text>` **required**<br>`--actor-session <session>` (only when the caller's session can't be derived)<br>`--json` |
 | `rig workflow status` | — | `--json` |
 
 ### capture
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig capture [session]` | — | `--rig <name>`<br>`--pod <name>`<br>`--lines <n>`<br>`--host <id>`<br>`--json` |
+| `rig capture [session]` | — | `--rig <name>`<br>`--pod <name>`<br>`--lines <n>`<br>`--history-plus-pane`<br>`--readable`<br>`--size <WxH>`<br>`--host <id>`<br>`--json` |
 
 ### broadcast
 
@@ -532,6 +609,7 @@ the sections that were not read are `null`.
 Wake seat targets must include the rig: `member@rig` or `member@rig@N` (1 = newest tenure).
 Values without `@` go unchanged to the runtime as a session ID or title; a bare member
 name is not resolved within `<rig>`.
+Only Claude and Codex tenures can be woken.
 
 ### chatroom
 
@@ -594,7 +672,7 @@ name is not resolved within `<rig>`.
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig skill` | — | — |
-| `rig skill loadout` | — | `--runtime <runtime>` **required**<br>`--cwd <path>`<br>`--project-root <path>`<br>`--topology <ids>`<br>`--apply`<br>`--json` |
+| `rig skill loadout` | — | `--runtime <runtime>` (folder mode; **required** there)<br>`--seat <session>` (seat mode; `self` is this seat)<br>`--wait-for-idle <ms>`<br>`--resend`<br>`--cwd <path>`<br>`--project-root <path>`<br>`--topology <ids>`<br>`--apply`<br>`--json` |
 | `rig skill audit` | — | `--json` |
 
 ### agent-image
@@ -612,11 +690,18 @@ name is not resolved within `<rig>`.
 | `rig agent-image prune` | — | `--dry-run`<br>`--force`<br>`--json` |
 | `rig agent-image sync` | — | `--json` |
 
+### community-harness
+
+| Invocation | Aliases | Declared options |
+|---|---|---|
+| `rig community-harness` | — | — |
+| `rig community-harness list` | — | `--json` |
+
 ### fork
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig fork <source-session>` | — | `--rig <rig-id>` **required**<br>`--pod <pod-namespace>` **required**<br>`--member <member-id>` **required**<br>`--keep-image`<br>`--image-name <name>`<br>`--image-version <version>`<br>`--rig-root <path>`<br>`--json` |
+| `rig fork <source-session>` | — | `--rig <rig>` **required**<br>`--pod <pod-namespace>` **required**<br>`--member <member-id>` **required**<br>`--keep-image`<br>`--image-name <name>`<br>`--image-version <version>`<br>`--rig-root <path>`<br>`--json` |
 
 ### workspace
 
@@ -635,7 +720,7 @@ name is not resolved within `<rig>`.
 | `rig mode show` | — | `--json` |
 | `rig mode effective` | — | `--rig <id>`<br>`--project <id>`<br>`--mission <id>`<br>`--workstream <id>`<br>`--qitem <id>`<br>`--json` |
 | `rig mode cite` | — | `--rig <id>`<br>`--project <id>`<br>`--mission <id>`<br>`--workstream <id>`<br>`--qitem <id>` |
-| `rig mode unset <scope> [qualifier]` | — | `--bearer <token>`<br>`--json` |
+| `rig mode unset <scope> [qualifier]` | — | `--bearer <token>`<br>`--category <category>`<br>`--json` |
 | `rig mode defaults` | — | `--json` |
 
 ### policy
@@ -657,7 +742,7 @@ name is not resolved within `<rig>`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig whoami` | — | `--node-id <id>`<br>`--session <name>`<br>`--host <id>`<br>`--all-hosts`<br>`--hosts <ids>`<br>`--json`<br>`--full`<br>`--verbose` |
+| `rig whoami` | — | `--node-id <id>`<br>`--session <name>`<br>`--host <id>`<br>`--all-hosts`<br>`--hosts <ids>`<br>`--json`<br>`--full`<br>`--verbose`<br>`--all-peers` |
 
 ### config
 
@@ -689,10 +774,10 @@ name is not resolved within `<rig>`.
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig auth` | — | — |
-| `rig auth status` | — | `--runtime <runtime>` |
-| `rig auth list` | — | `--runtime <runtime>` |
+| `rig auth status` | — | `--runtime <runtime>`<br>`--codex-home <dir>`<br>`--host <id>` |
+| `rig auth list` | — | `--runtime <runtime>`<br>`--codex-home <dir>`<br>`--host <id>` |
 | `rig auth save <profile>` | — | `--runtime <runtime>` |
-| `rig auth switch <profile>` | — | `--runtime <runtime>` |
+| `rig auth switch <profile>` | — | `--runtime <runtime>`<br>`--codex-home <dir>`<br>`--host <id>` |
 | `rig auth validate <profile>` | — | `--runtime <runtime>` |
 | `rig auth seats` | — | — |
 | `rig auth seats list` | — | `--runtime <runtime>` |
@@ -705,15 +790,14 @@ name is not resolved within `<rig>`.
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig provider` | — | — |
-| `rig provider status` | — | `--json`<br>`--refresh`<br>`--provider <p>` |
+| `rig provider status` | — | `--json`<br>`--refresh`<br>`--provider <p>`<br>`--claude-token-file <path>`<br>`--credential-label <label>`<br>`--all-hosts`<br>`--hosts <ids>` |
 | `rig provider accounts` | — | `--json`<br>`--provider <p>`<br>`--account <a>` |
 | `rig provider bindings` | — | `--json`<br>`--provider <p>`<br>`--account <a>` |
 | `rig provider signals` | — | `--json`<br>`--provider <p>`<br>`--account <a>` |
-| `rig provider precheck` | — | `--seat <s>` **required**<br>`--to-account <a>` **required**<br>`--json` |
-| `rig provider switch` | — | `--seat <s>` **required**<br>`--to-account <a>` **required**<br>`--force-unsafe`<br>`--json` |
-| `rig provider moves` | — | `--home <home>`<br>`--seat <seat>`<br>`--limit <n>`<br>`--json` |
-| `rig provider moves show` | `<id>` | `--json` |
-| `rig provider moves record` | — | `--file <path>` **required**<br>`--operator <name>`<br>`--json` |
+| `rig provider precheck` | — | `--seat <s>` **required**<br>`--to-account <a>`<br>`--token-file <path>`<br>`--api-key-file <path>`<br>`--stored-login`<br>`--json` |
+| `rig provider switch` | — | `--seat <s>` **required**<br>`--to-account <a>`<br>`--token-file <path>`<br>`--api-key-file <path>`<br>`--stored-login`<br>`--force-unsafe`<br>`--clear-account-home`<br>`--account-home <path>`<br>`--reason <text>`<br>`--model <id>`<br>`--codex-config-profile <name>`<br>`--dry-run`<br>`--json` |
+| `rig provider moves` | — | `--seat <seat>`<br>`--limit <n>`<br>`--json` |
+| `rig provider moves report` | — | `--file <path>` **required**<br>`--to <seat>` **required**<br>`--follows <qitemId>`<br>`--evidence-ref <ref>`<br>`--json` |
 
 ### usage
 
@@ -721,6 +805,7 @@ name is not resolved within `<rig>`.
 |---|---|---|
 | `rig usage` | — | — |
 | `rig usage top` | — | `--window <duration>`<br>`--top <n>`<br>`--json` |
+| `rig usage cost` | — | `--seat <session>`<br>`--json` |
 | `rig usage series` | — | `--seat <session>`<br>`--lane <lane>`<br>`--since <iso>`<br>`--until <iso>`<br>`--limit <n>`<br>`--json` |
 
 ### telemetry
@@ -757,7 +842,7 @@ name is not resolved within `<rig>`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig expand <rig-id> <pod-fragment-path>` | — | `--json`<br>`--rig-root <path>` |
+| `rig expand <rig> <pod-fragment-path>` | — | `--json`<br>`--rig-root <path>` |
 
 ### add
 
@@ -777,11 +862,25 @@ name is not resolved within `<rig>`.
 |---|---|---|
 | `rig grow <rig-id> <members...>` | — | `--pod <pod>`<br>`--new-pod <pod>`<br>`--runtime <runtime>`<br>`--cwd <path>`<br>`--json` |
 
+### edge
+
+| Invocation | Aliases | Declared options |
+|---|---|---|
+| `rig edge` | — | — |
+| `rig edge add <rig> [from] [to]` | — | `--kind <kind>`<br>`--plan`<br>`--json` |
+| `rig edge remove <rig> <edge-id>` | — | `--plan`<br>`--json` |
+
+`add` requires `from`, `to` and `--kind`, and is idempotent: a repeat reports the
+existing edge and writes nothing. `remove` deletes the edge with that ID; a repeat changes nothing and
+returns `edge_not_found` (exit 1). See
+[changing edges on an existing rig](../reference/rig-spec.md#changing-edges-on-an-existing-rig)
+for input and receipt examples, rollback, and snapshot behavior.
+
 ### reconcile-session
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig reconcile-session <session>` | — | `--rig <rigId>`<br>`--node <logicalId>`<br>`--no-launch`<br>`--json` |
+| `rig reconcile-session <session>` | — | `--rig <rigId>`<br>`--node <logicalId>`<br>`--no-launch`<br>`--repair-missing-pane`<br>`--json` |
 
 ### env
 
@@ -802,7 +901,7 @@ name is not resolved within `<rig>`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig release <rigId>` | — | `--delete`<br>`--json` |
+| `rig release <rig>` | — | `--delete`<br>`--json` |
 
 ### launch
 
@@ -820,7 +919,7 @@ name is not resolved within `<rig>`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig shrink <rigId> <podRef>` | — | `--fallback <live-seat>`<br>`--json` |
+| `rig shrink <rig> <podRef>` | — | `--fallback <live-seat>`<br>`--json` |
 
 ### destroy
 
@@ -832,7 +931,7 @@ name is not resolved within `<rig>`.
 
 | Invocation | Aliases | Declared options |
 |---|---|---|
-| `rig setup` | — | `--dry-run`<br>`--json`<br>`--full`<br>`--no-herdr`<br>`--ghostty`<br>`--no-ghostty`<br>`--providers <list>`<br>`--policy <name>`<br>`--spec <path>` |
+| `rig setup` | — | `--dry-run`<br>`--json`<br>`--full`<br>`--no-herdr`<br>`--ghostty`<br>`--no-ghostty`<br>`--providers <list>`<br>`--policy <name>`<br>`--spec <path>`<br>`--router-line <answer>` |
 
 ### restore-check
 
@@ -855,6 +954,8 @@ name is not resolved within `<rig>`.
 |---|---|---|
 | `rig compact-plan` | — | `--json`<br>`--rig <name>`<br>`--refresh`<br>`--threshold-tokens <n>`<br>`--threshold-percent <0-100>` |
 
+- `--threshold-tokens` and `--threshold-percent` set the plan's own candidate thresholds (the percentage applies when a seat's context window size is missing). They are not the automatic compaction setting: the output labels them as the plan's own and shows `policies.claude_compaction` (`enabled`, `threshold_percent`) separately, for comparison only, or says it couldn't be read.
+
 ### compact
 
 | Invocation | Aliases | Declared options |
@@ -872,6 +973,7 @@ name is not resolved within `<rig>`.
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig seat` | — | — |
+| `rig seat history` | — | `--rig <id>` **required**<br>`--node-id <id>` **required**<br>`--snapshot-id <id>`<br>`--history-session-id <id>`<br>`--json` |
 | `rig seat set-typing-guard <seat>` | — | `--enabled <boolean>`<br>`--mode <mode>`<br>`--reason <text>` **required**<br>`--json` |
 | `rig seat held-messages <seat>` | — | `--limit <n>`<br>`--offset <n>`<br>`--id <id>`<br>`--json` |
 | `rig seat retire-held-message <seat> <id>` | — | `--reason <text>` **required**<br>`--json` |
@@ -879,10 +981,15 @@ name is not resolved within `<rig>`.
 | `rig seat handover <seat>` | — | `--source <source>`<br>`--reason <reason>`<br>`--operator <address>`<br>`--dry-run`<br>`--json` |
 | `rig seat switch-client <seat>` | — | `--to-window <n>`<br>`--client <id>`<br>`--json` |
 | `rig seat clear-attention <session>` | — | `--reason <text>`<br>`--json` |
-| `rig seat set-permissions <seat>` | — | `--mode <mode>` **required**<br>`--reason <text>` **required**<br>`--operator <address>`<br>`--json` |
+| `rig seat set-terminal-policy <seat>` | — | `--preset <preset>` **required**<br>`--helper <addresses...>`<br>`--rig-default`<br>`--reason <text>` **required**<br>`--operator <address>`<br>`--json`<br>`--peer-compaction <decision>`<br>`--peer-model <decision>`<br>`--self-compaction <decision>`<br>`--self-model <decision>`<br>`--openrig-compaction <decision>`<br>`--openrig-model <decision>` |
+| `rig seat set-permissions <seat>` | — | `--mode <mode>`<br>`--rules <file>`<br>`--codex-permissions <file>`<br>`--codex-profile <name>`<br>`--reason <text>` **required**<br>`--operator <address>`<br>`--json` |
+| `rig seat set-effort <seat>` | — | `--effort <level>`<br>`--clear`<br>`--reason <text>` **required**<br>`--operator <address>`<br>`--json` |
+| `rig seat effort <seat>` | — | `--json` |
 | `rig seat set-model <seat>` | — | `--model <id>` **required**<br>`--reason <text>` **required**<br>`--operator <address>`<br>`--json` |
+| `rig seat set-runtime <seat>` | — | `--runtime <runtime>`<br>`--reason <text>`<br>`--model <id>`<br>`--effort <level>`<br>`--codex-config-profile <name>`<br>`--clear-account-home`<br>`--account-home <path>`<br>`--token-file <path>`<br>`--account-label <label>`<br>`--permission-mode <mode>`<br>`--confirm-timeout <seconds>`<br>`--dry-run`<br>`--confirm <switch-id>`<br>`--note <text>`<br>`--recover`<br>`--json` |
 | `rig seat set-cwd <seat>` | — | `--cwd <directory>` **required**<br>`--reason <text>` **required**<br>`--operator <address>`<br>`--json` |
-| `rig seat launch <seat>` | — | `--fresh` **required**<br>`--reason <text>` **required**<br>`--stop`<br>`--operator <address>`<br>`--json` |
+| `rig seat launch <seat>` | — | `--fresh` **required**<br>`--reason <text>`<br>`--plan`<br>`--stop`<br>`--operator <address>`<br>`--json` |
+| `rig seat restart <seat>` | — | `--keep-conversation` **required**<br>`--reason <text>`<br>`--plan`<br>`--verify`<br>`--expect-account <text>`<br>`--operator <address>`<br>`--host <id>`<br>`--json` |
 | `rig seat continue <seat>` | — | `--json` |
 | `rig seat stop <seat>` | — | `--reason <text>` **required**<br>`--operator <address>`<br>`--json` |
 | `rig seat clean <seat>` | — | `--reason <text>` **required**<br>`--operator <address>`<br>`--json` |
@@ -965,6 +1072,6 @@ off, draft-aware and hold modes, immediate refusal results and held-message insp
 | Invocation | Aliases | Declared options |
 |---|---|---|
 | `rig proof` | — | `--workspace <path>` |
-| `rig proof show [scope]` | — | `--json` |
-| `rig proof judge <scope-item>` | — | `--verdict <verdict>` **required**<br>`--reason <text>` **required**<br>`--evidence <ref>` (repeatable)<br>`--subject <kind:ref>`<br>`--comparison <ref>`<br>`--revision <revision>`<br>`--operation-id <id>`<br>`--replace`<br>`--json` |
+| `rig proof show [scope]` | — | `--project <id>`<br>`--json` |
+| `rig proof judge <scope-item>` | — | `--project <id>`<br>`--verdict <verdict>` **required**<br>`--reason <text>` **required**<br>`--evidence <ref>` (repeatable)<br>`--subject <kind:ref>`<br>`--comparison <ref>`<br>`--revision <revision>`<br>`--operation-id <id>`<br>`--replace`<br>`--json` |
 | `rig proof add <slice-path>` | — | `--mission <name>`<br>`--artifact-type <type>` **required**<br>`--verdict <verdict>` **required**<br>`--candidate-sha <sha>` **required**<br>`--money-evidence <line>` **required**<br>`--slice-id <dot-id>`<br>`--file <path>`<br>`--body <text>`<br>`--name <filename>`<br>`--replace`<br>`--evidences <refs>`<br>`--self-check <text>`<br>`--media <refs>`<br>`--json` |

@@ -33,12 +33,12 @@ blanket-replaced: `rigged` → `rig` is a per-occurrence question, not a global
 substitution.
 
 **Axis 1 — MCP tool names are `rig_*`.** `packages/cli/src/mcp-server.ts`
-registers **23** tools, all named `rig_*`
+registers **24** tools, all named `rig_*`
 (`grep -c 'server.tool(' packages/cli/src/mcp-server.ts`), including
 `rig_rig_nodes` (`mcp-server.ts:290`), `rig_send` (`:307`),
 `rig_capture` (`:341`), `rig_chatroom_send` (`:366`) and `rig_chatroom_watch`
-(`:402`), and the five queue tools `rig_queue_create`, `_show`, `_list`, `_claim`
-and `_update`. No `rigged_*` name other than the tmux keys below remains in product
+(`:402`), the five queue tools `rig_queue_create`, `_show`, `_list`, `_claim`
+and `_update`, and `rig_telemetry_events`. No `rigged_*` name other than the tmux keys below remains in product
 source: **0** hits
 (`git grep -n 'rigged_' -- ':(glob)packages/*/src/**' | grep -v -c '@rigged_'`).
 
@@ -277,21 +277,21 @@ Routes: `packages/daemon/src/routes/{transport,transcripts,ask,chat,whoami}.ts`
      after Enter must show the box empty, with the pane process
      (`#{pane_pid}`) and the seat's binding unchanged.
 
-   The result's `inputBox: { seat, before, after, sameProcess }` says which
-   reading failed. An empty box reads `queued` instead of `empty` where the
-   frames say the message may wait behind a turn: Codex's pending-input rows
-   or a row under its running-turn status, or a running turn in the frame
-   read before Enter (Codex's `• Working` row; for Claude Code,
-   `esc to interrupt` or a live status row above the box, including above a
-   box of several rows). The verdict uses these readings: verified needs
-   `empty`, so for a seat that was idle before the paste they are the only
-   check that rejects a message queued behind a turn that started after the
-   pre-paste capture. An audited prompt answer (step 4) reads no box: with
-   the setting on its `inputBox` reads `unchecked` for `seat`, `before` and
-   `after`, `sameProcess` is `false` (it stays a boolean), and the send reads
-   unconfirmed, whatever the default matcher would say.
-   It reports only: the seat is read from the capture `--verify` already
-   takes, and none of the extra reads decides whether Enter is sent. Each has
+   These readings stay internal to the send; the result carries only the
+   verdict (`verified`, `outcome`). An empty box reads `queued` instead of
+   `empty` where the frames say the message may wait behind a turn: Codex's
+   pending-input rows or a row under its running-turn status, or a running
+   turn in the frame read before Enter (Codex's `• Working` row; for Claude
+   Code, `esc to interrupt` or a live status row above the box, including
+   above a box of several rows). The verdict uses these readings: verified
+   needs `empty`, so for a seat that was idle before the paste they are the
+   only check that rejects a message queued behind a turn that started after
+   the pre-paste capture. An audited prompt answer (step 4) reads no box: with
+   the setting on it stays unconfirmed, whatever the default matcher would
+   say.
+   The readings decide the verification verdict, not whether Enter is sent:
+   the seat is read from the capture `--verify` already takes, and none of
+   the extra reads decides whether Enter is sent. Each has
    a 500 ms deadline, which is a budget, not a guarantee: the pre-Enter read
    comes after the existing 200 ms wait and can add about 500 ms before
    Enter, and the post-Enter process read can add about another 500 ms
@@ -461,6 +461,40 @@ agent IS the LLM. The one exception is the explicit CLI flag `rig ask --wake`
 (`packages/cli/src/commands/ask.ts:88`), which runs a headless resume of a
 Claude or Codex session (`claude -p --resume` / `codex exec resume`,
 `packages/cli/src/ask-wake.ts:58`–`60`) to answer one question.
+
+### Current-generation records for `rig walk`
+
+`rig walk` checks a delivered piece against the current conversation through
+`GET /api/sessions/:sessionName/generation-record` (`routes/sessions.ts`).
+Without `sinceBytes`, the route returns record identity and size; with it, the
+route also reads a bounded suffix from the same open file. This terminal-class
+endpoint uses the terminal bearer gate.
+
+For Codex, the current occupant must have a verified identity for its bound
+pane. The route compares tmux's current root PID with the identity's
+`observedPanePid`, falling back to `observedPid` for older verdicts that only
+recorded one PID. Previously it always compared the root with the native Codex
+PID, refusing a verified Codex running beneath a shell or launcher. Recording
+both PIDs lets that wrapper pass without accepting a changed pane root or
+changing the identity schema.
+
+For dual-PID verdicts, the selected thread must also be the thread resolved for
+`observedPid`. All candidate threads still participate in the ambiguity check;
+another process's resolvable thread cannot stand in for a missing or
+unresolvable verified native process. This reuses the same process observation
+and thread lookups, without an additional census.
+
+The existing thread lookup still requires a Codex descendant with one
+resolvable thread, a thread-table record path and a matching rollout header.
+The route rechecks occupant generation, pane binding and root PID after the
+thread lookup. These are bounded observations, not an atomic process snapshot.
+An unresolved identity still returns 409; `rig walk` reports consumption as
+unverified instead of claiming it read the record. Route regressions in
+`packages/daemon/test/walk-consumption-primitives.test.ts` cover shell and
+launcher wrappers, legacy verdicts, root changes, replaced or unresolved native
+processes, and changes during thread resolution with synthetic process
+observations and actual SQLite/JSONL
+fixtures; they do not exercise a live Codex conversation.
 
 ## 5. Chat flow
 

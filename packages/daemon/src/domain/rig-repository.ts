@@ -1,3 +1,7 @@
+import { isEscalationTargetRef } from "./escalation-target-ref.js";
+import { validateClaudePermissionRules } from "./claude-permission-rules.js";
+import { validateClaudeMcp, type ClaudeMcp } from "./claude-mcp.js";
+import { validateCodexMemberPermissions } from "./codex-member-permissions.js";
 import type Database from "better-sqlite3";
 import { resolveActiveOccupantRow } from "./active-occupant.js";
 import { decodeStoredSnapshotData } from "./snapshot-repository.js";
@@ -6,6 +10,8 @@ import { ulid } from "ulid";
 import { deriveComposeProjectName } from "./compose-project-name.js";
 import type { ClaudeManagedBlockFile } from "./managed-blocks.js";
 import { mergeSeatEnv, parseStoredSeatEnv, type SeatEnv } from "./seat-env.js";
+import { seatAccountHome, RUNTIME_HOME_VAR, withoutIgnoredRuntimeHomes } from "./seat-runtime-home.js";
+import { claudeSeatTokenRefProblem, parseClaudeSeatTokenRef, type ClaudeSeatTokenRef } from "./claude-seat-token.js";
 import type {
   Rig,
   Node,
@@ -18,7 +24,185 @@ import type {
   Snapshot,
   SnapshotData,
   SessionSourceSpec,
+  NodeLaunchRecipe,
+  StartupBlock,
+  StartupFile,
 } from "./types.js";
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.values(value).every((entry) => typeof entry === "string");
+}
+
+function isStoredSessionSource(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const source = value as Record<string, unknown>;
+  const ref = source.ref;
+  if (ref === null || typeof ref !== "object" || Array.isArray(ref)) return false;
+  const refRecord = ref as Record<string, unknown>;
+  if (source.mode === "fork") {
+    return ["native_id", "artifact_path", "name", "last"].includes(String(refRecord.kind))
+      && (refRecord.value === undefined || typeof refRecord.value === "string");
+  }
+  if (source.mode === "rebuild") {
+    return refRecord.kind === "artifact_set"
+      && Array.isArray(refRecord.value)
+      && refRecord.value.length > 0
+      && refRecord.value.every((entry) => typeof entry === "string" && entry.trim().length > 0);
+  }
+  if (source.mode === "agent_image") {
+    return refRecord.kind === "image_name"
+      && typeof refRecord.value === "string"
+      && refRecord.value.trim().length > 0
+      && (refRecord.version === undefined || typeof refRecord.version === "string");
+  }
+  return false;
+}
+
+function isStoredStartupBlock(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const startup = value as Record<string, unknown>;
+  if (!Array.isArray(startup.files) || !Array.isArray(startup.actions)) return false;
+  const fileHints = ["auto", "guidance_merge", "skill_install", "send_text"];
+  const phases = ["fresh_start", "restore"];
+  const actionTypes = ["slash_command", "send_text", "startup_proof"];
+  const actionPhases = ["after_files", "after_ready"];
+  return startup.files.every((file) => {
+    if (file === null || typeof file !== "object" || Array.isArray(file)) return false;
+    const entry = file as Record<string, unknown>;
+    return typeof entry.path === "string"
+      && fileHints.includes(String(entry.deliveryHint))
+      && typeof entry.required === "boolean"
+      && Array.isArray(entry.appliesOn)
+      && entry.appliesOn.every((phase) => typeof phase === "string" && phases.includes(phase))
+      && (entry.orientation === undefined || entry.orientation === "role")
+      && (entry.kind === undefined || entry.kind === "file");
+  }) && startup.actions.every((action) => {
+    if (action === null || typeof action !== "object" || Array.isArray(action)) return false;
+    const entry = action as Record<string, unknown>;
+    return actionTypes.includes(String(entry.type))
+      && typeof entry.value === "string"
+      && actionPhases.includes(String(entry.phase))
+      && Array.isArray(entry.appliesOn)
+      && entry.appliesOn.every((phase) => typeof phase === "string" && phases.includes(phase))
+      && typeof entry.idempotent === "boolean"
+      && (entry.builtin === undefined || entry.builtin === "session_identity");
+  });
+}
+
+function isStoredContinuityPolicy(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const policy = value as Record<string, unknown>;
+  if (typeof policy.enabled !== "boolean") return false;
+  if (policy.syncTriggers !== undefined
+    && (!Array.isArray(policy.syncTriggers) || !policy.syncTriggers.every((entry) => typeof entry === "string"))) return false;
+  for (const field of ["artifacts", "restoreProtocol"] as const) {
+    const nested = policy[field];
+    if (nested !== undefined) {
+      if (nested === null || typeof nested !== "object" || Array.isArray(nested)) return false;
+      if (!Object.values(nested as Record<string, unknown>).every((entry) => typeof entry === "boolean")) return false;
+    }
+  }
+  return true;
+}
+
+function isStoredWorkspace(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const workspace = value as Record<string, unknown>;
+  if (typeof workspace.workspaceRoot !== "string" || !Array.isArray(workspace.repos)) return false;
+  if (workspace.defaultRepo !== undefined && typeof workspace.defaultRepo !== "string") return false;
+  if (workspace.knowledgeRoot !== undefined && typeof workspace.knowledgeRoot !== "string") return false;
+  return workspace.repos.every((repo) => {
+    if (repo === null || typeof repo !== "object" || Array.isArray(repo)) return false;
+    const entry = repo as Record<string, unknown>;
+    return typeof entry.name === "string" && typeof entry.path === "string" && typeof entry.kind === "string";
+  });
+}
+
+function isStoredServices(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const services = value as Record<string, unknown>;
+  if (services.kind !== "compose" || typeof services.composeFile !== "string") return false;
+  if (services.projectName !== undefined && typeof services.projectName !== "string") return false;
+  if (services.profiles !== undefined
+    && (!Array.isArray(services.profiles) || !services.profiles.every((entry) => typeof entry === "string"))) return false;
+  if (services.downPolicy !== undefined
+    && !["leave_running", "down", "down_and_volumes"].includes(String(services.downPolicy))) return false;
+  if (services.waitFor !== undefined && !Array.isArray(services.waitFor)) return false;
+  if (services.surfaces !== undefined
+    && (services.surfaces === null || typeof services.surfaces !== "object" || Array.isArray(services.surfaces))) return false;
+  if (services.checkpoints !== undefined && !Array.isArray(services.checkpoints)) return false;
+  return true;
+}
+
+function isStoredRigSpec(value: unknown): value is NodeLaunchRecipe["rigSpec"] {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const spec = value as Record<string, unknown>;
+  if (typeof spec.version !== "string" || typeof spec.name !== "string" || !Array.isArray(spec.pods)) return false;
+  if (spec.cultureFile !== undefined && typeof spec.cultureFile !== "string") return false;
+  if (spec.nonInterruptive !== undefined && typeof spec.nonInterruptive !== "boolean") return false;
+  if (spec.permissionPolicy !== undefined && typeof spec.permissionPolicy !== "string") return false;
+  if (spec.env !== undefined && !isStringRecord(spec.env)) return false;
+  if (spec.managedBlocks !== undefined) {
+    if (spec.managedBlocks === null || typeof spec.managedBlocks !== "object" || Array.isArray(spec.managedBlocks)) return false;
+    const managedBlocks = spec.managedBlocks as Record<string, unknown>;
+    if (managedBlocks["claude-code"] !== undefined
+      && !["CLAUDE.md", "CLAUDE.local.md"].includes(String(managedBlocks["claude-code"]))) return false;
+  }
+  if (spec.startup !== undefined && !isStoredStartupBlock(spec.startup)) return false;
+  if (spec.services !== undefined && !isStoredServices(spec.services)) return false;
+  if (spec.workspace !== undefined && !isStoredWorkspace(spec.workspace)) return false;
+  return spec.pods.every((pod) => {
+    if (pod === null || typeof pod !== "object" || Array.isArray(pod)) return false;
+    const candidate = pod as Record<string, unknown>;
+    if (typeof candidate.id !== "string" || typeof candidate.label !== "string"
+      || !Array.isArray(candidate.members) || candidate.members.length === 0) return false;
+    if (candidate.continuityPolicy !== undefined && !isStoredContinuityPolicy(candidate.continuityPolicy)) return false;
+    if (candidate.startup !== undefined && !isStoredStartupBlock(candidate.startup)) return false;
+    return candidate.members.every((member) => {
+      if (member === null || typeof member !== "object" || Array.isArray(member)) return false;
+      const entry = member as Record<string, unknown>;
+      return typeof entry.id === "string"
+        && typeof entry.agentRef === "string"
+        && typeof entry.profile === "string"
+        && typeof entry.runtime === "string"
+        && typeof entry.cwd === "string"
+        && (entry.label === undefined || typeof entry.label === "string")
+        && (entry.codexConfigProfile === undefined || typeof entry.codexConfigProfile === "string")
+        && (entry.model === undefined || typeof entry.model === "string")
+        && (entry.effort === undefined || typeof entry.effort === "string")
+        && (entry.role === undefined || typeof entry.role === "string")
+        && (entry.advisor === undefined || typeof entry.advisor === "string")
+        && (entry.claudeMcp === undefined || (entry.runtime === "claude-code" && entry.claudeMcp === "none"))
+        && (entry.agentFile === undefined || typeof entry.agentFile === "string")
+        && (entry.appendSystemPromptFile === undefined || typeof entry.appendSystemPromptFile === "string")
+        && (entry.pluginDirs === undefined
+          || (Array.isArray(entry.pluginDirs) && entry.pluginDirs.every((dir) => typeof dir === "string")))
+        && (entry.permissionPolicy === undefined || typeof entry.permissionPolicy === "string")
+        && (entry.env === undefined || isStringRecord(entry.env))
+        && (entry.restorePolicy === undefined || typeof entry.restorePolicy === "string")
+        && (entry.compactionStrategy === undefined || typeof entry.compactionStrategy === "string")
+        && (entry.mechanic === undefined || typeof entry.mechanic === "string")
+        && (entry.startup === undefined || isStoredStartupBlock(entry.startup))
+        && (entry.sessionSource === undefined || isStoredSessionSource(entry.sessionSource))
+        && (entry.starterRef === undefined
+          || (entry.starterRef !== null && typeof entry.starterRef === "object" && !Array.isArray(entry.starterRef)
+            && typeof (entry.starterRef as Record<string, unknown>).name === "string"));
+    });
+  });
+}
+
+/** A rig's own startup layers: its `culture_file` and rig `startup` block as declared, and the absolute root they resolve against.
+ *  `podStartupFiles` holds each pod's declared startup files by pod id, resolved against the same root; a seat added to an
+ *  existing pod inherits them. Files only: pod startup actions are not inherited. */
+export interface RigStartupLayers {
+  root: string;
+  cultureFile?: string;
+  startup?: StartupBlock;
+  podStartupFiles?: Record<string, StartupFile[]>;
+  /** Validated declarations for seats created without a first launch. One source per materialization. */
+  materializedSources?: Array<{ root: string; spec: import("./types.js").RigSpec; nodeIds: string[]; cwdOverride?: string }>;
+}
 
 /**
  * Free helper: returns the latest snapshot for a rig whose data carries non-null
@@ -81,10 +265,11 @@ export function findLatestUsableSnapshot(db: Database.Database, rigId: string): 
  * arch-D1.1 sibling-audit `snapshots(rig_id, created_at)` index candidate.
  */
 export function findLatestUsableSnapshotsForAllRigs(db: Database.Database): Map<string, Snapshot> {
+  // One latest-snapshot lookup per rig with snapshots (from the index), not one per snapshot row.
   const rows = db.prepare(`
-    SELECT s.* FROM snapshots s
-    WHERE s.id = (
-      SELECT s2.id FROM snapshots s2 WHERE s2.rig_id = s.rig_id
+    SELECT s.* FROM (SELECT DISTINCT rig_id FROM snapshots) r
+    JOIN snapshots s ON s.id = (
+      SELECT s2.id FROM snapshots s2 WHERE s2.rig_id = r.rig_id
       ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1
     )
   `).all() as SnapshotRow[];
@@ -124,9 +309,15 @@ interface NodeOptions {
   runtime?: string;
   model?: string;
   effort?: string;
+  advisor?: string;
   codexConfigProfile?: string;
   /** OPR.0.4.8.3 Seam B: per-seat permission_policy REF (builtin:<name> or spec-relative path). */
   permissionPolicy?: string;
+  claudePermissions?: import("./claude-permission-rules.js").ClaudePermissionRules;
+  /** A Claude seat's own subscription token file, by reference (spec `claude_token`). */
+  claudeTokenRef?: ClaudeSeatTokenRef;
+  claudeMcp?: ClaudeMcp;
+  codexPermissions?: import("./codex-member-permissions.js").CodexMemberPermissions;
   /** The member's declared launch environment (spec `env:`); not merged with the rig's. */
   env?: SeatEnv;
   cwd?: string;
@@ -142,6 +333,8 @@ interface NodeOptions {
   resolvedSpecName?: string;
   resolvedSpecVersion?: string;
   resolvedSpecHash?: string;
+  /** Validated pod-aware source used to rebuild a fresh launch after restart. */
+  launchRecipe?: NodeLaunchRecipe;
 }
 
 export class RigRepository {
@@ -233,13 +426,20 @@ export class RigRepository {
   }
 
   /** What a seat's process gets: its rig's `env:` with the member's own `env:` over it. A launch,
-   *  a restore and a handover successor all read this, so they cannot disagree. */
-  getEffectiveSeatEnv(nodeId: string): SeatEnv {
+   *  a restore and a handover successor all read this, so they cannot disagree. A CLAUDE_CONFIG_DIR or
+   *  CODEX_HOME that isn't an absolute path is left out: OpenRig reports it as ignored (seat-runtime-home.ts),
+   *  so the runtime resolves as if the seat declared none. */
+  getEffectiveSeatEnv(nodeId: string, ignoreAccountHome = false): SeatEnv {
     if (!this.hasNodeColumn("env_json")) return {};
     const row = this.db.prepare("SELECT rig_id, env_json FROM nodes WHERE id = ?")
       .get(nodeId) as { rig_id: string; env_json: string | null } | undefined;
     if (!row) return {};
-    return mergeSeatEnv(this.getRigEnv(row.rig_id), parseStoredSeatEnv(row.env_json));
+    const env = withoutIgnoredRuntimeHomes(mergeSeatEnv(this.getRigEnv(row.rig_id), parseStoredSeatEnv(row.env_json)));
+    for (const runtime of ignoreAccountHome ? [] : ["codex", "claude-code"] as const) {
+      const accountHome = seatAccountHome(this.db, nodeId, runtime);
+      if (accountHome) env[RUNTIME_HOME_VAR[runtime]] = accountHome;
+    }
+    return env;
   }
 
   /** OPR.0.4.8.3 Seam B — persist a rig's attached permission_policy REF (builtin:<name> or a
@@ -264,6 +464,27 @@ export class RigRepository {
     if (!this.hasRigColumn("claude_managed_block_file")) return;
     this.db.prepare("UPDATE rigs SET claude_managed_block_file = ?, updated_at = ? WHERE id = ?")
       .run(file ?? null, new Date().toISOString(), rigId);
+  }
+
+  /** The rig's `culture_file` and rig `startup` block as its spec declared them, and the absolute root their paths
+   *  resolve against (migration 121). A seat added to the rig later reads them back. Null when neither was declared. */
+  setRigStartupLayers(rigId: string, layers: RigStartupLayers | null): void {
+    if (!this.hasRigColumn("startup_layers_json")) return;
+    this.db.prepare("UPDATE rigs SET startup_layers_json = ?, updated_at = ? WHERE id = ?")
+      .run(layers ? JSON.stringify(layers) : null, new Date().toISOString(), rigId);
+  }
+
+  getRigStartupLayers(rigId: string): RigStartupLayers | null {
+    if (!this.hasRigColumn("startup_layers_json")) return null;
+    const row = this.db.prepare("SELECT startup_layers_json FROM rigs WHERE id = ?")
+      .get(rigId) as { startup_layers_json: string | null } | undefined;
+    if (!row?.startup_layers_json) return null;
+    try {
+      const parsed = JSON.parse(row.startup_layers_json) as Partial<RigStartupLayers>;
+      return typeof parsed.root === "string" ? parsed as RigStartupLayers : null;
+    } catch {
+      return null;
+    }
   }
 
   /** #25 — the rig's selected Claude managed-block file, or null when it uses the default. */
@@ -392,6 +613,30 @@ export class RigRepository {
   }
 
   addNode(rigId: string, logicalId: string, opts?: NodeOptions): Node {
+    if (opts?.claudeMcp !== undefined) {
+      if (opts.runtime !== "claude-code") throw new Error("claude_mcp requires a claude-code seat");
+      validateClaudeMcp(opts.claudeMcp);
+      if (!this.db.inTransaction) return this.db.transaction(() => this.addNode(rigId, logicalId, opts))();
+    }
+    if (opts?.claudePermissions !== undefined) {
+      if (opts.runtime !== "claude-code") throw new Error("claude_permissions requires a claude-code seat");
+      validateClaudePermissionRules(opts.claudePermissions);
+      // Required rule persistence is atomic with creation, including direct repository callers.
+      if (!this.db.inTransaction) return this.db.transaction(() => this.addNode(rigId, logicalId, opts))();
+    }
+    if (opts?.codexPermissions !== undefined) {
+      if (opts.runtime !== "codex") throw new Error("codex_permissions requires a codex seat");
+      validateCodexMemberPermissions(opts.codexPermissions);
+      // The envelope is written atomically with creation, including direct repository callers.
+      if (!this.db.inTransaction) return this.db.transaction(() => this.addNode(rigId, logicalId, opts))();
+    }
+    if (opts?.claudeTokenRef !== undefined) {
+      if (opts.runtime !== "claude-code") throw new Error("claude_token requires a claude-code seat");
+      const problem = claudeSeatTokenRefProblem(opts.claudeTokenRef);
+      if (problem) throw new Error(`claude_token: ${problem}`);
+      // The reference is written atomically with creation, including direct repository callers.
+      if (!this.db.inTransaction) return this.db.transaction(() => this.addNode(rigId, logicalId, opts))();
+    }
     // Same-rig guard for podId
     if (opts?.podId) {
       const pod = this.db.prepare("SELECT rig_id FROM pods WHERE id = ?").get(opts.podId) as { rig_id: string } | undefined;
@@ -488,6 +733,22 @@ export class RigRepository {
         );
     }
 
+    if (opts?.claudeTokenRef !== undefined && !this.setNodeClaudeTokenRef(id, opts.claudeTokenRef)) {
+      throw new Error("claude_token needs the current database schema; the seat wasn't created");
+    }
+
+    if (opts?.claudePermissions !== undefined) {
+      if (opts.runtime !== "claude-code") throw new Error("claude_permissions requires a claude-code seat");
+      this.db.prepare("UPDATE nodes SET claude_permissions_json = ? WHERE id = ?")
+        .run(JSON.stringify(validateClaudePermissionRules(opts.claudePermissions)), id);
+    }
+
+    if (opts?.codexPermissions !== undefined) {
+      if (opts.runtime !== "codex") throw new Error("codex_permissions requires a codex seat");
+      this.db.prepare("UPDATE nodes SET codex_permissions_json = ? WHERE id = ?")
+        .run(JSON.stringify(validateCodexMemberPermissions(opts.codexPermissions)), id);
+    }
+
     if (opts?.sessionSource && this.hasNodeColumn("session_source_json")) {
       this.db.prepare("UPDATE nodes SET session_source_json = ? WHERE id = ?")
         .run(JSON.stringify(opts.sessionSource), id);
@@ -497,15 +758,38 @@ export class RigRepository {
       this.db.prepare("UPDATE nodes SET effort = ? WHERE id = ?")
         .run(opts.effort, id);
     }
+    if (opts?.advisor) this.setNodeAdvisor(id, opts.advisor);
+    if (opts?.claudeMcp !== undefined) this.setNodeClaudeMcp(id, opts.claudeMcp);
 
     if (opts?.env && this.hasNodeColumn("env_json")) {
       this.db.prepare("UPDATE nodes SET env_json = ? WHERE id = ?")
         .run(JSON.stringify(opts.env), id);
     }
 
+    if (opts?.launchRecipe && this.hasNodeColumn("launch_recipe_json")) {
+      this.db.prepare("UPDATE nodes SET launch_recipe_json = ? WHERE id = ?")
+        .run(JSON.stringify(opts.launchRecipe), id);
+    }
+
     return this.rowToNode(
       this.db.prepare("SELECT * FROM nodes WHERE id = ?").get(id) as NodeRow
     );
+  }
+
+  /** Return the durable source for rebuilding a pod-aware seat, if available. */
+  getNodeLaunchRecipe(nodeId: string): NodeLaunchRecipe | null {
+    if (!this.hasNodeColumn("launch_recipe_json")) return null;
+    const row = this.db.prepare("SELECT launch_recipe_json FROM nodes WHERE id = ?").get(nodeId) as
+      { launch_recipe_json?: string | null } | undefined;
+    if (!row?.launch_recipe_json) return null;
+    try {
+      const recipe = JSON.parse(row.launch_recipe_json) as Partial<NodeLaunchRecipe>;
+      if (recipe.version !== 1 || typeof recipe.rigRoot !== "string" || !recipe.rigSpec) return null;
+      if (!isStoredRigSpec(recipe.rigSpec)) return null;
+      return recipe as NodeLaunchRecipe;
+    } catch {
+      return null;
+    }
   }
 
   /** S5 (OPR.0.5.4.7) — the first supported nodes.model write (the inventory was insert-only;
@@ -549,17 +833,48 @@ export class RigRepository {
     return result.changes > 0;
   }
 
+  /** A Claude seat's own subscription credential, by reference only; null clears it. */
+  setNodeClaudeTokenRef(nodeId: string, ref: ClaudeSeatTokenRef | null): boolean {
+    if (!this.hasNodeColumn("claude_token_ref")) return false;
+    return this.db.prepare("UPDATE nodes SET claude_token_ref = ? WHERE id = ?")
+      .run(ref ? JSON.stringify({ label: ref.label, tokenFile: ref.tokenFile, ...(ref.kind ? { kind: ref.kind } : {}) }) : null, nodeId).changes > 0;
+  }
+
+  /** Persist the resolved Advisor; null removes a previous spec's selection. */
+  setNodeClaudeMcp(nodeId: string, value: ClaudeMcp | null): boolean {
+    if (value !== null) validateClaudeMcp(value);
+    if (!this.hasNodeColumn("claude_mcp")) {
+      if (value !== null) throw new Error("Cannot persist claude_mcp: database migration is required");
+      return false;
+    }
+    return this.db.prepare("UPDATE nodes SET claude_mcp = ? WHERE id = ?").run(value, nodeId).changes > 0;
+  }
+
+  setNodeAdvisor(nodeId: string, advisor: string | null): boolean {
+    if (!this.hasNodeColumn("advisor")) return false;
+    return this.db.prepare("UPDATE nodes SET advisor = ? WHERE id = ?")
+      .run(advisor, nodeId).changes > 0;
+  }
+
   addEdge(rigId: string, sourceId: string, targetId: string, kind: string): Edge {
     const id = ulid();
-    this.db
-      .prepare(
-        "INSERT INTO edges (id, rig_id, source_id, target_id, kind) VALUES (?, ?, ?, ?, ?)"
-      )
-      .run(id, rigId, sourceId, targetId, kind);
+    const targetRef = kind === "escalates_to" && isEscalationTargetRef(targetId) ? targetId : null;
+    if (targetRef) {
+      this.db.prepare("INSERT INTO edges (id, rig_id, source_id, target_ref, kind) VALUES (?, ?, ?, ?, ?)")
+        .run(id, rigId, sourceId, targetRef, kind);
+    } else {
+      this.db.prepare("INSERT INTO edges (id, rig_id, source_id, target_id, kind) VALUES (?, ?, ?, ?, ?)")
+        .run(id, rigId, sourceId, targetId, kind);
+    }
 
     return this.rowToEdge(
       this.db.prepare("SELECT * FROM edges WHERE id = ?").get(id) as EdgeRow
     );
+  }
+
+  /** Removes exactly one edge row within the target rig; true when it existed. */
+  removeEdge(rigId: string, edgeId: string): boolean {
+    return this.db.prepare("DELETE FROM edges WHERE rig_id = ? AND id = ?").run(rigId, edgeId).changes > 0;
   }
 
   getRig(rigId: string): RigWithRelations | null {
@@ -791,8 +1106,12 @@ export class RigRepository {
       runtime: row.runtime,
       model: row.model,
       effort: row.effort ?? null,
+      advisor: row.advisor ?? null,
+      claudeMcp: row.claude_mcp ?? null,
       effortChoice: row.effort_choice ?? null,
       codexConfigProfile: row.codex_config_profile ?? null,
+      claudeTokenRef: parseClaudeSeatTokenRef(row.claude_token_ref),
+      ...(row.account_home ? { accountHome: row.account_home } : {}),
       permissionPolicy: row.permission_policy ?? null,
       env: parseStoredSeatEnv(row.env_json),
       cwd: row.cwd,
@@ -824,7 +1143,8 @@ export class RigRepository {
       id: row.id,
       rigId: row.rig_id,
       sourceId: row.source_id,
-      targetId: row.target_id,
+      targetId: row.target_ref ?? row.target_id!,
+      ...(row.target_ref ? { targetRef: row.target_ref } : {}),
       kind: row.kind,
       createdAt: row.created_at,
     };
@@ -882,10 +1202,14 @@ interface NodeRow {
   runtime: string | null;
   model: string | null;
   effort?: string | null;
+  advisor?: string | null;
+  claude_mcp?: ClaudeMcp | null;
   effort_choice?: string | null;
   codex_config_profile?: string | null;
+  claude_token_ref?: string | null;
   permission_policy?: string | null;
   env_json?: string | null;
+  account_home?: string | null;
   cwd: string | null;
   surface_hint: string | null;
   workspace: string | null;
@@ -896,6 +1220,7 @@ interface NodeRow {
   profile: string | null;
   label: string | null;
   session_source_json?: string | null;
+  launch_recipe_json?: string | null;
   resolved_spec_name: string | null;
   resolved_spec_version: string | null;
   resolved_spec_hash: string | null;
@@ -911,7 +1236,8 @@ interface EdgeRow {
   id: string;
   rig_id: string;
   source_id: string;
-  target_id: string;
+  target_id: string | null;
+  target_ref?: string | null;
   kind: string;
   created_at: string;
 }

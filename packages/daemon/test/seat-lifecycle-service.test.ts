@@ -12,6 +12,7 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { NodeLauncher } from "../src/domain/node-launcher.js";
 import { TmuxAdapter, type TmuxResult } from "../src/adapters/tmux.js";
 import { SeatLifecycleService } from "../src/domain/seat-lifecycle-service.js";
+import type { StartupOrchestrator } from "../src/domain/startup-orchestrator.js";
 import { PsProjectionService } from "../src/domain/ps-projection.js";
 import { getNodeInventory } from "../src/domain/node-inventory.js";
 
@@ -665,5 +666,68 @@ describe("SeatLifecycleService", () => {
       // Session untouched.
       expect((db.prepare("SELECT status FROM sessions WHERE id = ?").get(seat.session.id) as { status: string }).status).toBe("running");
     });
+  });
+});
+
+describe("fresh launch startup context for a hand-added seat", () => {
+  let db: Database.Database;
+  let rigRepo: RigRepository;
+  let sessionRegistry: SessionRegistry;
+  let eventBus: EventBus;
+  let service: SeatLifecycleService;
+
+  beforeEach(() => {
+    db = createFullTestDb();
+    rigRepo = new RigRepository(db);
+    sessionRegistry = new SessionRegistry(db);
+    eventBus = new EventBus(db);
+    service = new SeatLifecycleService({
+      db,
+      rigRepo,
+      sessionRegistry,
+      eventBus,
+      tmuxAdapter: fakeTmux().adapter,
+      nodeLauncher: {} as NodeLauncher,
+      startupOrchestrator: {} as StartupOrchestrator,
+    });
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  /** Insert the persisted startup row the way the orchestrator writes it on a real start. */
+  function persistContext(nodeId: string) {
+    db.prepare(
+      "INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, ?, ?, ?)",
+    ).run(nodeId, "[]", JSON.stringify([{ absolutePath: "/shared/role.md", required: true, appliesOn: ["fresh_start"] }]), "[]", "jcode");
+  }
+
+  it("reuses a same-role sibling's startup context instead of refusing", async () => {
+    const rig = rigRepo.createRig("hull-test");
+    const sibling = rigRepo.addNode(rig.id, "core.impl-2", { runtime: "jcode", cwd: "/wt/impl-2", model: "gpt-6-luna" });
+    const handAdded = rigRepo.addNode(rig.id, "core.impl-3", { runtime: "jcode", cwd: "/wt/impl-3", model: "gpt-6-luna" });
+    db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-core", rig.id, "core");
+    db.prepare("UPDATE nodes SET agent_ref = ?, pod_id = ? WHERE id IN (?, ?)")
+      .run("path:/agents/implementer", "pod-core", sibling.id, handAdded.id);
+    persistContext(sibling.id);
+    const siblingBefore = db.prepare("SELECT * FROM node_startup_context WHERE node_id = ?").get(sibling.id);
+
+    const plan = await service.planFresh({ seatRef: "core-impl-3@hull-test", fresh: true });
+
+    expect(JSON.stringify(plan)).not.toContain("startup_context_missing");
+    expect(db.prepare("SELECT * FROM node_startup_context WHERE node_id = ?").get(sibling.id)).toEqual(siblingBefore);
+    expect(db.prepare("SELECT 1 FROM node_startup_context WHERE node_id = ?").get(handAdded.id)).toBeUndefined();
+  });
+
+  it("still refuses when no same-role sibling has a startup row", async () => {
+    const rig = rigRepo.createRig("hull-test-2");
+    const lone = rigRepo.addNode(rig.id, "core.impl-9", { runtime: "jcode", cwd: "/wt/impl-9", model: "gpt-6-luna" });
+    db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-x", rig.id, "x");
+    db.prepare("UPDATE nodes SET agent_ref = ?, pod_id = ? WHERE id = ?").run("path:/agents/implementer", "pod-x", lone.id);
+
+    const plan = await service.planFresh({ seatRef: "core-impl-9@hull-test-2", fresh: true });
+
+    expect(JSON.stringify(plan)).toContain("startup_context_missing");
   });
 });

@@ -16,7 +16,7 @@ without spelunking through `packages/daemon/specs/`.
 | `_canonical/` | The mirrored skills, organized by category (`core/`, `pm/`, `pods/`, `process/`) plus a few uncategorized at the root. Do not edit files here directly — see "Authoring" below. |
 | `rigs/` | The `rigs` skill: a route into OpenRig for an ordinary Claude Code or Codex session. It isn't mirrored; see "Using these skills". |
 | `CHANGELOG.md` | Append-only log of skill changes per curation cycle close. Hand-authored. |
-| `LICENSE` | Apache-2.0, matching the parent project. |
+| `LICENSE` | OpenRig's Apache-2.0 license. Vendored skill folders include their upstream `LICENSE.txt` files. |
 
 ## What a skill is
 
@@ -68,8 +68,8 @@ generated copy; edit the home and re-run the script before commit.
 
 A home must already be publishable: the script refuses to regenerate when a
 home holds text or files that the public copies would drop, such as an
-internal fence, a frontmatter key listed in
-`scripts/internal-tokens.generated.json`, a `feedback.md`, or an `evals/`
+internal fence, a frontmatter key the publishing rules drop
+(`scripts/leak-guard-rules.mjs`), a `feedback.md`, or an `evals/`
 folder. A skill change from anywhere else comes in as a normal pull request
 that edits its home.
 

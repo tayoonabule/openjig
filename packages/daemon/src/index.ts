@@ -11,6 +11,7 @@ import { removeParentSessionEnv } from "./domain/parent-session-env.js";
 import { resolveBindPlan } from "./domain/bind-plan.js";
 import { runQueueRetentionSweep, RETENTION_DEFAULTS } from "./domain/queue-retention.js";
 import { startLeadCompletionNotice, leadCompletionNoticeEnabled } from "./domain/lead-completion-notice.js";
+import { startQueueEmptyFrontierNotice, queueEmptyFrontierNoticeEnabled } from "./domain/queue-empty-frontier-notice.js";
 import {
   createStuckSweepStatus,
   resolveStuckSweepIntervalSeconds,
@@ -139,6 +140,8 @@ export function startQueueRetentionScheduler(deps: {
       watchdogRetentionDays: num("retention.watchdog_days", RETENTION_DEFAULTS.watchdogRetentionDays),
       watchdogKeepPerJob: num("retention.watchdog_keep_per_job", RETENTION_DEFAULTS.watchdogKeepPerJob),
       usageSamplesRetentionDays: num("retention.usage_samples_days", RETENTION_DEFAULTS.usageSamplesRetentionDays),
+      streamRetentionDays: num("retention.stream_days", RETENTION_DEFAULTS.streamRetentionDays),
+      streamMaxItems: num("retention.stream_max_items", RETENTION_DEFAULTS.streamMaxItems),
       batchSize: num("retention.batch_size", RETENTION_DEFAULTS.batchSize),
     }).catch((err: unknown) => {
       console.error(`[queue-retention] sweep error: ${err instanceof Error ? err.message : String(err)}`);
@@ -219,7 +222,10 @@ export function startWakeLadderScheduler(deps: {
       readPromptState: makePromptStateReader({
         db,
         getSeatState: (nodeId) => deps.seatActivityService?.getSeatState(nodeId),
-        getLatestHook: (sessionName) => deps.agentActivityStore?.getLatestForNode({ sessionName }),
+        getLatestHook: (sessionName, runtime) => deps.agentActivityStore?.getLatestForNode({
+          sessionName,
+          order: runtime === "claude-code" ? "source" : "arrival",
+        }),
       }),
       ...(deps.providerService
         ? { getProviderReadModel: () => deps.providerService!.getReadModel() }
@@ -271,8 +277,8 @@ export async function startServer(port?: number) {
   // The overloaded routing env (OPENRIG_HOST/RIGGED_HOST) is observed for the
   // provenance line below and NEVER selects the bind branch: a managed environment's
   // injected endpoint is byte-indistinguishable from opt-in, and the parent daemon
-  // silently lost its Tailscale listener to exactly that (operator baton
-  // qitem-20260827070400). The auth-bearer-tailscale-trust ruling rides the new
+  // silently lost its Tailscale listener to exactly that (operator baton).
+  // The auth-bearer-tailscale-trust ruling rides the new
   // surface unchanged.
   const bindPlan = resolveBindPlan({
     bindHostEnv: process.env.OPENRIG_BIND_HOST,
@@ -308,7 +314,7 @@ export async function startServer(port?: number) {
 
   // The fresh-DB Codex probe runs inside createDaemon, before the shutdown handlers below exist.
   const disarmStartupSignals = endProbeGroupsOnStartupSignal();
-  const { app, contextMonitor, deps, eventLoopMonitor, injectWebSocket } = await createDaemon({
+  const { app, contextMonitor, deps, eventLoopMonitor, injectWebSocket, wakeRecovery } = await createDaemon({
     dbPath,
     bearerToken,
     terminalBearerToken,
@@ -325,6 +331,7 @@ export async function startServer(port?: number) {
   let retentionTimer: ReturnType<typeof setInterval> | null = null;
   let stuckSweepTimer: ReturnType<typeof setInterval> | null = null;
   let stopLeadNotice: (() => void) | null = null;
+  let stopEmptyFrontierNotice: (() => void) | null = null;
   let wakeLadderScheduler: WakeLadderScheduler | null = null;
   // P7 — lifecycle heartbeat: advance last-seen every tick while running.
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -335,6 +342,8 @@ export async function startServer(port?: number) {
       if (!monitorsStarted) {
         monitorsStarted = true;
         contextMonitor.start();
+        // Recovered queue notifications are seat deliveries: they run once listening, never before readiness.
+        wakeRecovery.start();
         // PL-004 Phase C: start watchdog scheduler. Joins the supervision
         // tree post-bind so the HTTP surface is ready before the first
         // tick (matches contextMonitor pattern).
@@ -367,6 +376,10 @@ export async function startServer(port?: number) {
         if (leadCompletionNoticeEnabled() && deps.queueRepo && deps.seatActivityService && deps.eventBus) {
           stopLeadNotice = startLeadCompletionNotice({ db: deps.rigRepo.db, eventBus: deps.eventBus, queueRepo: deps.queueRepo, seatActivity: deps.seatActivityService, contentChangedAtMs: (n: string) => deps.seatActivityService?.getContentChangedAtMs(n) ?? null });
         }
+        // Opt-in event-driven cue for an idle seat with no actionable successor after explicit no-follow-on.
+        if (queueEmptyFrontierNoticeEnabled() && deps.queueRepo && deps.seatActivityService && deps.eventBus) {
+          stopEmptyFrontierNotice = startQueueEmptyFrontierNotice({ db: deps.rigRepo.db, eventBus: deps.eventBus, queueRepo: deps.queueRepo, seatActivity: deps.seatActivityService });
+        }
         // S01 — wake-or-escalate on batons: a failed baton wake retries on schedule,
         // then escalates through recorded rungs; never a silent park.
         wakeLadderScheduler = startWakeLadderScheduler(deps);
@@ -394,12 +407,16 @@ export async function startServer(port?: number) {
   const shutdown = createDaemonShutdown({
     receiptPath: path.join(OPENRIG_HOME, DAEMON_SHUTDOWN_RECEIPT),
     phases: [
+      // First, while transport still works: let the delivery in flight finish; the rest wait for the next start.
+      ["wake-recovery", () => wakeRecovery.stop()],
+      ["terminal-following", () => deps.terminalService?.stop()],
       ["timers", () => {
         deps.resumeMetadataRefresher?.stop();
         if (heartbeatTimer) clearInterval(heartbeatTimer);
         if (retentionTimer) clearInterval(retentionTimer);
         if (stuckSweepTimer) clearInterval(stuckSweepTimer);
         if (stopLeadNotice) stopLeadNotice();
+        if (stopEmptyFrontierNotice) stopEmptyFrontierNotice();
       }],
       ["runtime-probes", () => stopRuntimeProbes()],
       ["proof-source-watch", () => deps.proofSourceWatch?.close()],
@@ -410,7 +427,10 @@ export async function startServer(port?: number) {
       ["seat-structural-activity", () => deps.seatStructuralActivityService?.stop()],
       ["seat-identity", () => deps.seatIdentityReconciler?.stop()],
       ["herdr-managed-views", () => deps.managedHerdrViews?.dispose()],
-      ["herdr-agent-bridge", () => deps.herdrAgentBridge?.dispose()],
+      ["herdr-agent-bridge", () => {
+        const bridges = deps.herdrAgentBridges ?? (deps.herdrAgentBridge ? [deps.herdrAgentBridge] : []);
+        for (const bridge of bridges) bridge.dispose();
+      }],
       ["periodic-snapshot", () => deps.periodicSnapshotScheduler?.stop()],
       ["gateway", () => deps.gatewaySubsystem?.stop()],
       ["wake-ladder", () => wakeLadderScheduler?.stop()],

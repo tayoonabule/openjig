@@ -66,6 +66,11 @@ describe("Transcript CLI", () => {
         res.writeHead(200, { "Content-Type": "application/json" });
         const many = Array.from({ length: 12 }, (_, i) => `content line ${i}`).join("\n");
         res.end(JSON.stringify({ session: "dev-impl@thick-rig", lines: 12, content: many }));
+      } else if (url.startsWith("/api/transcripts/dev-impl@long-rig/tail")) {
+        // A long transcript: the tail route returns the last `lines` lines it was asked for.
+        const lines = Number(new URL(url, "http://x").searchParams.get("lines"));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ content: Array.from({ length: lines }, (_, i) => `long line ${i}`).join("\n") + "\n" }));
       } else if (url.startsWith("/api/transcripts/dev-impl@paragraph-rig/tail")) {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ content: "\n# Result\n\nFirst paragraph.\n\n\nSecond paragraph.\n```python\nx = 1\n\nprint(x)\n```\nDone.\n" }));
@@ -128,6 +133,24 @@ describe("Transcript CLI", () => {
     expect(output).not.toContain("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN");
   });
 
+  it("a small --tail of a long transcript does NOT emit the renderer note", async () => {
+    for (const tail of ["5", "3", "1"]) {
+      const { logs } = await captureLogs(async () => {
+        await makeCmd().parseAsync(["node", "rig", "transcript", "dev-impl@long-rig", "--tail", tail]);
+      });
+      const output = logs.join("\n");
+      expect(output).toContain("long line 0");
+      expect(output).not.toContain("line(s) captured");
+    }
+  });
+
+  it("a thin transcript read with the default tail still emits the renderer note", async () => {
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "transcript", "dev-impl@my-rig"]);
+    });
+    expect(logs.join("\n")).toContain("only 3 line(s) captured");
+  });
+
   it("--grep prints matching lines", async () => {
     const { logs } = await captureLogs(async () => {
       await makeCmd().parseAsync(["node", "rig", "transcript", "dev-impl@my-rig", "--grep", "decision"]);
@@ -164,5 +187,18 @@ describe("Transcript CLI", () => {
     const output = logs.join("\n");
     // grep mode: should show matched lines, not tail content
     expect(output).toContain("decision made");
+  });
+
+  it("sends exactly 50 lines for non-positive --tail values", async () => {
+    for (const tail of ["0", "-1"]) {
+      const { logs } = await captureLogs(async () => {
+        await makeCmd().parseAsync(["node", "rig", "transcript", "dev-impl@long-rig", `--tail=${tail}`]);
+      });
+      // The fixture generates exactly as many lines as the request asks for:
+      // line 49 present and line 50 absent pins the wire value at lines=50.
+      const output = logs.join("\n");
+      expect(output).toContain("long line 49");
+      expect(output).not.toContain("long line 50");
+    }
   });
 });

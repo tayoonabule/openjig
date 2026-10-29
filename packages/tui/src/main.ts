@@ -13,7 +13,7 @@ import { parseCommand } from "./grammar.js";
 import { filterPalette, paletteExecuteLine } from "./commands/palette.js";
 import { COMMAND_REGISTRY, currentCommandContext } from "./commands/registry.js";
 import { createInputDecoder, resolveEscapeAction, resolveKeyAction, resolveMouseAction, MOUSE_ENABLE, MOUSE_DISABLE, ALT_SCREEN_ON, ALT_SCREEN_OFF, PASTE_ENABLE, PASTE_DISABLE } from "./input.js";
-import { renderScreen } from "./render.js";
+import { drawableSize, renderScreen } from "./render.js";
 import { createStyle, detectColorMode } from "./theme.js";
 import { stylizeLines } from "./stylize.js";
 import { createControlSocket, defaultSocketPath } from "./socket-server.js";
@@ -23,6 +23,7 @@ import { hydrateSnapshot } from "./hydrate.js";
 import { createLiveRefresh } from "./live.js";
 import { resolvePendingAddress } from "./pending-address.js";
 import { subscribeActivityEvents } from "./live-events.js";
+import { checkVersionSkew, parseCliIdentity } from "./version-skew.js";
 import { execFile } from "node:child_process";
 import { helperCwd } from "./helper-cwd.js";
 import { probeCrashCart, type CrashCartRenderOpts } from "./crash-cart/from-emit.js";
@@ -32,6 +33,8 @@ import { restoreKeyAction, type RestoreInputEvent } from "./crash-cart/restore-i
 import { evaluateOneClickGate, restoreConfirmMessage } from "./crash-cart/one-click-gate.js";
 import { daemonStartArgs } from "./crash-cart/start-daemon.js";
 import { readLocal } from "./local-reading.js";
+import { replyAct, opensOnDefaultFeed, actingAs, answerRequest } from "./attention/attention-model.js";
+import type { AttentionRead } from "@openrig/daemon/attention";
 import { StartupController } from "./startup.js";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -141,11 +144,47 @@ async function run(): Promise<void> {
   let drawnSettled = false;
   let previousPage: { state: ReturnType<typeof view.get>; snapshot: FleetSnapshot } | undefined;
   let activityEvents: ReturnType<typeof subscribeActivityEvents> | null = null;
+  // A daemon upgraded or restarted under this TUI: on the first connect and every reconnect, compare
+  // builds; on a mismatch stop the background reads (event-driven and quiet) until the TUI restarts.
+  const tuiBuild = parseCliIdentity(process.env["OPENRIG_TUI_CLI_IDENTITY"]);
+  let buildMismatch = false;
+  let eventsDropped = false;
+  function checkDaemonBuild(attempt = 0): void {
+    if (!live || !client || buildMismatch) return;
+    void checkVersionSkew(tuiBuild, () => client.health()).then((skew) => {
+      // A loaded daemon can time out a /healthz read; retry twice before waiting for the next reconnect.
+      if (skew.state === "unreadable" && attempt < 2) { setTimeout(() => checkDaemonBuild(attempt + 1), 15_000).unref(); return; }
+      if (skew.state !== "mismatch" || buildMismatch) return;
+      buildMismatch = true;
+      activityEvents?.close();
+      live.stopBackground(skew.message);
+    });
+  }
   function enableLive(): boolean {
     if (!live || !client || startup?.state.connection !== "up") return false;
+    if (!liveEnabled) checkDaemonBuild();
+    if (!liveEnabled) openChosenDefaultFeed();
     liveEnabled = true;
-    activityEvents ??= subscribeActivityEvents({ open: () => client.openActivityEvents(), onEvent: (event) => { if (event.type.startsWith("proof.")) reviewCache.clear(); void live.invalidate(); }, onStatus: (status) => live.connectionStatus(status) });
+    if (!buildMismatch) activityEvents ??= subscribeActivityEvents({ open: () => client.openActivityEvents(), onEvent: (event) => { if (event.type.startsWith("proof.")) reviewCache.clear(); live.pushed(); }, onStatus: (status) => {
+      if (status === "dropped") eventsDropped = true;
+      else if (status === "connected" && eventsDropped) { eventsDropped = false; checkDaemonBuild(); }
+      live.connectionStatus(status);
+    } });
     return true;
+  }
+  // Once, when the TUI first reaches the daemon, whichever startup path gets there: the chosen default person's Feed opens
+  // first, only for someone who hasn't touched anything since the TUI started (see opensOnDefaultFeed).
+  let defaultFeedChecked = false;
+  function openChosenDefaultFeed(): void {
+    if (defaultFeedChecked || !client) return;
+    defaultFeedChecked = true;
+    if (inputRevision !== 0) return;
+    void client.humanAttention(null, "default").then((read) => {
+      if (!opensOnDefaultFeed(read as AttentionRead | null, view.get(), inputRevision === 0)) return;
+      view.dispatch({ type: "jump", section: "needs" });
+      draw();
+      void live?.refresh();
+    }, () => {});
   }
   function commandContext() {
     return currentCommandContext(startup && startup.state.connection !== "up" ? "unverified" : crashCartOpts.daemonState ?? null);
@@ -153,8 +192,11 @@ async function run(): Promise<void> {
 
   function draw(): void {
     if (nativeAttached) return;
-    const cols = process.stdout.columns ?? 120;
-    const rows = process.stdout.rows ?? 32;
+    // A terminal reporting 0 rows or columns has nothing to draw into: skip the frame (the view keeps its state) and
+    // let the next resize draw.
+    const size = drawableSize(process.stdout.columns, process.stdout.rows);
+    if (!size) return;
+    const { cols, rows } = size;
     const nowMs = Date.now();
     if (live) {
       const next = live.snapshot();
@@ -191,9 +233,9 @@ async function run(): Promise<void> {
     // openjig: repaint only changed lines inside synchronized output, so the
     // blinking command cursor does not erase and flash every static line.
     const paint = stylizeLines(lastScreen, style);
-    const size = `${process.stdout.columns}x${process.stdout.rows}`;
-    const full = paint.length !== paintedLines.length || size !== paintedSize;
-    paintedSize = size;
+    const terminalSize = `${process.stdout.columns}x${process.stdout.rows}`;
+    const full = paint.length !== paintedLines.length || terminalSize !== paintedSize;
+    paintedSize = terminalSize;
     const out = paint.map((l, i) => (full || l !== paintedLines[i] ? `\x1b[${i + 1};1H\x1b[2K${l}` : "")).join("");
     paintedLines = paint;
     if (out) process.stdout.write("\x1b[?2026h\x1b[?7l" + out + "\x1b[?7h\x1b[?2026l");
@@ -428,6 +470,14 @@ async function run(): Promise<void> {
       } else if (action.act === "run") {
         const result = await client.launchNode(action.rigId, action.agent);
         view.dispatch({ type: "notice", message: launchNodeNotice(action.agent, result) });
+      } else if (action.act === "answer") {
+        const result = await client.missionControlAction(answerRequest(action));
+        const actor = actingAs(snapshot.attentionRead, action.actorSession);
+        view.dispatch({ type: "notice", message: action.verb === "resolve" ? `Resolved ${action.qitemId} as ${actor}: it's unparked for its owner, with your decision.`
+          : action.verb === "approve"
+          ? `Approved ${action.qitemId} as ${actor}: the request is closed on its own row.`
+          : result.answer?.message ?? (result.answer?.outcome === "recorded" ? `Recorded on ${action.qitemId}. Still to answer: ${result.answer.unanswered.join("; ")}`
+          : `Answered ${action.qitemId} as ${actor}: the answer went back to the asker, and the request is closed.`) });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -465,6 +515,10 @@ async function run(): Promise<void> {
           notice: message => view.dispatch({ type: "notice", message }), draw,
         }).catch(error => view.dispatch({ type: "notice", message: String(error) }));
       } catch (err) { view.dispatch({ type: "notice", message: (err as Error).message }); }
+      return;
+    }
+    if (action.type === "attention-reply") {
+      perform(replyAct(snapshot.attentionRead, view.get().attentionOpen, action.text));
       return;
     }
     if (action.type === "act") {
@@ -750,8 +804,9 @@ async function run(): Promise<void> {
   draw();
   // Probe the daemon-down verdict once on launch: bare `rig` with the daemon down renders the cockpit.
   // (Key-triggered re-probe after `s start daemon` / `r retry` is the follow-on increment.)
+  // --demo renders its labeled fixture without a daemon, so it never probes for one.
   if (startup) void startup.refresh();
-  else void refreshCrashCart();
+  else if (!demo) void refreshCrashCart();
   // A merely-open TUI must impose no steady-state fleet load. The initial
   // hydrate establishes honest state; navigation, commands, and socket-driven
   // mutations request later truth through the same single-flight owner.

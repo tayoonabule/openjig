@@ -7,6 +7,7 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
+import { SeatLaunchEnvironment } from "../src/domain/seat-launch-environment.js";
 import { ClaudeManagedLaunch } from "../src/domain/claude-managed-launch.js";
 import { StartupOrchestrator } from "../src/domain/startup-orchestrator.js";
 import type { SessionRegistry } from "../src/domain/session-registry.js";
@@ -69,16 +70,71 @@ console.log(JSON.stringify({env:{HOME:process.env.HOME,CLAUDE_CONFIG_DIR:dir}, s
     writeFile: (p, text) => { writes.push(p); fs.writeFileSync(p, text); },
     copyFile: fs.copyFileSync, readdir: p => fs.readdirSync(p),
   };
-  const tmux = { sendShellCommand: async (_target: string, command: string, check: () => void) => {
-    check(); launches.push(JSON.parse(execFileSync("/bin/sh", ["-c", command], { encoding: "utf8", env: { HOME: daemonHome, PATH: "/usr/bin:/bin" } })));
+  const tmux = { sendShellCommand: async (_target: string, command: string, check?: () => void) => {
+    check?.(); launches.push(JSON.parse(execFileSync("/bin/sh", ["-c", command], { encoding: "utf8", env: { HOME: daemonHome, PATH: `${bin}:/usr/bin:/bin` } })));
     return { ok: true as const };
   }, getPaneCommand: async () => "claude", capturePaneContent: async () => "Claude Code\n>" } as unknown as TmuxAdapter;
   const adapter = new ClaudeCodeAdapter({ tmux, fsOps, claudeManagedLaunch: managed, sessionIdFactory: () => "fixture-fresh", sleep: async () => {} });
   const binding = { id: "binding", nodeId: "node", cwd, tmuxSession: "seat", tmuxPane: "%1", permissionMode: "acceptEdits" } as NodeBinding;
-  return { root, cwd, env, statePath, untouched, reads, writes, launches, adapter, binding, fsOps, tmux, db };
+  return { root, cwd, env, statePath, untouched, reads, writes, launches, adapter, binding, fsOps, tmux, db, managed };
 }
 
 describe.skipIf(process.platform === "win32")("Claude managed bootstrap selects the launch config home", () => {
+  it.each(["managed", "classic"])("%s API successor bootstraps and checks its selected home, leaving predecessor credentials alone", async route => {
+    const f = fixture("unset", false, true);
+    const old = path.join(f.root, "old-home"), selected = path.join(f.root, "new-home");
+    fs.mkdirSync(old); fs.mkdirSync(selected);
+    fs.writeFileSync(path.join(old, "settings.json"), JSON.stringify({ env: { ANTHROPIC_AUTH_TOKEN: "synthetic-old-conflict" } }));
+    fs.writeFileSync(path.join(selected, "settings.json"), JSON.stringify({ apiKeyHelper: "synthetic-unused-helper" }));
+    const tokenFile = path.join(f.root, "new-api"); fs.writeFileSync(tokenFile, "synthetic-selected-api", { mode: 0o600 });
+    f.db.exec("ALTER TABLE nodes ADD COLUMN account_home TEXT; ALTER TABLE nodes ADD COLUMN claude_token_ref TEXT");
+    f.db.prepare("UPDATE nodes SET account_home = ?, claude_token_ref = ? WHERE id = 'node'").run(old,
+      JSON.stringify({ label: "old-api", tokenFile: path.join(old, "missing-key"), kind: "api-key" }));
+    const cli = path.join(f.root, "rig"); fs.writeFileSync(cli, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    const executable = path.join(f.root, "bin", "claude");
+    fs.writeFileSync(executable, fs.readFileSync(executable, "utf8").replace("JSON.stringify({env:", "JSON.stringify({api:process.env.ANTHROPIC_API_KEY==='synthetic-selected-api',env:"));
+    f.tmux.getPaneCommand = async () => "sh";
+    const identity: Record<string, string> = { OPENRIG_NODE_ID: "node", OPENRIG_SESSION_NAME: "seat" };
+    f.tmux.getSessionEnv = async (_session, key) => identity[key];
+    const launch = new SeatLaunchEnvironment(f.tmux, { ...f.env, OPENRIG_HOME: path.join(f.root, "instance") }, f.cwd, cli, undefined, () => old);
+    const adapter = new ClaudeCodeAdapter({ tmux: f.tmux, fsOps: f.fsOps, claudeManagedLaunch: f.managed, seatLaunchEnvironment: launch, sleep: async () => {} });
+    const binding = { ...f.binding, ...(route === "classic" ? { permissionMode: undefined } : {}), accountHome: selected,
+      accountToken: { label: "new-api", tokenFile, kind: "api-key" as const } };
+    await adapter.deliverStartup([], binding);
+    expect(await adapter.launchHarness(binding, { name: "seat" })).toMatchObject({ ok: true });
+    expect(f.launches[0]).toMatchObject({ api: true, statePath: path.join(selected, ".claude.json"), state: { hasCompletedOnboarding: true } });
+    expect(f.writes).toEqual([path.join(selected, ".claude.json")]);
+    expect(JSON.parse((f.db.prepare("SELECT claude_token_ref AS ref FROM nodes WHERE id = 'node'").get() as { ref: string }).ref).label).toBe("old-api");
+  });
+  for (const route of ["managed", "classic"]) for (const selection of ["persisted", "staged", "cleared"] as const) {
+    it(`${route}: ${selection} account home bootstraps only the state its child reads`, async () => {
+      const f = fixture("unset", false, true);
+      const stored = path.join(f.root, "stored-account");
+      const staged = path.join(f.root, "staged-account");
+      fs.mkdirSync(stored); fs.mkdirSync(staged);
+      f.db.exec("ALTER TABLE nodes ADD COLUMN account_home TEXT");
+      f.db.prepare("UPDATE nodes SET account_home = ? WHERE id = 'node'").run(stored);
+      const cli = path.join(f.root, "rig");
+      fs.writeFileSync(cli, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+      f.tmux.getPaneCommand = async () => "sh";
+      const identity: Record<string, string> = { OPENRIG_NODE_ID: "node", OPENRIG_SESSION_NAME: "seat" };
+      f.tmux.getSessionEnv = async (_session, key) => identity[key];
+      const launch = new SeatLaunchEnvironment(f.tmux, { ...f.env, OPENRIG_HOME: path.join(f.root, "instance") }, f.cwd, cli, undefined,
+        (_node, _runtime, ignoreAccountHome) => ignoreAccountHome ? undefined : stored);
+      const adapter = new ClaudeCodeAdapter({ tmux: f.tmux, fsOps: f.fsOps, claudeManagedLaunch: f.managed,
+        seatLaunchEnvironment: launch, sleep: async () => {} });
+      const binding = { ...f.binding, ...(route === "classic" ? { permissionMode: undefined } : {}),
+        ...(selection === "staged" ? { accountHome: staged } : selection === "cleared" ? { accountHome: null } : {}) };
+      const selectedState = selection === "cleared" ? f.statePath : path.join(selection === "staged" ? staged : stored, ".claude.json");
+      const defaultBefore = fs.readFileSync(f.statePath, "utf8");
+      expect(await adapter.deliverStartup([], binding)).toEqual({ delivered: 0, failed: [] });
+      expect(await adapter.launchHarness(binding, { name: "seat" })).toMatchObject({ ok: true });
+      expect(f.launches[0].statePath).toBe(selectedState);
+      expect(f.launches[0].state).toMatchObject({ hasCompletedOnboarding: true, projects: { [f.cwd]: { hasTrustDialogAccepted: true } } });
+      expect(new Set(f.writes)).toEqual(new Set([selectedState]));
+      if (selection !== "cleared") expect(fs.readFileSync(f.statePath, "utf8")).toBe(defaultBefore);
+    });
+  }
   it.each(["fresh", "resume"])("classic %s child reading its inherited default home gets bootstrap there", async mode => {
     const f = fixture("alternate", false, true);
     const alternateBefore = fs.readFileSync(f.statePath, "utf8");
@@ -162,6 +218,26 @@ describe.skipIf(process.platform === "win32")("Claude managed bootstrap selects 
     expect(fs.readFileSync(f.statePath, "utf8")).toBe(text);
     expect(f.writes).toEqual([]);
     for (const [file, before] of f.untouched) expect(fs.readFileSync(file, "utf8")).toBe(before);
+  });
+  it.each(["managed", "classic"])("%s: a seat's own CLAUDE_CONFIG_DIR gets the bootstrap and the launch, not the daemon's selection", async route => {
+    const f = fixture("alternate", true, false);
+    const seatDir = path.join(f.root, "seat's config");
+    // The seat's stored env (migration 111's columns), declaring its own home over the daemon's selection.
+    f.db.exec("CREATE TABLE rigs(id TEXT, env_json TEXT); ALTER TABLE nodes ADD COLUMN rig_id TEXT; ALTER TABLE nodes ADD COLUMN env_json TEXT;");
+    f.db.prepare("INSERT INTO rigs VALUES ('rig', NULL)").run();
+    f.db.prepare("UPDATE nodes SET rig_id = 'rig', env_json = ? WHERE id = 'node'").run(JSON.stringify({ CLAUDE_CONFIG_DIR: seatDir }));
+    const seatState = path.join(seatDir, ".claude.json");
+    const binding = route === "managed" ? f.binding : { ...f.binding, permissionMode: undefined };
+    expect(await f.adapter.deliverStartup([], binding)).toEqual({ delivered: 0, failed: [] });
+    expect(f.writes).toContain(seatState);
+    expect(f.writes).not.toContain(f.statePath);
+    expect(JSON.parse(fs.readFileSync(seatState, "utf8"))).toMatchObject({ hasCompletedOnboarding: true, projects: { [f.cwd]: { hasTrustDialogAccepted: true } } });
+    if (route === "managed") {
+      expect(await f.adapter.launchHarness(binding, { name: "seat" })).toMatchObject({ ok: true });
+      expect(f.launches[0].env.CLAUDE_CONFIG_DIR).toBe(seatDir);
+      expect(f.launches[0].statePath).toBe(seatState);
+    }
+    expect(fs.existsSync(f.statePath)).toBe(false);
   });
   it("preserves unreadable selected state without writing another home", async () => {
     const f = fixture("alternate", true, true);

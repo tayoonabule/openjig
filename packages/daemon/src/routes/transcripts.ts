@@ -1,3 +1,4 @@
+import { savedSessionName } from "../domain/session-registry.js";
 import { Hono } from "hono";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "../domain/rig-repository.js";
@@ -159,7 +160,7 @@ export function transcriptRoutes(): Hono {
     const db = c.get("db" as never) as Database.Database;
     const rigRepo = c.get("rigRepo" as never) as RigRepository;
     const tmuxAdapter = c.get("tmuxAdapter" as never) as TmuxAdapter | undefined;
-    const sessionName = c.req.param("session");
+    let sessionName = c.req.param("session");
     const rawLines = parseInt(c.req.query("lines") ?? "50", 10);
     const lines = isNaN(rawLines) || rawLines < 1 ? 50 : rawLines;
 
@@ -170,6 +171,7 @@ export function transcriptRoutes(): Hono {
       );
     }
 
+    sessionName = savedSessionName(db, sessionName);
     const resolution = resolveSessionToRig(db, rigRepo, sessionName);
     if ("error" in resolution) {
       return c.json({ error: resolution.error }, resolution.status as 404);
@@ -207,7 +209,7 @@ export function transcriptRoutes(): Hono {
     const db = c.get("db" as never) as Database.Database;
     const rigRepo = c.get("rigRepo" as never) as RigRepository;
     const tmuxAdapter = c.get("tmuxAdapter" as never) as TmuxAdapter | undefined;
-    const sessionName = c.req.param("session");
+    let sessionName = c.req.param("session");
     const pattern = c.req.query("pattern");
 
     if (!pattern) {
@@ -231,6 +233,7 @@ export function transcriptRoutes(): Hono {
       );
     }
 
+    sessionName = savedSessionName(db, sessionName);
     const resolution = resolveSessionToRig(db, rigRepo, sessionName);
     if ("error" in resolution) {
       return c.json({ error: resolution.error }, resolution.status as 404);
@@ -257,8 +260,8 @@ export function transcriptRoutes(): Hono {
 
   // GET /:session/full — return the full transcript content for a session.
   //
-  // Per orch decision approved-option-a (escalation
-  // qitem-20260502020833-68e4eca3): this route adopts the existing
+  // Per orch decision approved-option-a (escalation):
+  // this route adopts the existing
   // tail/grep posture (open route, daemon-local trust boundary). No
   // session-scoped auth is enforced because no caller-identity primitive
   // exists in the daemon today. Route-level redaction (M1 contract § 4 /
@@ -273,7 +276,7 @@ export function transcriptRoutes(): Hono {
     const db = c.get("db" as never) as Database.Database;
     const rigRepo = c.get("rigRepo" as never) as RigRepository;
     const tmuxAdapter = c.get("tmuxAdapter" as never) as TmuxAdapter | undefined;
-    const sessionName = c.req.param("session");
+    let sessionName = c.req.param("session");
 
     if (!transcriptStore?.enabled) {
       return c.json(
@@ -282,6 +285,7 @@ export function transcriptRoutes(): Hono {
       );
     }
 
+    sessionName = savedSessionName(db, sessionName);
     const resolution = resolveSessionToRig(db, rigRepo, sessionName);
     if ("error" in resolution) {
       return c.json({ error: resolution.error }, resolution.status as 404);

@@ -165,6 +165,12 @@ commit. Evidence capture (`proof add`), policy acceptance, higher outcome
 judgment and publication are distinct. This optional component does not select
 Part B or add a mandatory review gate.
 
+A judgment binds the slice's path, the item's text and the policy. Moving or
+renaming a slice (`rig scope slice move`, or by hand) reopens its judged items:
+`rig proof show` reports each as `unknown`, and each needs a new judgment on its
+current revision. `rig scope audit` checks structure only and never reads proof
+readiness, so a passing audit doesn't mean the proof still stands.
+
 The project readiness that `rig proof show --project` reports counts only
 missions whose `mission.yaml` carries `metadata.status: active` or
 `metadata.status: release-candidate`. `rig scope mission create` writes
@@ -174,7 +180,9 @@ outside the rollup, even after its slices are accepted, until someone changes
 its status to `active` (or `release-candidate` for a release that is ready to
 judge). Nothing changes the status automatically. Missions created before this
 default carry no status and are not counted either; add the line by hand to
-include them.
+include them. It also writes `metadata.name`, the mission's folder name, which
+the project lifecycle compiler requires; a mission created without it refuses to
+compile with `lifecycle_field_missing` until you add that line.
 
 The three sections project into the UI's one review structure: a vertical
 stack of **INTENT → PLAN → DELIVERED**. A slice missing a section still

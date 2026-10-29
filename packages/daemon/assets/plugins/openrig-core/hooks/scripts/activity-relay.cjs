@@ -46,7 +46,9 @@ function firstString(...values) {
   return null;
 }
 
-function buildOpenRigPayload(providerPayload, env = process.env, now = () => new Date()) {
+// The route this run reports by, so the daemon can count one event once per route: "plugin" for the plugin's hook
+// (started with --from-plugin), "managed" for the settings or managed hook copy.
+function buildOpenRigPayload(providerPayload, env = process.env, now = () => new Date(), argv = process.argv) {
   const sessionName = firstString(env.OPENRIG_SESSION_NAME, env.RIGGED_SESSION_NAME);
   const nodeId = firstString(env.OPENRIG_NODE_ID, env.RIGGED_NODE_ID);
   const runtime = firstString(env.OPENRIG_RUNTIME, env.RIGGED_RUNTIME);
@@ -61,15 +63,19 @@ function buildOpenRigPayload(providerPayload, env = process.env, now = () => new
 
   if ((!sessionName && !nodeId) || !runtime || !hookEvent) return null;
 
-  const subtype = firstString(
-    providerPayload.subtype,
-    providerPayload.notification_type,
-    providerPayload.notificationType,
-    providerPayload.tool_name,
-    providerPayload.toolName,
-    providerPayload.source,
-    providerPayload.matcher
-  );
+  // StopFailure has a typed error field. Never infer it from rendered error text,
+  // a tool name, or another event's subtype; those are not provider failures.
+  const subtype = runtime === "claude-code" && hookEvent === "StopFailure"
+    ? firstString(providerPayload.error)
+    : firstString(
+      providerPayload.subtype,
+      providerPayload.notification_type,
+      providerPayload.notificationType,
+      providerPayload.tool_name,
+      providerPayload.toolName,
+      providerPayload.source,
+      providerPayload.matcher
+    );
 
   return {
     sessionName,
@@ -78,8 +84,14 @@ function buildOpenRigPayload(providerPayload, env = process.env, now = () => new
     generation,
     hookEvent,
     subtype,
+    // Claude's main session omits agent_id; subagents and in-process teammates carry it.
+    // Keep that distinction for permission completion, without forwarding tool inputs/results.
+    ...(runtime === "claude-code" && (hookEvent === "Notification" || hookEvent === "PostToolBatch")
+      && (providerPayload.agent_id == null || firstString(providerPayload.agent_id))
+      ? { hookAgentId: firstString(providerPayload.agent_id) } : {}),
     turnId: firstString(providerPayload.turn_id, providerPayload.turnId),
     occurredAt: now().toISOString(),
+    relayRoute: argv.includes("--from-plugin") ? "plugin" : "managed",
   };
 }
 
@@ -170,6 +182,10 @@ function buildSessionIdentityPayload(providerPayload, env = process.env, now = (
 
   if ((!sessionName && !nodeId) || !runtime) return null;
 
+  // #1524 (a): whether the runtime sent transcript_path, and its raw value. Codex sends an explicit null for a
+  // thread it never persists; the daemon tells that apart from an absent key, an empty string or a malformed value.
+  const transcriptPathPresent = Object.prototype.hasOwnProperty.call(providerPayload, "transcript_path");
+
   return {
     eventFamily: "session_identity",
     sessionName,
@@ -182,6 +198,8 @@ function buildSessionIdentityPayload(providerPayload, env = process.env, now = (
     // The daemon finds the Claude that ran this hook from its parent chain.
     hookPid: process.pid,
     sessionId,
+    transcriptPathPresent,
+    ...(transcriptPathPresent ? { transcriptPath: providerPayload.transcript_path } : {}),
     occurredAt: now().toISOString(),
   };
 }
@@ -202,6 +220,18 @@ function claimFirstLaunchHook(resumeLaunch, generation, dir = path.join(os.tmpdi
   }
 }
 
+function jcodeHookPayload(env) {
+  // Jcode passes lifecycle data in environment variables, not on stdin.
+  const jcodeEvents = {
+    turn_start: "UserPromptSubmit", turn_end: "Stop",
+    session_start: "SessionStart", session_end: "SessionEnd",
+  };
+  const payload = parseJson(env.JCODE_HOOK_PAYLOAD);
+  return { ...payload,
+    hookEvent: jcodeEvents[env.JCODE_HOOK_EVENT] || env.JCODE_HOOK_EVENT,
+    session_id: env.JCODE_HOOK_SESSION_ID || payload.session_id };
+}
+
 function uid() {
   try { return typeof process.getuid === "function" ? String(process.getuid()) : "user"; } catch { return "user"; }
 }
@@ -214,19 +244,20 @@ function uid() {
 // each event once either way. Anything unreadable, missing or different counts as "not registered": a seat is never silent.
 const SETTINGS_RELAY_TAIL = "state/claude-activity-hooks/activity-relay.cjs";
 
-// Keep this finite generated-command grammar in parity with parseManagedClaudeNodeCommand.
-// Bare-node legacy commands and a canonical quoted absolute Node path are recognised;
-// extra arguments and user wrappers are not the settings relay.
+// Keep this finite Node-command grammar in parity with parseManagedClaudeNodeCommand.
+// Canonical POSIX quotes and literal unquoted words only; no expansion or wrappers.
 function settingsRelayPath(command) {
   if (/[\r\n]/.test(command)) return null;
-  const m = /^(node|'(?:[^']|'"'"')*')[ \t]+('(?:[^']|'"'"')*')$/.exec(command.trim());
+  const token = /'(?:[^']|'"'"')*'|[-A-Za-z0-9_./:@%+=,]+/.source;
+  const m = new RegExp(`^(${token})[ \t]+(${token})$`).exec(command.trim());
   if (!m) return null;
-  const decode = token => token.slice(1, -1).split(`'"'"'`).join("'");
+  const decode = token => token.startsWith("'") ? token.slice(1, -1).split(`'"'"'`).join("'") : token;
   const quote = value => "'" + value.replace(/'/g, `'"'"'`) + "'";
-  const executable = m[1] === "node" ? "node" : decode(m[1]);
+  const executable = decode(m[1]);
   const relay = decode(m[2]);
-  if (quote(relay) !== m[2] || !path.isAbsolute(relay) || !relay.endsWith(`/${SETTINGS_RELAY_TAIL}`)) return null;
-  if (m[1] !== "node" && (quote(executable) !== m[1] || !path.isAbsolute(executable) || !/^node(?:\.exe)?$/i.test(path.basename(executable)))) return null;
+  if (m.slice(1).some(token => token.startsWith("'") && quote(decode(token)) !== token)) return null;
+  if (!path.isAbsolute(relay) || !relay.endsWith(`/${SETTINGS_RELAY_TAIL}`)) return null;
+  if (executable !== "node" && (!path.isAbsolute(executable) || !/^node(?:\.exe)?$/i.test(path.basename(executable)))) return null;
   return { executable, relay };
 }
 
@@ -268,6 +299,9 @@ function settingsRelayReports(hookEvent, providerPayload, env = process.env) {
 function pluginRunIsRedundant(providerPayload, argv = process.argv, env = process.env) {
   if (!argv.includes("--from-plugin")) return false;
   const hookEvent = firstString(providerPayload.hookEvent, providerPayload.hookEventName, providerPayload.hook_event_name, providerPayload.event, providerPayload.eventName);
+  // Codex activity has one producer: OpenRig's managed inline hooks. The plugin supplies refocus and skills, but its
+  // activity entries are no-ops. Do not infer merged native hook state here or bypass a person's inline-hook disable.
+  if (firstString(env.OPENRIG_RUNTIME, env.RIGGED_RUNTIME) === "codex") return true;
   return settingsRelayReports(hookEvent, providerPayload, env);
 }
 

@@ -41,6 +41,31 @@ state. Attention/alarm values likewise stay in their own machinery (`attentionCo
 Both herdr and omnigent converged on this exclusion, with warning comments on the
 collision in both codebases.
 
+The legacy `agentActivity` field distinguishes a typed provider interruption from
+a request for a person: fresh Codex `at_limit` and Claude `StopFailure/rate_limit`
+events carry `state: unknown` and `reason: usage_limit`, never a `needs_input`
+hook. A permission prompt can independently supply human-input evidence. See
+[Claude usage-limit detection](claude-status-line.md#claude-usage-limit-detection)
+for the separate provider signal and queue timer.
+
+### Per-seat attention in the node inventory
+
+`rig ps --nodes` carries the daemon's `needsAttention` result, using the same predicate
+as the rig's `attentionCount`. It also serves `arbitratedNeedsInput`: `true` for observed
+input, `false` for an observed clear, and `null` when no authoritative needs-input source
+answered. `needsInputEvidence` retains that source's rung and observation time, or `null`.
+A zero prompt count alone is not an observed clear. Absent arbitration evidence leaves
+the existing live-hook fallback in effect; lifecycle, startup, held and error signals
+can independently raise attention. A false attention flag means no known trigger, not
+proof that an unobserved input box is clear.
+
+The compact human table's ATTN column renders `yes`, `no`, or `?` when the flag is
+unavailable. Compact JSON retains `needsAttention`; use `--full` or
+`--fields needsAttention,arbitratedNeedsInput,needsInputEvidence` with `--json` for the
+provenance. The TUI uses the served flag for attention glyphs and totals, and shows the
+needs-input evidence in seat detail, including a hook-only prompt. With an older daemon,
+attention stays unknown while its existing prompt, startup and error hints remain visible.
+
 ## Derived diagnoses — computed at read time, never stored
 
 - **PARKED** — the disease: `(activity = idle-at-prompt OR needs-input pending) ×
@@ -77,7 +102,7 @@ time-bounded evidence. Rungs, top down, with each rung's retirement condition:
 - **r3 — Claude `sessions/<pid>.json` self-report** (busy/shell/idle/waiting, since
   v2.1.139): standing, above hooks for working/idle. Undocumented internal — unreadable
   means fall down the ladder, never error.
-- **r2 — lifecycle hooks** (Claude SessionStart/UserPromptSubmit/Stop/Notification;
+- **r2 — lifecycle hooks** (Claude SessionStart/UserPromptSubmit/PostToolBatch/Stop/StopFailure/Notification;
   Codex SessionStart/UserPromptSubmit/Stop/PermissionRequest): standing for Claude; Codex's
   hook rung starts at trial and is promoted after 50 agreeing observations over at least an
   hour. Exactly-once turn boundaries; SubagentStop filtered (it
@@ -92,10 +117,51 @@ time-bounded evidence. Rungs, top down, with each rung's retirement condition:
   window in production — never by fixture pass alone (symmetric admission: a fixture
   pass admits a rung to TRIAL, where it is measured but not consulted; production agreement
   promotes it). Undeclared and partial-coverage rungs are identity-only, which is also where
-  a degraded rung goes.
+  a degraded rung goes, with one declared exception: for a pi or omp seat or a community
+  harness, sampling is positive-only: a changing pane reads working, and a quiet one never reads idle on its
+  own, since the pane can be quiet mid-turn.
+- **pi and omp runner hooks**: OpenRig's runner reads the child's RPC event stream and posts
+  each turn boundary (`agent_start`, `turn_start`, tool calls, `agent_end`; attention). These
+  decide working, idle and needs-input. Unlike Claude and Codex hooks, an idle or attention
+  boundary holds until the next one instead of expiring after 15 s; a working boundary still
+  expires, so a turn whose end was lost reads unknown, not working forever. Posts are taken
+  in the runner's own order (time, then its sequence), so an older boundary arriving late
+  doesn't win. The runner's report that its child
+  exited reads unknown, not idle. A boundary the runner didn't see (if a runtime ended a turn
+  without `agent_end`) leaves the seat working up to the 15 s window, then unknown, never idle. After a
+  daemon restart, a runner seat takes its last recorded boundary from the hook store, for its
+  current session and occupant generation only, so an idle seat still reads idle before it
+  posts again, provided that report is fresh: a pi runner's idle boundary states an interval
+  (below) and lapses to unknown once it is older than two of them.
+  A pi runner also posts an idle `Stop` (`idle_heartbeat`) every three minutes while it waits, and states that
+  interval as `livenessSeconds` on every `Stop`: a newly ready runner reads idle at once, and an idle boundary that
+  carries an interval holds for two of them, then lapses to unknown, so a runner killed without saying so stops reading
+  idle. Silence never clears a pending attention prompt, and a runner that states no interval (omp, an older pi
+  runner) keeps the hold-until-the-next-boundary behaviour.
+
+Claude permission notifications raise needs-input immediately. A visible permission can clear
+after it has been observed and then disappears. A notification whose dialog was never observed
+can also clear when Claude reports `PostToolBatch`: every tool in that actor's batch has resolved,
+so its earlier permission requests are no longer pending. The relay carries the native actor
+identity; a subagent or in-process teammate finishing its batch cannot clear the main session's
+request, and overlapping actors remain separate. An individual `PostToolUse` is insufficient
+because another tool in the batch may still be waiting for permission.
+
+Batch completion must come from the current occupant and have a later source timestamp than
+the matching notification. Missing actor attribution from an older relay, equal or older
+timestamps, and another actor's completion retain attention. An unrecognized or missing screen
+does not expire attention by age. `Stop` and `UserPromptSubmit` remain the turn-boundary fallback.
+The oracle remembers each actor's latest completed batch for the current occupant, so a strictly
+earlier notification arriving late cannot restore the mark, even if the completion arrived first.
+A notification with an equal or later timestamp remains eligible; swapping or retiring the
+occupant discards its remembered completions.
+Completing a batch changes the needs-input signal without inferring that the seat is idle or
+overwriting a later elicitation. The hook contract is documented in
+[Claude's hooks reference](https://code.claude.com/docs/en/hooks#posttoolbatch).
 
 Partial-coverage honesty: a source with partial lifecycle coverage gets identity-only
-trust. The ladder is also the migration path — new oracles slot in above existing
+trust, unless its inventory declares it positive-only. A positive-only source can report
+working and nothing else; its silence reads unknown, never idle. The ladder is also the migration path — new oracles slot in above existing
 heuristics, lower rungs retire a release at a time, consumers never see a flag day.
 
 Seat-keyed: state attaches to the durable seat nodeId, never the occupant. A handover or
@@ -117,7 +183,8 @@ LIFECYCLE); see the
 - **Attention codes:** `trust_gate`, `hook_trust_gate`, `update_gate`, `login_required`,
   `mcp_gate`, `bypass_consent_gate`, `codex_auth_refusal`, `codex_client_incompatible`.
 - **Restore outcome:** `resumed`, `fresh-primed`, `awaiting-decision`, `attention_required`,
-  `failed` (plus `rebuilt`, `operator_recovered` and the legacy `fresh`).
+  `failed` (plus `rebuilt`, `operator_recovered` and the legacy `fresh`). A seat joined with
+  `rig attach` as an external CLI reads `left_attached`: restore leaves it as it is.
 
 ## Rejected oracles — dated receipts (2026-08-26), so nobody re-derives them expensively
 

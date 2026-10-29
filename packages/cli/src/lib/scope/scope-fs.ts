@@ -195,22 +195,13 @@ function refuseFrontmatterUpdate(absPath: string): never {
 // Mission discovery
 // ---------------------------------------------------------------------
 
-/**
- * The typed `workspace.slices_root` setting, when it is a readable directory;
- * null when it is unset or unreadable. The fallback every command resolves to
- * when the caller names no workspace of its own.
- */
+/** The typed `workspace.slices_root` setting when it is a readable directory. */
 export function configuredMissionsRoot(configPath?: string): string | null {
   const configured = new ConfigStore(configPath).get("workspace.slices_root") as string;
-  if (configured && fs.existsSync(configured) && fs.statSync(configured).isDirectory()) return configured;
-  return null;
+  return configured && fs.existsSync(configured) && fs.statSync(configured).isDirectory() ? configured : null;
 }
 
-/**
- * The project's missions root: project.yaml's optional `missions.root` when it is a relative path inside the
- * project, else the conventional `missions`. Null when it resolves outside the project. Work positions and
- * mission creation both use it, so they agree on where a project's missions live.
- */
+/** Resolve the declared project missions root without allowing escape from the project. */
 export function projectMissionsRoot(
   projectRoot: string,
   projectManifest: Record<string, unknown> | null,
@@ -233,7 +224,6 @@ export function projectMissionsRoot(
   return rel === "" || (!path.isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${path.sep}`)) ? missionsRoot : null;
 }
 
-/** {@link projectMissionsRoot} for the project.yaml at `projectRoot`, when there is one. */
 export function readProjectMissionsRoot(projectRoot: string, warnings: string[]): string | null {
   const projectManifestPath = path.join(projectRoot, "project.yaml");
   let projectManifest: Record<string, unknown> | null = null;
@@ -249,9 +239,8 @@ export function readProjectMissionsRoot(projectRoot: string, warnings: string[])
   return projectMissionsRoot(projectRoot, projectManifest, warnings);
 }
 
-/** Locate the missions root from an explicit workspace override or the typed
- * `workspace.slices_root` setting. No cwd walk: discovery may enumerate
- * candidates, but selection comes from configuration. */
+/** Locate the missions root from an explicit workspace override, a catalogued project containing cwd, or the typed
+ * `workspace.slices_root` setting. Explicit overrides remain authoritative and never fall back to the catalog. */
 export function resolveMissionsRoot(opts: {
   override?: string | null;
   cwd?: string;
@@ -292,18 +281,14 @@ export function resolveMissionsRoot(opts: {
       });
     }
   }
-  const catalogPath = new ConfigStore(opts.configPath).get("workspace.catalog_path") as string;
-  if (catalogPath) {
-    const projectRoot = catalogProjectRootFor(catalogPath, cwd);
-    if (projectRoot) {
-      const projectMissions = readProjectMissionsRoot(projectRoot, []);
-      if (projectMissions && fs.existsSync(projectMissions) && fs.statSync(projectMissions).isDirectory()) {
-        return projectMissions;
-      }
-    }
+  const store = new ConfigStore(opts.configPath);
+  if (!fromOverride) {
+    const project = catalogProjectRootFor(store.get("workspace.catalog_path") as string, cwd);
+    const missions = project && readProjectMissionsRoot(project, []);
+    if (missions && fs.existsSync(missions) && fs.statSync(missions).isDirectory()) return missions;
   }
-  const configured = configuredMissionsRoot(opts.configPath);
-  if (configured) return configured;
+  const configured = store.get("workspace.slices_root") as string;
+  if (configured && fs.existsSync(configured) && fs.statSync(configured).isDirectory()) return configured;
   throw new ScopeCliError({
     fact: `Configured workspace.slices_root is not a readable directory: ${(new ConfigStore(opts.configPath).get("workspace.slices_root") as string) || "(unset)"}.`,
     consequence: "No mission tree to operate on.",
@@ -565,8 +550,9 @@ export function findSlice(
         continue;
       }
       const mission = buildMissionInfo(missionsRoot, owningMissionPath);
-      const sliceRoot = path.dirname(candidate);
-      return buildSliceInfo(mission, sliceRoot, path.basename(candidate));
+      // The directory and the name both come from the resolved path, so `<slice>/.` and `<slice>/sub/..` select the slice.
+      const resolved = path.resolve(candidate);
+      return buildSliceInfo(mission, path.dirname(resolved), path.basename(resolved));
     }
   }
   if (firstContextError) throw firstContextError;
@@ -578,9 +564,18 @@ export function findSlice(
 }
 
 function findOwningMission(missionsRoot: string, slicePath: string): string | null {
+  // path.dirname never ends in a separator, so compare against the normalized root
+  // (a configured or --workspace root may be written as `/w/missions/`); resolve the
+  // slice the same way so a relative root and a relative candidate stay comparable.
+  // A path that leaves the root, such as `<root>/../other/m1/slices/x`, then falls back
+  // to the walk as written, where it reads as before.
+  return walkToMission(path.resolve(missionsRoot), path.resolve(slicePath)) ?? walkToMission(missionsRoot, slicePath);
+}
+
+function walkToMission(root: string, slicePath: string): string | null {
   let dir = path.dirname(slicePath);
-  while (dir.startsWith(missionsRoot) && dir !== missionsRoot) {
-    if (path.dirname(dir) === missionsRoot) return dir;
+  while (dir.startsWith(root) && dir !== root) {
+    if (path.dirname(dir) === root) return dir;
     dir = path.dirname(dir);
   }
   return null;

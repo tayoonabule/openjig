@@ -99,6 +99,11 @@ export interface RungDeclaration {
   lifecycleCoverage: "full" | "partial" | "none";
   /** The trust the rung STARTS with on this adapter (promotion may raise trial). */
   initialTrust: RungTrust;
+  /** Hooks only: the source sees every turn boundary in order, so its last idle or attention boundary holds until the
+   *  next instead of expiring with the hook window. A working boundary still expires: a turn whose end was lost must not
+   *  read working forever. Its posts are taken in the source's own order. Only a runner that reads its child's whole
+   *  event stream declares it. */
+  durableBoundaries?: true;
 }
 
 /** What an adapter declares about itself — arbitration ranks what each source can
@@ -106,7 +111,7 @@ export interface RungDeclaration {
  *  never inherits its predecessor's rung authority. */
 export interface AdapterRungInventory {
   adapterId: string;
-  runtime: "claude-code" | "codex" | "jcode" | "tmux-generic" | "community-harness";
+  runtime: "claude-code" | "codex" | "jcode" | "pi" | "omp" | "tmux-generic" | "community-harness" | "community-runner";
   rungs: RungDeclaration[];
 }
 
@@ -122,12 +127,26 @@ export interface ActivityEvidence {
   /** Monotonic per source — stale or reordered reports are dropped. */
   seq: number;
   observedAt: string;
+  /** The emitter's own order (a runner's per-post sequence), which orders posts that share an observedAt. */
+  sourceSequence?: number;
+  /** How often the source promises to report while idle. A durable idle boundary holds for two of these, then lapses to
+   *  unknown: a runner that died without saying so stops reading idle. Absent: the boundary holds until the next. */
+  livenessSeconds?: number;
   activity?: ActivityValue;
   needsInput?: NeedsInput;
-  permissionRequest?: { id: string };
-  /** Optional evidence-specific freshness bound for live self-report adapters. */
+  permissionRequest?: { id: string; hookAgentId?: string | null };
+  permissionResolved?: boolean;
+  /** Which relay route posted hook evidence, when it said. One event can arrive by more than one route (a Codex seat's
+   *  plugin hook and its managed hook), so promotion counts agreements per route. Absent for an untagged post. */
+  route?: EvidenceRoute;
+  /** Optional freshness bound. When set, the evidence stops deciding activity once it is older
+   *  than this (the same time-bounding hooks get). Used by POLLED self-reports (jcode's debug
+   *  socket) so a dead socket's last answer can never stay authoritative. */
   validForMs?: number;
 }
+
+/** The bounded set of relay routes. "unrecognised" stands for any other label, so a post can never add a new key. */
+export type EvidenceRoute = "plugin" | "managed" | "unrecognised";
 
 /** A visible rung-health transition (AM-1): arbitration can never make a silently-dead
  *  source authoritative, and the degradation itself must be observable. */
@@ -190,19 +209,6 @@ export const CODEX_ACTIVITY_RUNG_INVENTORY: AdapterRungInventory = {
   ],
 };
 
-/** Jcode: its seat-scoped debug socket is the authoritative working/idle self-report;
- *  lifecycle hooks enter at trial until production agreement promotes them; tmux sampling
- *  remains the authoritative floor when Jcode's socket is unavailable. */
-export const JCODE_ACTIVITY_RUNG_INVENTORY: AdapterRungInventory = {
-  adapterId: "jcode-runtime-adapter",
-  runtime: "jcode",
-  rungs: [
-    { rung: "self-report", lifecycleCoverage: "full", initialTrust: "authoritative" },
-    { rung: "lifecycle-hooks", lifecycleCoverage: "full", initialTrust: "trial" },
-    { rung: "window-sampling", lifecycleCoverage: "full", initialTrust: "authoritative" },
-  ],
-};
-
 /** The generic tmux floor: sampling only — exactly what an undeclared seat gets. */
 export const TMUX_GENERIC_RUNG_INVENTORY: AdapterRungInventory = {
   adapterId: "tmux-generic",
@@ -218,13 +224,60 @@ export const COMMUNITY_HARNESS_RUNG_INVENTORY: AdapterRungInventory = {
   rungs: [{ rung: "window-sampling", lifecycleCoverage: "partial", initialTrust: "positive-only" }],
 };
 
+/** pi and omp run under OpenRig's runner, which reads the child's RPC event stream and posts each turn boundary as a
+ *  hook (agent_start, turn_start, tool calls, agent_end; attention; process exit). Those hooks decide, and a boundary
+ *  holds until the next one. A quiet pane can be mid-turn, so window sampling stays positive-only. */
+const RUNNER_ACTIVITY_RUNGS: RungDeclaration[] = [
+  { rung: "lifecycle-hooks", lifecycleCoverage: "full", initialTrust: "authoritative", durableBoundaries: true },
+  { rung: "window-sampling", lifecycleCoverage: "partial", initialTrust: "positive-only" },
+];
+
+export const PI_ACTIVITY_RUNG_INVENTORY: AdapterRungInventory = {
+  adapterId: "pi-runtime-adapter",
+  runtime: "pi",
+  rungs: RUNNER_ACTIVITY_RUNGS,
+};
+
+export const OMP_ACTIVITY_RUNG_INVENTORY: AdapterRungInventory = {
+  adapterId: "omp-runtime-adapter",
+  runtime: "omp",
+  rungs: RUNNER_ACTIVITY_RUNGS,
+};
+
+/** A community app whose preset declared `runner: true` at its launch: its runner posts turn boundaries as Pi's does,
+ *  so those hooks decide. Only a session recorded as launched for a runner gets it; any other community seat keeps
+ *  the sampling-only inventory above. */
+export const COMMUNITY_RUNNER_RUNG_INVENTORY: AdapterRungInventory = {
+  adapterId: "community-runner",
+  runtime: "community-runner",
+  rungs: RUNNER_ACTIVITY_RUNGS,
+};
+
+/** Jcode: the seat's own debug socket (`sessions` → status/is_processing) is a self-report
+ *  rung, polled per sweep, time-bounded, and AUTHORITATIVE above sampling. Sampling alone
+ *  cannot tell idle from working here: the jcode TUI repaints while idle, so tmux
+ *  `#{window_activity}` advances every second and an idle seat would read working forever
+ *  (OPR.99.0.1). Activity-relay hooks still enter at TRIAL, with TUI sampling as the authoritative
+ *  floor only when no self-report is available. */
+export const JCODE_ACTIVITY_RUNG_INVENTORY: AdapterRungInventory = {
+  adapterId: "jcode-runtime-adapter",
+  runtime: "jcode",
+  rungs: [
+    { rung: "self-report", lifecycleCoverage: "full", initialTrust: "authoritative" },
+    { rung: "lifecycle-hooks", lifecycleCoverage: "full", initialTrust: "trial" },
+    { rung: "window-sampling", lifecycleCoverage: "full", initialTrust: "authoritative" },
+  ],
+};
+
 /** Resolve a runtime string to its rung inventory (the ingest auto-declaration path).
  *  Unknown runtimes get the generic floor — partial-coverage honesty by default. A seat launched for a community
  *  community harness (its session's recorded selection, still the node's runtime) gets that app's inventory. */
-export function runtimeRungInventory(runtime: string | null, communityHarness?: string | null): AdapterRungInventory {
+export function runtimeRungInventory(runtime: string | null, communityHarness?: string | null, communityRunner?: boolean): AdapterRungInventory {
   if (runtime === "claude-code") return CLAUDE_ACTIVITY_RUNG_INVENTORY;
   if (runtime === "codex") return CODEX_ACTIVITY_RUNG_INVENTORY;
+  if (runtime === "pi") return PI_ACTIVITY_RUNG_INVENTORY;
+  if (runtime === "omp") return OMP_ACTIVITY_RUNG_INVENTORY;
+  if (communityHarnessOf(communityHarness, runtime)) return communityRunner === true ? COMMUNITY_RUNNER_RUNG_INVENTORY : COMMUNITY_HARNESS_RUNG_INVENTORY;
   if (runtime === "jcode") return JCODE_ACTIVITY_RUNG_INVENTORY;
-  if (communityHarnessOf(communityHarness, runtime)) return COMMUNITY_HARNESS_RUNG_INVENTORY;
   return TMUX_GENERIC_RUNG_INVENTORY;
 }

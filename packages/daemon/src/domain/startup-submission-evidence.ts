@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import {
   composerPromptClassForRuntime,
   composerPromptIsAmbiguous,
@@ -15,6 +14,7 @@ const VIM_MODE_PREFIX = /^-- INSERT --\s*/;
 const MODE_BAR_START = /^(?:⏵⏵|⏸)(?:\s|$)/;
 // The suffix is a circle glyph and an effort level, e.g. `◐ medium` or `● high`; arbitrary text is not one.
 const PASTE_HINT = /^paste again to expand(?:\s{2,}[◐●○◑◒◓] (?:low|medium|high|xhigh|max) · \/effort)?$/;
+export const isClaudePasteHint = (line: string): boolean => PASTE_HINT.test(line.replace(VIM_MODE_PREFIX, ""));
 export const isComposerFooter = (line: string): boolean => {
   const bar = line.replace(VIM_MODE_PREFIX, "");
   return (bar === "" && line !== "") || /(?:shift\+tab to cycle|\? for shortcuts)/i.test(bar) || MODE_BAR_START.test(bar)
@@ -47,6 +47,17 @@ export function composerRegion(pane: string | null, runtime: string | null = nul
     closingRuleLine: end < 0 ? null : end + 1, capturedLines: pane === null ? 0 : lines.length };
 }
 
+/** Whether Claude's input box is drawn: its input line, then a closing rule with the composer footer under it. */
+export function claudeInputBoxDrawn(pane: string | null): boolean {
+  const { markerLine, closingRuleLine } = composerRegion(pane, "claude-code");
+  return markerLine !== null && closingRuleLine !== null;
+}
+
+/** Whether a screen has no input line at all, as while Claude is still drawing it: not a draft and not a dialog. */
+export function startupNoInputLine(pane: string | null, runtime: string | null = null): boolean {
+  return Boolean(pane?.trim()) && composerRegion(pane, runtime).markerLine === null;
+}
+
 /** An echoed turn or a partial/opaque composer stays unverified. */
 export function inspectStartupStagedText(pane: string | null, expected: string, runtime: string | null = null): "staged" | "clear" | "unverified" {
   const { body } = composerRegion(pane, runtime);
@@ -60,6 +71,13 @@ export function inspectStartupStagedText(pane: string | null, expected: string, 
 // newlines in the pasted text (8 of 8 pastes in retained native runs). Matched on the normalized body.
 export const COLLAPSED_PASTE = /^\[Pastedtext#\d+\+(\d+)lines\]$/;
 
+export const STARTUP_UNCONFIRMED_REASON = {
+  staged: "the prompt still looked staged in the input box",
+  unobservable: "the input box could not be observed",
+  unclear: "the input box did not clearly show the prompt as submitted",
+  retryRefused: "the guarded Enter retry did not go through",
+} as const;
+
 /** Whether the composer holds only Claude's collapsed label for a paste with the expected text's newline count. */
 export function startupOwnCollapsedPaste(pane: string | null, expected: string, runtime: string | null = null): boolean {
   const { body } = composerRegion(pane, runtime);
@@ -67,17 +85,67 @@ export function startupOwnCollapsedPaste(pane: string | null, expected: string, 
   return label !== null && Number(label[1]) === expected.split("\n").length - 1;
 }
 
+// A fresh Claude's first input, as startup sends it; a runtime switch's handover to a Claude successor uses the same rules.
+// Expanded startup text can put the current input marker above 50 scrollback lines.
+export const STARTUP_SUBMIT_CAPTURE_LINES = 200;
+// Claude Code 2.1.289 has taken Enter on a large startup paste after the first look, while the composer
+// still showed that paste collapsed. Only that transient is looked at again, 200 ms apart, up to this many
+// times: about 5 s of waiting per send, plus capture time. Nothing is typed meanwhile.
+export const STARTUP_SUBMIT_SETTLE_LOOKS = 25;
+// A prompt still staged after a guarded retry is retried again, up to this many retries in all, each after
+// the 200 ms look. Every retry is guarded: Enter goes in only while the composer holds exactly the text we typed.
+export const STARTUP_SUBMIT_RETRIES = 2;
+
+type ReadPane = () => Promise<string | null>;
+type Sleep = (ms: number) => Promise<void>;
+
+/**
+ * A fresh launch can read ready before Claude has drawn its input box: on Linux the pane names `claude` the moment
+ * Claude starts, and startup text pasted then sat unsent. Before a fresh start's first send, look at the visible
+ * screen until the input box the startup check reads is drawn, at most STARTUP_SUBMIT_SETTLE_LOOKS looks 200 ms
+ * apart. A screen that never shows one within that, or can't be read, is sent to as before. Observation only.
+ */
+export async function waitForClaudeInputBox(readScreen: ReadPane, sleep: Sleep): Promise<void> {
+  for (let look = 0; look < STARTUP_SUBMIT_SETTLE_LOOKS; look++) {
+    let screen: string | null;
+    try { screen = await readScreen(); } catch { return; }
+    if (screen === null || claudeInputBoxDrawn(screen)) return;
+    await sleep(200);
+  }
+}
+
+/**
+ * Claude can take the startup Enter after the first look while the composer still shows our paste collapsed, and a
+ * fresh Claude can still be drawing its screen, with no input line at all, when the first look comes. Only those
+ * two transients are looked at again, until the composer reads clear or staged, shows anything else, or the looks
+ * run out. A draft, ghost text, a dialog or any other mismatch keeps its verdict. Observation only.
+ * Remaining ambiguity: a person who clears a collapsed paste with the same line count inside the window reads
+ * as submitted.
+ */
+export async function settleOwnStartupPaste(read: ReadPane, pane: string, text: string, runtime: string | null, sleep: Sleep): Promise<{
+  pane: string; state: ReturnType<typeof inspectStartupStagedText>; looks: number;
+}> {
+  let state = inspectStartupStagedText(pane, text, runtime);
+  let looks = 0;
+  while (state === "unverified" && looks < STARTUP_SUBMIT_SETTLE_LOOKS
+    && (startupOwnCollapsedPaste(pane, text, runtime) || startupNoInputLine(pane, runtime))) {
+    await sleep(200);
+    // A failed re-look adds nothing; the last usable observation stands.
+    const next = await read().catch(() => null);
+    if (!next?.trim()) break;
+    pane = next;
+    state = inspectStartupStagedText(pane, text, runtime);
+    looks++;
+  }
+  return { pane, state, looks };
+}
+
 export interface StartupSubmissionEvidence {
-  normalization: "whitespace-stripped-utf8";
-  expected: { bytes: number; sha256: string };
-  observed: { bytes: number; sha256: string } | null;
   /** One-based positions in this capture, not absolute terminal rows. */
   markerLine: number | null;
   closingRuleLine: number | null;
   capturedLines: number;
   captureScrollbackLines: number;
-  /** Zero-based UTF-8 byte offset; null when equal or no valid region exists. */
-  firstDifferenceByte: number | null;
   /** Diagnostic only; absent for unavailable captures or an excluded selector. */
   reason?: "unrecognized_composer_boundary" | "extracted_text_mismatch";
   windowsOmitted: "unclassified-startup-text";
@@ -102,22 +170,10 @@ export interface StartupSubmissionDiagnostic {
 export function startupSubmissionEvidence(pane: string | null, expected: string, captureScrollbackLines: number, runtime: string | null = null): StartupSubmissionEvidence | undefined {
   try {
     const { body, ...positions } = composerRegion(pane, runtime);
-    const expectedBytes = Buffer.from(normalize(expected));
-    const observedBytes = body === null ? null : Buffer.from(body);
-    const digest = (bytes: Buffer) => ({ bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") });
-    let firstDifferenceByte: number | null = null;
-    if (observedBytes !== null) {
-      let i = 0;
-      while (i < expectedBytes.length && i < observedBytes.length && expectedBytes[i] === observedBytes[i]) i++;
-      if (i !== expectedBytes.length || i !== observedBytes.length) firstDifferenceByte = i;
-    }
     const reason = !pane?.trim() ? undefined
       : positions.markerLine === null || positions.closingRuleLine === null ? "unrecognized_composer_boundary"
-      : observedBytes !== null && firstDifferenceByte !== null ? "extracted_text_mismatch" : undefined;
-    return { normalization: "whitespace-stripped-utf8", expected: digest(expectedBytes),
-      observed: observedBytes === null ? null : digest(observedBytes), ...positions,
-      ...(reason ? { reason } : {}),
-      captureScrollbackLines, firstDifferenceByte, windowsOmitted: "unclassified-startup-text" };
+      : body !== null && body !== normalize(expected) ? "extracted_text_mismatch" : undefined;
+    return { ...positions, ...(reason ? { reason } : {}), captureScrollbackLines, windowsOmitted: "unclassified-startup-text" };
   } catch {
     return undefined;
   }

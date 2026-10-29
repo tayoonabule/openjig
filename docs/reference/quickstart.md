@@ -6,6 +6,25 @@ talk to one agent, and it hands work to the others. The team keeps its tasks and
 Most people let their coding agent set it up. This page explains what happens either way, so nothing is a black
 box, and shows how to do each step by hand if you'd rather.
 
+## The quick way: let your coding agent do it
+
+In your project folder, add OpenRig's `rigs` skill to the agent you use:
+
+```sh
+# Claude Code
+npx skills add https://github.com/mvschwarz/openrig/tree/<release-tag>/skills/rigs --skill rigs --agent claude-code
+# Codex
+npx skills add https://github.com/mvschwarz/openrig/tree/<release-tag>/skills/rigs --skill rigs --agent codex
+```
+
+For a new install, use the latest release's tag, for example `v0.7.5`. If OpenRig is already installed, use the tag
+that matches `rig --version`, or upgrade first. If the command fails with `npx: command not found`, Node.js isn't
+installed or isn't on your PATH yet (see [What you need](#what-you-need)). Then type `/rigs` in Claude Code, or `$rigs` in Codex, and say what
+you want built.
+
+The skill has your agent work through the steps below in order. It says what it will run and change before it runs
+it, and it asks before installing anything on your system. It finishes when you're talking to the operator.
+
 ## How the pieces fit
 
 - **`rig`** is the command you and your agents use. It comes from the npm package `@openrig/cli`.
@@ -30,24 +49,18 @@ Ask your coding agent to help use the toolchain already on your machine. On a Ma
 may belong to another user; do not change its ownership to complete this setup. After correcting PATH or installing
 Node, open a new terminal and check `node --version` and `npx --version` before continuing.
 
-## The quick way: let your coding agent do it
-
-In your project folder, add OpenRig's `rigs` skill to the agent you use:
+On a Mac where you aren't an administrator, or where another account owns Homebrew, install Node.js in your own home
+folder with [nvm](https://github.com/nvm-sh/nvm); nvm itself needs no administrator password. A new Mac account has no
+`~/.zshrc`, and nvm's installer only adds itself to a profile file that already exists, so create one first:
 
 ```sh
-# Claude Code
-npx skills add https://github.com/mvschwarz/openrig/tree/<release-tag>/skills/rigs --skill rigs --agent claude-code
-# Codex
-npx skills add https://github.com/mvschwarz/openrig/tree/<release-tag>/skills/rigs --skill rigs --agent codex
+touch ~/.zshrc
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | bash
 ```
 
-For a new install, use the latest release's tag, for example `v0.6.12`. If OpenRig is already installed, use the tag
-that matches `rig --version`, or upgrade first. If the command fails with `npx: command not found`, Node.js isn't
-installed or isn't on your PATH yet (see above). Then type `/rigs` in Claude Code, or `$rigs` in Codex, and say what
-you want built.
-
-The skill has your agent work through the steps below in order. It says what it will run and change before it runs
-it, and it asks before installing anything on your system. It finishes when you're talking to the operator.
+Then open a new terminal and run `nvm install 22`. If nvm's installer says you need Apple's command line tools, run
+`xcode-select --install`, then its install command again. That's nvm v0.40.8's install command; [nvm's
+page](https://github.com/nvm-sh/nvm#install--update-script) has the newest.
 
 ## What happens, step by step
 
@@ -67,10 +80,10 @@ Node.js and SQLite check was skipped.
 ### 2. Set up the tools around it
 
 ```sh
-rig setup --providers claude   # or codex, or both
+rig setup --providers claude
 ```
 
-Add `--dry-run` first to see the plan without changing anything. Setup does four things:
+Use `codex` or `both` in place of `claude` to match the coding agents you use. Add `--dry-run` first to see the plan without changing anything. Setup does four things:
 - it checks Node.js, tmux and your sign-in;
 - it installs a missing tmux (with Homebrew on macOS, if you have it) or the coding agent you chose;
 - it installs Herdr, a terminal workspace app the OpenRig view can use, unless you add `--no-herdr`;
@@ -132,10 +145,10 @@ Before it starts one, it tells you what starting a team in your folder changes: 
 `CLAUDE.md`, plus the team's skills. Then it waits for your yes. As shipped, `starter` uses both Claude Code and
 Codex. With only one of them, ask the operator to adapt it.
 
-By hand, from your repository:
+By hand, from your repository (the first command shows what it would start, and starts nothing):
 
 ```sh
-rig up starter --cwd . --plan    # check what it would start
+rig up starter --cwd . --plan
 rig up starter --cwd .
 rig ps --nodes --rig starter
 ```
@@ -156,10 +169,10 @@ stops that team. `rig daemon stop` stops the background service and leaves agent
 
 ## The one-command install
 
-Instead of steps 1 and 2:
+Instead of steps 1 and 2 (the first line shows the plan and changes nothing):
 
 ```sh
-curl -fsSL https://openrig.dev/install.sh | sh -s -- --dry-run   # shows the plan and changes nothing
+curl -fsSL https://openrig.dev/install.sh | sh -s -- --dry-run
 curl -fsSL https://openrig.dev/install.sh | sh
 ```
 
@@ -179,6 +192,18 @@ it as the step to finish: sign in, then continue at step 3.
 - **OpenRig view:** the terminal view that opens on the operator. In a wide window the dashboard sits beside it;
   otherwise, or when the width can't be measured, the dashboard is on its own page. `saved:kernel` in
   `rig terminal open saved:kernel` is the name of this saved view.
+
+## Learn it in this order
+
+1. **How OpenRig works:** [the world and its purpose](../../packages/daemon/assets/onboarding/01-world-and-purpose.md),
+   the first page a new agent in a team gets. It's written to agents, and it's the shortest account of rigs, seats and
+   queued work. Your install has the same page under `$(npm root -g)/@openrig/cli/daemon/assets/onboarding/`.
+2. **First use:** this page, and [what these words mean](#what-these-words-mean).
+3. **One command:** `rig <command> --help` is the exact answer for the version you have installed, and `rig --help`
+   lists every command.
+4. **Every command and flag:** the [CLI reference](../as-built/cli-reference.md).
+   It describes the source commit it names, so where it and your installed `--help` disagree, `--help` is right for
+   your version.
 
 ## More
 

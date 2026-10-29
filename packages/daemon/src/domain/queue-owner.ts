@@ -87,3 +87,15 @@ export function resolveRigRepresentativeById(db: Database.Database, rigId: strin
     .get(roots[0]!.nodeId) as { session_name: string } | undefined;
   return row?.session_name ?? null;
 }
+
+/** Resolve an in-rig lead cue to the rig's unique delegation root, not merely the
+ *  seat's immediate parent. A direct parent may be a specialist without assignment
+ *  authority. Ambiguous or incomplete topology remains unresolved rather than guessed. */
+export function resolveRigRepresentativeForSession(db: Database.Database, session: string): string | null {
+  const nodeId = resolveSessionNodeId(db, session);
+  if (!nodeId) return null;
+  const row = db.prepare(
+    `SELECT r.name AS rigName FROM nodes n JOIN rigs r ON r.id = n.rig_id WHERE n.id = ?`,
+  ).get(nodeId) as { rigName: string } | undefined;
+  return row?.rigName ? resolveRigRepresentative(db, row.rigName) : null;
+}

@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import type { EventBus } from "./event-bus.js";
-import { defaultResolveOrchestrator } from "./queue-owner.js";
+import { resolveRigRepresentativeForSession } from "./queue-owner.js";
 import type { QueueRepository } from "./queue-repository.js";
 
 /**
@@ -42,7 +42,7 @@ export function startQueueEmptyFrontierNotice(deps: {
   resolveLead?: (db: Database.Database, session: string) => string | null;
   sourceSession?: string;
 }): () => void {
-  const resolveLead = deps.resolveLead ?? defaultResolveOrchestrator;
+  const resolveLead = deps.resolveLead ?? resolveRigRepresentativeForSession;
   const sourceSession = deps.sourceSession ?? "daemon@kernel";
   const candidates = new Map<string, Map<string, string>>();
   const notifying = new Set<string>();

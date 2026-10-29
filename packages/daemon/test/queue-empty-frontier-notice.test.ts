@@ -1,4 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
+import { createDb } from "../src/db/connection.js";
+import { migrate } from "../src/db/migrate.js";
+import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
+import { EventBus } from "../src/domain/event-bus.js";
+import { QueueRepository } from "../src/domain/queue-repository.js";
 import {
   EMPTY_FRONTIER_NOTICE_ENV,
   EMPTY_FRONTIER_NOTICE_TAG,
@@ -128,7 +133,8 @@ describe("queue empty-frontier notice", () => {
     h.completion("q2");
     await flush();
     expect(h.created).toHaveLength(1);
-    expect(h.created[0]?.body).toContain("q1, q2");
+    expect(h.created[0]?.body).toContain("q1 (no-follow-on)");
+    expect(h.created[0]?.body).toContain("q2 (no-follow-on)");
     const noticeId = "notice-1";
     h.emit({ type: "queue.updated", qitemId: noticeId, fromState: "in-progress", toState: "done", closureReason: "no-follow-on" });
     await flush();
@@ -140,5 +146,63 @@ describe("queue empty-frontier notice", () => {
     const h = harness();
     h.stop();
     expect(h.queueRepo.create).not.toHaveBeenCalled();
+  });
+
+  it("cues the original sender after a real handoff and idle event, not the recipient successor", async () => {
+    const db = createDb();
+    migrate(db, ALL_MIGRATIONS);
+    const eventBus = new EventBus(db);
+    const repo = new QueueRepository(db, eventBus, { validateRig: () => true });
+    let activity = "working";
+    const stop = startQueueEmptyFrontierNotice({
+      db,
+      eventBus,
+      queueRepo: repo,
+      seatActivity: { getSeatStateBySession: () => ({ activity }) },
+      resolveLead: (_db, seat) => seat === "researcher@test" ? "lead@test" : null,
+    });
+
+    try {
+      const source = await repo.create({
+        sourceSession: "lead@test",
+        destinationSession: "researcher@test",
+        body: "research the existing bug",
+        nudge: false,
+      });
+      repo.claim({ qitemId: source.qitemId, destinationSession: "researcher@test" });
+      const handoff = await repo.handoff({
+        qitemId: source.qitemId,
+        fromSession: "researcher@test",
+        toSession: "architect@test",
+        body: "review the research",
+        nudge: false,
+      });
+      expect(handoff.closed.state).toBe("handed-off");
+      expect(handoff.created.destinationSession).toBe("architect@test");
+
+      activity = "idle-at-prompt";
+      eventBus.emit({
+        type: "seat.activity_changed",
+        sessionName: "researcher@test",
+        seatNodeId: "researcher-node",
+        seq: 1,
+        at: new Date().toISOString(),
+      } as never);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      const cues = db.prepare(
+        "SELECT source_session, destination_session, body, tags FROM queue_items WHERE source_session = 'daemon@kernel' AND tags LIKE ?",
+      ).all(`%${EMPTY_FRONTIER_NOTICE_TAG}%`) as Array<{ source_session: string; destination_session: string; body: string; tags: string }>;
+      expect(cues).toHaveLength(1);
+      expect(cues[0]?.destination_session).toBe("lead@test");
+      expect(cues[0]?.body).toContain(`${source.qitemId} (handed off to architect@test)`);
+      expect(cues[0]?.body).toContain("successor belongs to its recipient");
+      expect(repo.getById(handoff.created.qitemId)?.destinationSession).toBe("architect@test");
+      expect(repo.list({ destinationSession: "researcher@test", state: ["pending", "in-progress"] })).toHaveLength(0);
+    } finally {
+      stop();
+      db.close();
+    }
   });
 });

@@ -116,6 +116,17 @@ export async function run(argv = process.argv, io: RunProgramIo = {}): Promise<v
     normalizedArgv[1] = realpathSync(normalizedArgv[1]);
   }
 
+  // This must precede lazy command loading as well as eager entry loading. Lazy commands execute
+  // without importing index.js, where adoption used to happen. Keep the helper dynamically loaded
+  // after compile-cache setup and independent of the eager command graph.
+  try {
+    const { adoptRuntimeSessionSeat } = await import("./runtime-session-seat.js");
+    await adoptRuntimeSessionSeat();
+  } catch (error) {
+    await failedToLoad(normalizedArgv, error, io);
+    return;
+  }
+
   const entryPath = resolveBinEntry(normalizedArgv[1], import.meta.url);
   // A named command loads only its own module (lazy-program.ts), which ships beside the entry.
   if (normalizedArgv.length > 2) {
@@ -150,11 +161,6 @@ export async function run(argv = process.argv, io: RunProgramIo = {}): Promise<v
     await failedToLoad(normalizedArgv, error, io);
     return;
   }
-  // Slice 17: the PUBLIC bin is the real front door — bare `rig` in a TTY
-  // opens the TUI here, not only under a direct `node dist/index.js` run
-  // (guard finding 1: importing the entry makes its isDirectRun false).
-  // Feature-detected so the wrapper still runs an older sibling entry.
-  await (mod as { adoptRuntimeSessionSeat?: () => Promise<void> }).adoptRuntimeSessionSeat?.();
   const owned = mod.runFrontDoor ? await mod.runFrontDoor(normalizedArgv) : false;
   if (owned) return;
   // Slice 15: run through the shared error path so `--json` failures emit a JSON

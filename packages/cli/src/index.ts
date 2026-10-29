@@ -94,6 +94,7 @@ import { policyCommand } from "./commands/policy.js";
 import { startupProofCommand, type StartupProofDeps } from "./commands/startup-proof.js";
 import type { LifecycleDeps } from "./daemon-lifecycle.js";
 import { configureRoot } from "./program-root.js";
+import { adoptRuntimeSessionSeat } from "./runtime-session-seat.js";
 
 export interface ProgramDeps {
   daemonDeps?: LifecycleDeps;
@@ -282,21 +283,7 @@ export function isDirectRun(argv1 = process.argv[1], moduleUrl = import.meta.url
   }
 }
 
-/** A shared runtime server can leak another seat's OPENRIG_* env. If the runtime session id maps to
- *  exactly one seat, that seat is the identity (daemon decides; any failure keeps the env as-is). */
-export async function adoptRuntimeSessionSeat(): Promise<void> {
-  const runtimeId = process.env["JCODE_SESSION_ID"]?.trim();
-  if (!runtimeId) return;
-  try {
-    const base = (process.env["OPENRIG_URL"] || "http://127.0.0.1:7433").replace(/\/+$/, "");
-    const res = await fetch(`${base}/api/whoami/seat`, { headers: { "X-OpenRig-Runtime-Session": runtimeId }, signal: AbortSignal.timeout(1000) });
-    const seat = res.ok ? ((await res.json()) as { seat?: string | null }).seat : null;
-    if (seat && seat !== process.env["OPENRIG_SESSION_NAME"]) {
-      process.env["OPENRIG_SESSION_NAME"] = seat;
-      delete process.env["OPENRIG_NODE_ID"];
-    }
-  } catch { /* keep env identity */ }
-}
+export { adoptRuntimeSessionSeat } from "./runtime-session-seat.js";
 
 // Slice 15 — the shared CLI error/exit path (re-exported for bin-wrapper + tests).
 export { runProgram, wantsJsonOutput } from "./cli-error.js";

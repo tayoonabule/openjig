@@ -372,6 +372,19 @@ describe("ContextMonitor", () => {
     expect(db.prepare("SELECT COUNT(*) AS n FROM usage_samples WHERE node_id = ?").get(codexNode.id)).toEqual({ n: 1 });
   });
 
+  it("still polls a running jcode seat in an archived rig", async () => {
+    const { rig, node, sessionName, resumeToken } = seedJcodeNode();
+    writeJcodeSession(resumeToken);
+    const samples = new UsageSamplesStore(db);
+    const nativeMonitor = new ContextMonitor(db, store, undefined, undefined, undefined, samples);
+    rigRepo.archiveRig(rig.id);
+
+    await nativeMonitor.pollOnce();
+
+    expect(store.getForNode(node.id, sessionName).availability).toBe("known");
+    expect(db.prepare("SELECT COUNT(*) AS n FROM usage_samples WHERE node_id = ?").get(node.id)).toEqual({ n: 1 });
+  });
+
   it.each(["claude-code", "codex"])("still polls a running %s seat in an archived rig", async (runtime) => {
     const { rig, node, sessionName } = runtime === "codex" ? seedCodexNode() : seedClaudeNode();
     if (runtime === "codex") {
@@ -588,6 +601,34 @@ describe("ContextMonitor", () => {
     const row = db.prepare("SELECT startup_status FROM sessions WHERE id=?").get(session.id);
     expect(row).toEqual({ startup_status: timing === "other occupant" ? "ready" : timing === "delivering" ? "pending" : "attention_required" });
     expect(checkReadySpy).toHaveBeenCalledWith(expect.objectContaining({ tmuxSession: sessionName }));
+  });
+
+  it.each(["before", "during", "delivering", "other occupant"])("jcode default-path consent protects pending context (%s)", async timing => {
+    const { rig, node, sessionName, session } = seedJcodeNode("running", "attention_required");
+    const events = new EventBus(db);
+    const pending = () => events.emit({ type: "node.startup_failed", rigId: rig.id, nodeId: node.id,
+      error: "consent", sessionId: timing === "other occupant" ? "old-occupant" : session.id, freshContextPending: true });
+    if (timing === "before" || timing === "other occupant") pending();
+    const jcodeReadySpy = vi.fn(async (): Promise<ReadinessResult> => {
+      if (timing === "during") pending();
+      if (timing === "delivering") {
+        events.emit({ type: "node.startup_pending", rigId: rig.id, nodeId: node.id });
+        db.prepare("UPDATE sessions SET startup_status='pending' WHERE id=?").run(session.id);
+      }
+      return { ready: true };
+    });
+    monitor = new ContextMonitor(db, store, undefined, undefined, { jcode: { checkReady: jcodeReadySpy } });
+
+    // No session JSON is required to test consent gating, just as the Claude contract needs no sidecar.
+    await monitor.pollOnce();
+
+    const row = db.prepare("SELECT startup_status FROM sessions WHERE id=?").get(session.id);
+    expect(row).toEqual({ startup_status: timing === "other occupant" ? "ready" : timing === "delivering" ? "pending" : "attention_required" });
+    expect(jcodeReadySpy).toHaveBeenCalledWith(expect.objectContaining({
+      nodeId: node.id,
+      tmuxSession: sessionName,
+      cwd: "/project",
+    }));
   });
 
   it("pollOnce normalizes stale Claude startup failures back to ready when the runtime is live", async () => {

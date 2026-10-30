@@ -36,6 +36,13 @@ export function jcodeRuntimeDir(stateRoot: string, sessionName: string): string 
   return nodePath.join(stateRoot, sessionName, "runtime");
 }
 
+function readSharedRuntimeDirFile(fsx: { exists(path: string): boolean; readFile(path: string): string }): string {
+  try {
+    const file = nodePath.join(os.homedir(), ".jcode", "scratch", "shared-socket", "shared-runtime-dir.txt");
+    return fsx.exists(file) ? fsx.readFile(file).trim() : "";
+  } catch { return ""; }
+}
+
 /** Where a seat's jcode server lives. A seat is per-seat by default; a marker file
  *  `<stateRoot>/<seat>/shared-server` holding a runtime dir path opts the seat into one shared
  *  server that hosts many seats (reads are then scoped to the seat by `openrig_seat`). */
@@ -50,7 +57,12 @@ export function resolveJcodeServerDir(
       const dir = fsx.readFile(marker).trim();
       if (dir) return { dir, shared: true };
     }
-  } catch { /* fall back to the per-seat dir */ }
+  } catch { /* fall through to the machine-wide shared server */ }
+  // One shared jcode server for every seat. A server per seat multiplies resident memory
+  // and reload churn, so the per-seat dir is only used when no shared dir is configured.
+  const sharedDir = process.env.OPENRIG_JCODE_SHARED_RUNTIME_DIR?.trim()
+    || readSharedRuntimeDirFile(fsx);
+  if (sharedDir) return { dir: sharedDir, shared: true };
   return { dir: jcodeRuntimeDir(stateRoot, sessionName), shared: false };
 }
 /** How long one jcode self-report stays authoritative. The sweep polls at 1Hz, so a live

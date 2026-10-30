@@ -391,6 +391,7 @@ export interface NodeStartupSnapshot {
 }
 
 export interface SnapshotData {
+  environmentBindingsByNode?: Record<string, { version: 1; bindingId: string; resourceId: string; generation: string | null; checkpointId: string | null; nativeType: string | null; nativeId: string | null; destinationCwd: string; nativeState: string }>;
   rig: Rig;
   nodes: NodeWithBinding[];
   edges: Edge[];
@@ -755,6 +756,10 @@ export interface NodeInventoryEntry {
   previousOccupant: string | null;
   handoverAt: string | null;
   tmuxAttachCommand: string | null;
+  /** Structured server identity for clients that attach without a shell. */
+  tmuxServerArgs?: string[];
+  /** Effective mode; inherited non-default sockets also have server arguments. */
+  tmuxServerMode?: "inherit" | "isolated";
   resumeCommand: string | null;
   recoveryGuidance: NodeRecoveryGuidance | null;
   latestError: string | null;

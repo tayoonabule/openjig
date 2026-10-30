@@ -346,6 +346,16 @@ export class StartupOrchestrator {
     if (guard && !guard.ownsLifecycle(input.nodeId)) {
       return guard.lifecycle([input.nodeId], () => this.startNodeWithWarnings(input, warnings));
     }
+    // A contained runtime reconciles saved execution before the ordinary startup prelude writes state or files.
+    if (input.adapter.environment) {
+      input = { ...input, binding: { ...input.binding, launchGeneration: input.binding.launchGeneration ?? this.sessionRegistry.currentOccupantTenure(input.nodeId)?.generationUuid } };
+      try {
+        if (!input.adapter.preflightEnvironmentStartup) throw new Error("Selected environment lacks startup reconciliation");
+        await input.adapter.preflightEnvironmentStartup(input.binding, { resumeToken: input.resumeToken, resumeType: input.resumeType, forkSource: input.forkSource });
+      } catch (error) {
+        return { ok: false, startupStatus: "attention_required", errors: [(error as Error).message] };
+      }
+    }
     try {
       input = { ...input, binding: new NativePermissionStore(this.db).apply(input.binding, input.adapter.runtime) };
       if (input.adapter.runtime === "claude-code") {
@@ -403,6 +413,7 @@ export class StartupOrchestrator {
       && input.forkSource?.kind === "native_id" && input.forkSource.value?.trim()
       ? { parentToken: input.forkSource.value.trim(), isRestore: input.isRestore } : undefined;
     const launchGeneration = this.sessionRegistry.currentOccupantTenure(input.nodeId)?.generationUuid;
+    if (input.adapter.environment) input = { ...input, binding: { ...input.binding, launchGeneration: input.binding.launchGeneration ?? launchGeneration } };
 
     // 1. Mark pending
     this.sessionRegistry.updateStartupStatus(input.sessionId, "pending");
@@ -446,7 +457,8 @@ export class StartupOrchestrator {
     // so the operator's trust-precedence ordering is preserved when the post-launch
     // delivery loop walks the array. Rebuild artifacts are tagged
     // appliesOn: ["fresh_start"] by the resolver, which matches the rebuild context.
-    const sourceFiles = input.rebuildArtifacts && input.rebuildArtifacts.length > 0
+    const restoreEnvironmentContext = !!input.adapter.environment && !!input.binding.environmentRestore && !!input.preserveStartupContext;
+    const sourceFiles = restoreEnvironmentContext ? [] : input.rebuildArtifacts && input.rebuildArtifacts.length > 0
       ? [...input.rebuildArtifacts, ...input.resolvedStartupFiles]
       : input.resolvedStartupFiles;
     // OPR.0.7.0.13 (router, R1.1): the one-line bootstrap is delivered on its own (below), only with a yes, and never
@@ -456,6 +468,13 @@ export class StartupOrchestrator {
       && isSeatSkillsBootstrapLine(f));
     const applicableFiles = sourceFiles.filter((f) => f.appliesOn.includes(context) && !input.replaySkip?.files.has(f.absolutePath)
       && !isSeatSkillsBootstrapLine(f));
+    if (input.adapter.environment) {
+      try {
+        if (!input.adapter.prepareEnvironmentStartup) throw new Error("Selected environment does not support required startup projection");
+        const prepared = await input.adapter.prepareEnvironmentStartup(restoreEnvironmentContext ? input.resolvedStartupFiles : applicableFiles, input.binding);
+        if (prepared.failed.length) return this.fail(input, "failed", prepared.failed.map(file => `Required environment startup input ${file.path}: ${file.error}`), undefined, false, undefined, false, "pre_launch_files", true);
+      } catch (error) { return this.fail(input, "failed", [`Environment startup preparation: ${(error as Error).message}`], undefined, false, undefined, false, "pre_launch_files", true); }
+    }
     const preLaunchFiles: ResolvedStartupFile[] = [];
     let postLaunchFiles: ResolvedStartupFile[] = [];
     for (const f of applicableFiles) {

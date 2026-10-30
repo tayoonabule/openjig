@@ -533,7 +533,7 @@ Examples:
   cmd
     .command("handover")
     .argument("<seat>", "Canonical session name or logical seat ref")
-    .option("--source <source>", "Source: fresh (default; launches a new agent), discovered:<id> (operator-prepared), fork:<id> (native fork of the source conversation), or rebuild (fresh agent primed from the seat's durable artifacts).")
+    .option("--source <source>", "Source: fresh (default; launches a new agent), discovered:<id> (operator-prepared), fork:<seat> (native fork of that seat's conversation, by its session name), or rebuild (fresh agent primed from the seat's durable artifacts).")
     .option("--reason <reason>", "Why the handover is happening")
     .option("--operator <address>", "Operator initiating the handover")
     .option("--dry-run", "Plan the handover without changing topology")
@@ -1323,6 +1323,8 @@ session is refused (use rig unclaim). Stopping ends that agent's session and any
 work in progress: check it first (rig capture <seat>) and stop only a seat you
 own or were asked to stop. rig seat launch <seat> --fresh --reason <text> starts
 a fresh occupant there; it does not resume the stopped conversation.
+A community harness stop closes its managed pane; its native processes or compute
+may outlive it. Inspect their own lifecycle receipts.
 An intentionally stopped seat does not degrade an otherwise running rig.
 Running counts still exclude the stopped seat; stopping every seat leaves the
 rig stopped. Examples:
@@ -1333,6 +1335,7 @@ rig stopped. Examples:
         const s = data["seat"] as { logicalId?: string; rigName?: string } | undefined;
         console.log(`Stopped ${String(data["sessionName"])} (seat ${s?.logicalId}@${s?.rigName}).`);
         console.log("Session marked exited, binding cleared; siblings untouched. Relaunch via the normal launch surface.");
+        if (data["paneOnly"]) console.log("Only the community seat viewer was closed. Native execution, storage and compute may remain; inspect the selected environment or harness lifecycle.");
       });
     });
 
@@ -1507,7 +1510,7 @@ export function handoverCommand(depsOverride?: SeatDeps): Command {
   };
   return new Command("handover")
     .argument("<seat>", "Canonical session name or logical seat ref")
-    .option("--source <source>", "Successor source: fresh (default; launches a new agent), discovered:<id> (operator-prepared), fork:<id> (native fork of the source conversation), or rebuild (fresh agent primed from the seat's durable artifacts).")
+    .option("--source <source>", "Successor source: fresh (default; launches a new agent), discovered:<id> (operator-prepared), fork:<seat> (native fork of that seat's conversation, by its session name), or rebuild (fresh agent primed from the seat's durable artifacts).")
     .option("--reason <reason>", "Why the handover is happening")
     .option("--operator <address>", "Operator initiating the handover")
     .option("--dry-run", "Plan the handover without changing topology")
@@ -1515,8 +1518,8 @@ export function handoverCommand(depsOverride?: SeatDeps): Command {
     .description("Hand a seat to a successor: create -> deliver context -> verify continuity -> rebind")
     .addHelpText("after", `
 All four sources execute (OPR.0.5.5.5): fresh delivers a captured restore
-packet; discovered adopts an operator-prepared live session; fork:<id> launches
-a NATIVE FORK of the source conversation (the successor carries the incumbent
+packet; discovered adopts an operator-prepared live session; fork:<seat> launches
+a NATIVE FORK of that seat's conversation (the successor carries the incumbent
 context from its first byte); rebuild launches fresh and primes from the seat's
 durable artifact chain, recording exactly what it found. A source that cannot
 proceed (e.g. fork with no discoverable native id) refuses honestly before any

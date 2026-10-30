@@ -94,7 +94,7 @@ const LAUNCH_DEPENDENCY_KINDS = new Set(["delegates_to", "spawned_by"]);
 // in the pure leaf module active-occupant.ts, shared with preview, snapshot
 // usability, and lifecycle projection. Imported and re-exported here so the
 // existing export surface and the execution call sites below are unchanged.
-import { resolveActiveSnapshotSession, activeOccupantAmbiguityError, absentSeatResumeHistory, absentSeatResumeHistoryError, freshSeatLaunchCommand } from "./active-occupant.js";
+import { resolveActiveSnapshotSession, activeOccupantAmbiguityError, absentSeatResumeHistory, absentSeatResumeHistoryError, freshSeatLaunchCommand, seatStopCommand } from "./active-occupant.js";
 import { effectiveRestorePolicy, isOrdinaryTerminalSeat, type RestoreSeatFacts, communityLaunchOnlyRestoreReason } from "./restore-policy.js";
 import { communityHarnessOf } from "./built-in-runtimes.js";
 import { communityHarnessStopsRestore } from "./community-harness-presets.js";
@@ -326,6 +326,7 @@ export class RestoreOrchestrator {
    * Launch preparation and native existence checks remain on the execution path. */
   canAttemptRecordedResume(runtime: string | null, resumeType: string | null, resumeToken: string | null): boolean {
     if (typeof resumeToken !== "string" || !resumeToken.trim()) return false;
+    if (runtime === "openshell-claude") return resumeType === "community:openshell-claude";
     if (runtime === "codex") return resumeType === "codex_id" && this.codexResume.canResume(resumeType, resumeToken);
     if (runtime === "claude-code") return this.claudeResume.canResume(resumeType, resumeToken);
     return false;
@@ -1493,6 +1494,11 @@ export class RestoreOrchestrator {
     return freshSeatLaunchCommand(logicalId, this.rigRepo.getRig(rigId)?.rig.name ?? data.rig.name);
   }
 
+  /** The stop a restore reason names first when the rollback kept the seat's pane, so its session is still there. */
+  private stopSeatCommand(rigId: string, data: SnapshotData, logicalId: string): string {
+    return seatStopCommand(logicalId, this.rigRepo.getRig(rigId)?.rig.name ?? data.rig.name);
+  }
+
   /** Replay the preflight-selected source after launch, keeping native identity and startup checks. */
   private async postLaunchRestore(
     entry: PlanEntry,
@@ -1780,6 +1786,8 @@ export class RestoreOrchestrator {
     const replayContained = resumeRequested && !!resumeToken;
     const startupRuntime = startupCtx?.runtime ?? node.runtime ?? null;
     const startupAdapter = seatAdapter(opts?.adapters, startupRuntime, session?.communityHarness);
+    // New compute has no retained context filesystem. Restore the saved file selection, never conversation actions.
+    const restoreEnvironmentContext = replayContained && !!startupAdapter?.environment && !!data.environmentBindingsByNode?.[node.id];
 
     // A new pod-aware agent needs a startup context to run StartupOrchestrator.
     // Do not report a healthy fresh-primed result when that context or adapter
@@ -1846,9 +1854,9 @@ export class RestoreOrchestrator {
         if (adapter) {
           // Prefilter: check which files/entries still exist
           const existsFn = opts.fsOps?.exists ?? (() => true);
-          const sourceEntries = replayContained ? [] : startupCtx.projectionEntries.map((e) => reanchorShippedProjectionEntry(e, undefined, existsFn));
+          const sourceEntries = replayContained && !restoreEnvironmentContext ? [] : startupCtx.projectionEntries.map((e) => reanchorShippedProjectionEntry(e, undefined, existsFn));
           // #261: recognized built-in startup files follow the running install.
-          const sourceFiles = replayContained ? [] : startupCtx.resolvedStartupFiles.map((f) => reanchorBuiltinStartupFile(f, undefined, undefined, existsFn));
+          const sourceFiles = replayContained && !restoreEnvironmentContext ? [] : startupCtx.resolvedStartupFiles.map((f) => reanchorBuiltinStartupFile(f, undefined, undefined, existsFn));
           const sourceActions = replayContained ? [] : startupCtx.startupActions;
           const filteredEntries = sourceEntries.filter((e) => {
             if (!existsFn(e.absolutePath)) {
@@ -1907,6 +1915,7 @@ export class RestoreOrchestrator {
 
           const binding = {
             ...launchResult.binding,
+            ...(data.environmentBindingsByNode?.[node.id] ? { environmentRestore: data.environmentBindingsByNode[node.id] } : {}),
             ...(opts?.claudeExecutable ? { claudeExecutable: opts.claudeExecutable } : {}),
             cwd: node.cwd ?? ".",
             codexConfigProfile: this.liveCodexProfile(rigId, node, selected?.nodeId) ?? undefined,
@@ -2005,11 +2014,16 @@ export class RestoreOrchestrator {
               // with its pane and binding kept, so its output can still be read.
               if (startupResult.missingConversation) {
                 if (!await rollbackOwnBlank()) return changedDuringRollback();
+                // The records can't tell a seat that was never used from one whose conversation is elsewhere (a moved
+                // account or folder), so the seat waits for the person who knows, with the steps that start it fresh. A kept
+                // pane leaves the seat's own tmux session at a shell, which the fresh launch won't replace until it's stopped.
+                const fresh = this.freshSeatCommand(rigId, data, node.logicalId);
+                const steps = opts?.keepPane ? `in two steps: ${this.stopSeatCommand(rigId, data, node.logicalId)}, then ${fresh}` : `in one step: ${fresh}`;
                 return {
                   nodeId: node.id,
                   logicalId: node.logicalId,
                   status: "awaiting-decision",
-                  error: `Original session unresumable: ${startupResult.errors.join("; ")}. The blank session was rolled back; no session is running. Restore the original session manually, or deliberately start only this seat fresh: ${this.freshSeatCommand(rigId, data, node.logicalId)}.`,
+                  error: `Original session unresumable: ${startupResult.errors.join("; ")}. The blank session was rolled back; no session is running. OpenRig's records can't tell whether this conversation was ever used. If you know this seat was never used, nothing is lost by starting only this seat fresh, ${steps}. Otherwise restore the original session manually.`,
                 };
               }
               return {

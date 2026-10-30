@@ -1,3 +1,7 @@
+import { EnvironmentStartup } from "./domain/environment-startup.js";
+import { EnvironmentPlatform } from "./domain/environment-platform.js";
+import { OpenShellDriver } from "./adapters/openshell-driver.js";
+import { isBoundTerminalSeat } from "./domain/terminal-seat.js";
 import { seatAccountHome, effectiveRuntimeHome, type HomeRuntime } from "./domain/seat-runtime-home.js";
 import { reportRestoreDeliveryFailure } from "./domain/compaction-restore-notice.js";
 import { ClaudeTokenUsage, claudeTokenUsageReader } from "./domain/provider/claude-token-usage.js";
@@ -38,6 +42,7 @@ import { NodeLauncher } from "./domain/node-launcher.js";
 import { TmuxOptionDefaultsApplier } from "./domain/tmux-option-defaults.js";
 import { TmuxAdapter } from "./adapters/tmux.js";
 import { setDaemonTmuxServer, tmuxServerArgs } from "./adapters/tmux-server.js";
+import { selectTmuxServer, type TmuxServerMode } from "./domain/tmux-server-selection.js";
 import { CmuxAdapter } from "./adapters/cmux.js";
 import { execArgvCommand, execCommand } from "./adapters/tmux-exec.js";
 import { tmuxControlExec } from "./adapters/tmux-control.js";
@@ -208,6 +213,8 @@ import {
 } from "./openrig-compat.js";
 
 interface DaemonOptions {
+  /** Explicit confined listener; absent means guest activity is unavailable. */
+  guestActivityPort?: number;
   dbPath?: string;
   /** S20 — the effective bind plan (mode/hosts/tailscaleDetected/ignoredRoutingHost),
    *  computed once in index.ts and exposed on /healthz so adoption gates verify
@@ -522,17 +529,33 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   watchdogAutoRegistration.assertLiveSeatCoverage();
   const watchdogHistoryLogInstance = new WatchdogHistoryLog(db);
 
+  // Select before reconciliation: a surviving old server must stay reachable
+  // while a requested move to another server waits for those seats to stop.
+  const tmuxSelection = opts?.tmuxExec || opts?.argvExec ? undefined : await selectTmuxServer({
+    home: OPENRIG_HOME,
+    mode: new ContextPackSettingsStore().resolveOne("terminal.tmux_server").value as TmuxServerMode,
+    persist: dbPath !== ":memory:",
+    registeredSessions: (db.prepare(`
+      SELECT DISTINCT tmux_session AS name FROM bindings
+      WHERE COALESCE(attachment_type, 'tmux') = 'tmux' AND tmux_session IS NOT NULL
+      UNION SELECT s.session_name AS name FROM sessions s
+      WHERE s.id = (SELECT latest.id FROM sessions latest WHERE latest.node_id = s.node_id
+        ORDER BY datetime(latest.created_at) DESC, latest.rowid DESC LIMIT 1)
+        AND s.status <> 'exited'
+    `).all() as Array<{ name: string }>).map(row => row.name).filter(Boolean),
+  });
+  if (tmuxSelection?.note) console.warn(`[tmux] ${tmuxSelection.note}`);
   // An injected string exec keeps the shell path, so its fake sees every command. OPENRIG_TMUX_SHELL=1 keeps it too.
   const spawnedArgvExec = opts?.argvExec
     ?? (opts?.tmuxExec || (process.env.OPENRIG_TMUX_SHELL === "1" && process.platform !== "win32") ? undefined : execArgvCommand);
   // OPENRIG_TMUX_CONTROL=1 drives the real tmux through one control-mode client (tmux-control.ts); by default a client
   // is spawned per command. An injected exec is the test's own, and psmux has no control mode.
   const argvExec = spawnedArgvExec === execArgvCommand && process.platform !== "win32" && process.env.OPENRIG_TMUX_CONTROL === "1"
-    ? tmuxControlExec(execArgvCommand) : spawnedArgvExec;
-  const tmuxAdapter = new TmuxAdapter(opts?.tmuxExec ?? execCommand, undefined, argvExec);
-  // The real tmux runs with this process's environment, so its server is the one $TMUX names.
-  // An injected exec has no server of its own: printed attach commands stay in the default form.
-  setDaemonTmuxServer(opts?.tmuxExec ? [] : tmuxServerArgs(process.env));
+    ? tmuxControlExec(execArgvCommand, { serverArgs: tmuxSelection?.executionArgs }) : spawnedArgvExec;
+  const tmuxAdapter = new TmuxAdapter(opts?.tmuxExec ?? execCommand, undefined, argvExec, tmuxSelection?.executionArgs);
+  // Inherit keeps the native execution environment; attachment metadata still names
+  // its server for a new terminal. Isolated execution and attachment share a fixed socket.
+  setDaemonTmuxServer(tmuxSelection?.serverArgs ?? (opts?.tmuxExec ? [] : tmuxServerArgs(process.env)), tmuxSelection);
   const deliveryGuard = new SeatDeliveryGuard(db, target => resolveGuardTarget(db, target));
   deliveryGuard.recoverActivation();
   tmuxAdapter.deliveryGuard = deliveryGuard;
@@ -1162,11 +1185,26 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     },
   );
 
+  const environmentDriver = new OpenShellDriver();
+  const environmentPlatform = new EnvironmentPlatform(db, environmentDriver);
+  const checkGuestActivityEndpoint = (origin: string) => {
+    const url = new URL(origin);
+    if (!opts?.guestActivityPort || Number(url.port || (url.protocol === "https:" ? 443 : 80)) !== opts.guestActivityPort)
+      throw new Error("The guest activity origin must name the configured guest-only listener; the host API is not a guest endpoint");
+  };
+  const environmentStartup = new EnvironmentStartup(environmentPlatform, nodePath.join(OPENRIG_HOME, "state", "environment-staging"), async input => {
+    // The one shared P6 implementation owns token issuance and ingress validation.
+    const { ActivityGrantStore, guestActivityEnv } = await import("./domain/activity-grants.js");
+    checkGuestActivityEndpoint(input.guestBaseUrl);
+    const grant = new ActivityGrantStore(db).issue({ nodeId: input.nodeId, generation: input.generation, issuedBy: input.seat });
+    return { grantId: grant.grantId, env: guestActivityEnv(grant, input.seat, input.guestBaseUrl) };
+  }, checkGuestActivityEndpoint);
+
   const podInstantiator = new PodRigInstantiator({
     db, rigRepo, podRepo,
     sessionRegistry, eventBus, nodeLauncher, startupOrchestrator,
     fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), exists: (p: string) => fs.existsSync(p) },
-    adapters: withCommunityHarnesses({ "claude-code": claudeAdapter, "codex": codexAdapter, "jcode": jcodeAdapter, "pi": piAdapter, "omp": ompAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() }, { tmux: tmuxAdapter, seatLaunchEnvironment }),
+    adapters: withCommunityHarnesses({ "claude-code": claudeAdapter, "codex": codexAdapter, "jcode": jcodeAdapter, "pi": piAdapter, "omp": ompAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() }, { tmux: tmuxAdapter, seatLaunchEnvironment, environmentStartup }),
     tmuxAdapter,
     agentImageLibrary,
     continuityPolicyMaterializer,
@@ -1231,7 +1269,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     "omp": ompAdapter,
     "stub": stubAdapter,
     "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter(),
-  }, { tmux: tmuxAdapter, seatLaunchEnvironment });
+  }, { tmux: tmuxAdapter, seatLaunchEnvironment, environmentStartup });
   let kernelBootTracker: import("./domain/kernel-boot-tracker.js").KernelBootTracker | undefined;
   try {
     const { bootKernelIfNeeded } = await import("./domain/kernel-boot.js");
@@ -1376,6 +1414,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   });
   const selfAttachService = new SelfAttachService({
     db, rigRepo, podRepo, sessionRegistry, eventBus, tmuxAdapter, transcriptStore,
+    tmuxServer: tmuxSelection,
     claudeContextProvisioner: claudeAdapter,
     // OPR.0.4.3.28 B3 — echo the resolved activity url+token into the self-attach
     // response env so the caller's shell can produce activity signal.
@@ -1437,6 +1476,9 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const compatibleSpecLibraryRoot = getCompatibleOpenRigPath("specs");
 
   const deps: AppDeps = {
+    environmentDriver,
+    environmentArtifactRoot: nodePath.join(runtimeSettings.workspaceRoot, "artifacts", "environments"),
+    environmentStateRoot: nodePath.join(OPENRIG_HOME, "state", "environment-checkpoints"),
     databaseWarnings,
     rigRepo,
     sessionRegistry,
@@ -1526,6 +1568,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     transcriptStore,
     sessionTransport: (() => {
       const t = new SessionTransport({
+        contextUsageStore,
         db,
         rigRepo,
         sessionRegistry,
@@ -2302,6 +2345,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       eventBus,
       deliver: makeWatchdogDeliver({
         sessionTransport,
+        isTerminalSeat: (sessionName) => isBoundTerminalSeat(db, sessionName),
         hasPendingPostCompactStage: (sessionName) => deps.compactionEnforcer?.hasPendingPostCompactStage(sessionName) ?? false,
         createContinuityAction: (action) => createContinuityCutoverBaton(action, queueRepoInstance).then(() => {}),
       }),
@@ -2396,6 +2440,13 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
               queueRepoInstance.recordNudgeAttempt(qitemId, result),
             listOpenIds: (destinationSession: string) =>
               queueRepoInstance.listOpenObligations(destinationSession, 500).map((r) => r.qitemId),
+          },
+          isTerminalSeat: (sessionName) => isBoundTerminalSeat(db, sessionName),
+          retentionState: (sessionName) => {
+            const target = resolveGuardTarget(db, sessionName);
+            if (!target) return null;
+            const guard = deliveryGuard.configuration(target.nodeId);
+            return JSON.stringify([target.nodeId, guard.desired.revision, guard.effective.revision, outboxHandlerInstance.retentionUsage(target.nodeId)]);
           },
           occupantGeneration: (sessionName) => sessionRegistry.currentOccupantGenerationForSession(sessionName),
           // The enforcer is constructed below; read its shared instance at evaluation time.

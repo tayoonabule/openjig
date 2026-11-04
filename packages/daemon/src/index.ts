@@ -197,8 +197,8 @@ export function startWakeLadderScheduler(deps: {
   usageLimitJitterSeconds?: number;
   seatActivityService?: Pick<import("./domain/seat-activity-service.js").SeatActivityService, "getSeatState">;
   agentActivityStore?: Pick<import("./domain/agent-activity-store.js").AgentActivityStore, "getLatestForNode">;
-  tmuxAdapter?: Pick<import("./adapters/tmux.js").TmuxAdapter, "listPanes" | "readAllPaneProcesses" | "capturePaneScreen">;
-  gatewaySubsystem?: { dispatch: (op: string, entityBindingRef: string, payload: unknown, opts?: { decisionId?: string }) => import("./domain/gateway/dispatcher.js").DispatchResult };
+  tmuxAdapter?: Pick<import("./adapters/tmux.js").TmuxAdapter, "listPanes" | "readAllPaneProcesses" | "capturePaneScreen" | "getPanePid">;
+  gatewaySubsystem?: { status?: () => { state?: unknown }; dispatch: (op: string, entityBindingRef: string, payload: unknown, opts?: { decisionId?: string }) => import("./domain/gateway/dispatcher.js").DispatchResult };
 }): WakeLadderScheduler | null {
   const queueRepo = deps.queueRepo;
   if (!queueRepo) return null;
@@ -213,6 +213,7 @@ export function startWakeLadderScheduler(deps: {
     ? makeOperatorDeliveryEngine({
         home: OPENRIG_HOME,
         queueRepo,
+        gatewayState: () => String(deps.gatewaySubsystem?.status?.().state ?? "unavailable"),
         dispatch: (op, ref, payload, opts) => deps.gatewaySubsystem!.dispatch(op, ref, payload, opts),
       })
     : undefined;

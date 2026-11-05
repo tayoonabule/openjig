@@ -129,6 +129,7 @@ import { WakeResolveService, WAKE_SESSIONS_SQL } from "./domain/wake-resolve-ser
 import type { WakeSessionRow } from "./domain/wake-resolver.js";
 import { ChatRepository } from "./domain/chat-repository.js";
 import { StreamStore } from "./domain/stream-store.js";
+import { StreamIntakeCoordinator } from "./domain/stream-intake.js";
 import { SlowOpRecorder, type SlowOperationInstrumentation } from "./domain/slow-op-recorder.js";
 import { configureSyncSiteRecorder } from "./domain/sync-site-wrap.js";
 import { RequestPhaseObserver } from "./domain/request-phase-observer.js";
@@ -482,6 +483,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // db.transaction commits atomically with the close + successor create.
   const outboxHandlerInstance = new OutboxHandler(db);
   queueRepoInstance.attachOutbox(outboxHandlerInstance);
+  outboxHandlerInstance.reconcileAbandonedSending("watchdog-occurrence-");
   // Reconcile only the prior process's claims, before transport/producers/timers can start new sends.
   let reconciledWakeIntents = 0;
   try {
@@ -569,8 +571,10 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // window: 3s per slice 15 README. Per-seat silenceWindowSeconds from
   // AgentSpec.profile.activity is currently inert (the poller uses the
   // global default; per-seat windows are not wired to the live poll).
+  const seatStructuralActivityService = new SeatStructuralActivityService(tmuxAdapter);
   const seatActivityService = new SeatActivityService({
     tmux: tmuxAdapter,
+    structuralActivity: seatStructuralActivityService,
     defaultWindowSeconds: 3,
     permissionPromptReader: async (sessionName, runtime) => {
       if (runtime === "claude-code") {
@@ -607,7 +611,6 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // 5b82324b — the STRUCTURAL activity cache (sibling of SeatActivityService). Captures pane TEXT once
   // per running seat per tick + classifies motion STRUCTURALLY, so the `rig ps` ACTIVITY column reflects
   // real liveness for hook-less / stale-hook / turn-boundary seats WITHOUT a per-request capture storm.
-  const seatStructuralActivityService = new SeatStructuralActivityService(tmuxAdapter);
   // A confirmed prompt clearing recovers its refused queue wakes immediately, using the same
   // hook/pane resolution as status. No new captures, timer or delivery admission path.
   const retryPromptWakes = (sessionName: string) => {
@@ -1621,6 +1624,13 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     })(),
     chatRepo: new ChatRepository(db),
     streamStore,
+    streamIntakeCoordinator: new StreamIntakeCoordinator({
+      db,
+      eventBus,
+      streamStore,
+      queueRepo: queueRepoInstance,
+      destination: () => String(new ContextPackSettingsStore().resolveOne("stream.intake").value),
+    }),
     slowOpRecorder,
     queueRepo: queueRepoInstance,
     inboxHandler: new InboxHandler(db, eventBus, queueRepoInstance),
@@ -2356,6 +2366,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       eventBus,
       deliver: makeWatchdogDeliver({
         sessionTransport,
+        outbox: outboxHandlerInstance,
         isTerminalSeat: (sessionName) => isBoundTerminalSeat(db, sessionName),
         hasPendingPostCompactStage: (sessionName) => deps.compactionEnforcer?.hasPendingPostCompactStage(sessionName) ?? false,
         createContinuityAction: (action) => createContinuityCutoverBaton(action, queueRepoInstance).then(() => {}),
@@ -2372,8 +2383,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       resolvePreDeliveryTerminalReason: ({ jobId }) =>
         queueRepoInstance.resolveWatchdogPreDeliveryTerminalReason(jobId),
       resolveQueueWait: (input) => queueRepoInstance.evaluateWaitReminder(input),
-      onWakeAttempt: ({ jobId, deliveryStatus }) => {
-        queueRepoInstance.recordWatchdogWakeAttempt(jobId, deliveryStatus);
+      onWakeAttempt: ({ jobId, deliveryStatus, retryAt }) => {
+        queueRepoInstance.recordWatchdogWakeAttempt(jobId, deliveryStatus, retryAt);
       },
       // Due parked-row reminders for one seat in one scheduler pass go as one message.
       resolveDigestEntry: ({ jobId, message }) => queueRepoInstance.parkReminderDigestEntry(jobId, message),

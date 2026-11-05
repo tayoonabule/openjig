@@ -2,9 +2,10 @@ import { expectedConversation, sameConversation, resolveExpectedConversation, ty
 import type { ContextUsageStore } from "./context-usage-store.js";
 import { physicalSessionName } from "./session-registry.js";
 import { currentClaudeMcpMenu } from "./claude-mcp-menu.js";
+import { currentClaudeThemeMenu } from "./claude-theme-menu.js";
 import { currentClaudeResumePicker } from "./native-resume-probe.js";
 import stringWidth from "string-width";
-import { CODEX_TURN_STATUS_PATTERN } from "./codex-pane-patterns.js";
+import { CODEX_LIVE_WORKING_FRAME_PATTERN, CODEX_TURN_STATUS_PATTERN } from "./codex-pane-patterns.js";
 import { randomUUID } from "node:crypto";
 import { COLLAPSED_PASTE, composerRegion, isComposerFooter, isClaudePasteHint, inspectStartupStagedText, QUEUED_PLACEHOLDER, startupSubmissionEvidence, type StartupSubmissionEvidence } from "./startup-submission-evidence.js";
 import {
@@ -170,6 +171,18 @@ function findPatternEvidence(lines: string[], patterns: RegExp[]): string | null
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]!;
     if (patterns.some((pattern) => pattern.test(line))) return truncateEvidence(line);
+  }
+  return null;
+}
+
+/** A numbered choice, with or without the selector a platform draws before it (`❯`, `›`, or ASCII `>` on Windows). */
+const PROMPT_CHOICE_LINE = /^(?:[❯›>]\s*)?\d+\.\s+\S/;
+
+/** The last permission question with a numbered choice after it, as every native menu draws one. */
+function findPermissionQuestionWithChoices(lines: string[]): string | null {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (PERMISSION_PROMPT_PATTERNS.some((pattern) => pattern.test(lines[i]!))
+        && lines.slice(i + 1).some((line) => PROMPT_CHOICE_LINE.test(line))) return truncateEvidence(lines[i]!);
   }
   return null;
 }
@@ -666,7 +679,15 @@ export function classifyPaneActivity(paneContent: string, options: ClassifyPaneO
     ? lastLine
     : null;
   const oldQuestionEnd = promptScanLines.lastIndexOf(CLAUDE_QUESTION_FOOTER);
-  const permissionPromptEvidence = findPatternEvidence(promptScanLines, PERMISSION_PROMPT_PATTERNS);
+  // Above Claude's complete, empty input box with its mode bar, a permission question counts only with its numbered
+  // choices after it, as every native menu draws them: a bare question there is a finished reply quoting one, and
+  // refusing on it held wakes until the line scrolled out of the scan. Without that box, or on another runtime, any
+  // listed question line counts, as before.
+  const emptyClaudeInputBelow = options.runtime === "claude-code" && claudeComposer?.framed === true &&
+    CLAUDE_ANCHORED_MODE_FOOTER.test(claudeComposer.bar) && IDLE_PROMPT_PATTERNS.some(pattern => pattern.test(claudeComposer.text));
+  const permissionPromptEvidence = emptyClaudeInputBelow
+    ? findPermissionQuestionWithChoices(promptScanLines)
+    : findPatternEvidence(promptScanLines, PERMISSION_PROMPT_PATTERNS);
   // A complete later empty composer with a recognized Claude bar makes the preceding question history.
   // Keep draft handling and selectors without this dialog boundary unchanged.
   const selectionLines = claudeComposer?.framed &&
@@ -688,7 +709,9 @@ export function classifyPaneActivity(paneContent: string, options: ClassifyPaneO
     : null;
   // Claude's resume picker types a paste into its search and resumes a card on Enter. A Codex or Pi pane printing one is output.
   const claudePicker = options.runtime === "codex" || options.runtime === "pi" ? null : currentClaudeResumePicker(paneContent);
-  const selectionPromptEvidence = claudePicker ?? currentClaudeMcpMenu(paneContent) ?? findCurrentClaudeQuestion(paneContent) ??
+  const themeMenu = options.runtime === undefined || options.runtime === "claude-code"
+    ? currentClaudeThemeMenu(paneContent) : null;
+  const selectionPromptEvidence = themeMenu ?? claudePicker ?? currentClaudeMcpMenu(paneContent) ?? findCurrentClaudeQuestion(paneContent) ??
     currentComposerSelection ?? (options.currentClaudeDialogueOnly ? null
       : findPatternEvidence(selectionLines, [COMPOSER_SELECTION_SCAN_PATTERN]));
   if (selectionPromptEvidence) {
@@ -1284,19 +1307,20 @@ function promptAnswerStaged(pane: string | null, answer: string, runtime: string
 // Codex 0.160 input box: the last prompt line plus indented continuation rows, one blank row, then a footer
 // of at most two rows: the `<model> · <~ or /path>` status line, optionally followed by one known hint row.
 const CODEX_STATUS_LINE = /^ {2}[^\s·][^·]* · [~/]/;
+const CODEX_NATIVE_STATUS_LINE = /^ {2}[^\s·][^·]* · [A-Za-z]:[\\/]/;
 const CODEX_HINT_ROW = /(?:^|\s)\? for shortcuts(?:\s|$)|⚠ \d+ warnings? · f2 to view\s*$/;
 // Codex shows a long paste as this label until it is submitted. Matched on the normalized body.
 const CODEX_COLLAPSED_PASTE = /^\[PastedContent\d+chars\]$/;
 
 /** The supported status/path + optional hint footer ends at the visible bottom.
  * Share only its boundary: capture's placeholder heuristic is not close authority. */
-function codexFooterSeparator(lines: string[]): number {
+function codexFooterSeparator(lines: string[], allowNativePath = false): number {
   let last = lines.length - 1;
   while (last >= 0 && !lines[last]!.trim()) last--;
   let footerStart = last;
   while (footerStart > 0 && lines[footerStart - 1]!.trim()) footerStart--;
   const footer = lines.slice(footerStart, last + 1);
-  if (last < 0 || footer.length > 2 || !CODEX_STATUS_LINE.test(footer[0]!)
+  if (last < 0 || footer.length > 2 || !(CODEX_STATUS_LINE.test(footer[0]!) || (allowNativePath && CODEX_NATIVE_STATUS_LINE.test(footer[0]!)))
     || !footer.slice(1).every((row) => CODEX_HINT_ROW.test(row))) return -1;
   const separator = footerStart - 1;
   return separator >= 1 && !lines[separator]!.trim() ? separator : -1;
@@ -1305,9 +1329,9 @@ function codexFooterSeparator(lines: string[]): number {
 /** The current Codex input box: its normalized text ("" when empty), its rows as drawn (the prompt glyph removed)
  *  and where its prompt row is, or null when the layout is not the recognized one (another footer, a selector, no
  *  blank separator, an older TUI). */
-function codexInputBox(pane: string): { text: string; rows: string[]; lines: string[]; inputAt: number } | null {
+function codexInputBox(pane: string, allowNativePath = false): { text: string; rows: string[]; lines: string[]; inputAt: number } | null {
   const lines = pane.split("\n");
-  const separator = codexFooterSeparator(lines);
+  const separator = codexFooterSeparator(lines, allowNativePath);
   if (separator < 0) return null;
   const promptClass = composerPromptClassForRuntime("codex");
   const inputAt = findComposerInputLineIndex(lines.slice(0, separator), promptClass);
@@ -1430,6 +1454,36 @@ function codexCurrentSelectionLines(pane: string): string[] | null {
   while (status >= 0 && !box.lines[status]!.trim()) status--;
   if (status < 0 || !CODEX_TURN_STATUS_PATTERN.test(box.lines[status]!)) return null;
   return trimPaneLines(box.lines.slice(status).join("\n"));
+}
+
+/** A working status in the adjacent normal-composer slot, rather than arbitrary pane history. */
+export function isCodexLiveWorkingFrame(pane: string): boolean {
+  if (namesAnotherClientVersion(pane, "codex")) return false;
+  const box = codexInputBox(pane, true);
+  if (!box || box.text) return false;
+  let status = box.inputAt - 1;
+  while (status >= 0 && !box.lines[status]!.trim()) status--;
+  return status >= 0 && CODEX_LIVE_WORKING_FRAME_PATTERN.test(box.lines[status]!);
+}
+
+/** Read the elapsed counter from a working-looking line above a recognized empty Codex composer.
+ * A single reading may be history; only a later advancing reading is positive activity evidence. */
+export function codexWorkingElapsed(pane: string): number | null {
+  if (namesAnotherClientVersion(pane, "codex")) return null;
+  const box = codexInputBox(pane, true);
+  if (!box || box.text) return null;
+  for (let i = box.inputAt - 1; i >= 0; i--) {
+    const line = box.lines[i]!;
+    if (!CODEX_LIVE_WORKING_FRAME_PATTERN.test(line)) continue;
+    const match = line.match(/\(((?:\d+[hms]\s*)+)•\s*esc to interrupt/);
+    if (!match) return null;
+    let seconds = 0;
+    for (const part of match[1]!.matchAll(/(\d+)([hms])/g)) {
+      seconds += Number(part[1]) * (part[2] === "h" ? 3600 : part[2] === "m" ? 60 : 1);
+    }
+    return seconds;
+  }
+  return null;
 }
 
 /** Whether a Claude Code frame shows a running turn: `esc to interrupt` in the footer under its input box, or a
@@ -2492,7 +2546,10 @@ export class SessionTransport {
       if (result.outcome !== "retained") {
         try {
           for (const id of ids) {
-            if (result.ok) outbox.markDelivered(id);
+            if (result.ok) {
+              if (result.outcome === "rendered-unconfirmed" || (opts?.verify && result.verified !== true)) outbox.markIndeterminate(id);
+              else outbox.markDelivered(id);
+            } else if (result.inputPhase === "attempted" || result.inputPhase === "written") outbox.markIndeterminate(id);
             else if (result.sent === false || result.inputPhase === "not_reached") outbox.markFailed(id);
             else outbox.markIndeterminate(id);
           }
@@ -2503,11 +2560,20 @@ export class SessionTransport {
       // Before-input conditional failures never fall back to an ordinary send.
       const written = (error as { inputWritten?: boolean }).inputWritten;
       const attempted = (error as { inputAttempted?: boolean }).inputAttempted;
-      if (admitted && !written && !attempted) for (const id of ids) { try { if (outbox.getById(id)) outbox.markFailed(id); } catch { /* Original refusal remains authoritative. */ } }
+      let receiptUnconfirmed = false;
+      if (admitted) for (const id of ids) {
+        try {
+          if (outbox.getById(id)) {
+            if (written || attempted) outbox.markIndeterminate(id);
+            else outbox.markFailed(id);
+          }
+        } catch { receiptUnconfirmed = true; }
+      }
       return { ok: false, sessionName, identityContract: 1, outboxIds: ids,
         sent: written ? true : attempted ? undefined : false,
         inputPhase: written ? "written" : attempted ? "attempted" : "not_reached",
-        reason: (error as { code?: string }).code ?? "expected_identity_unavailable", error: (error as Error).message };
+        reason: (error as { code?: string }).code ?? "expected_identity_unavailable", error: (error as Error).message,
+        ...(receiptUnconfirmed ? { warning: "Conditional input receipt could not be finalized; inspect before retrying." } : {}) };
     }
   }
 
@@ -2693,6 +2759,7 @@ export class SessionTransport {
         sessionName,
         reason: "transport_unavailable",
         error: `Session '${sessionName}' is attached as an external CLI node. Inbound tmux transport is unavailable for this target.`,
+        sent: false, inputPhase: "not_reached",
       } };
     }
     const runtime = meta.runtime;
@@ -2737,6 +2804,7 @@ export class SessionTransport {
           sessionName,
           reason: "session_missing",
           error: `Session '${sessionName}' not found: tmux reports no session with this name. No text was sent. Check available sessions with: rig ps --nodes`,
+          sent: false, inputPhase: "not_reached",
         } };
       }
       if (probe.state === "transport_unavailable") {
@@ -2745,6 +2813,7 @@ export class SessionTransport {
           sessionName,
           reason: "tmux_unavailable",
           error: `The tmux server could not be reached (${probe.cause}). Whether session '${sessionName}' exists was not determined. No text was sent.`,
+          sent: false, inputPhase: "not_reached",
         } };
       }
     } catch (err) {
@@ -2753,6 +2822,7 @@ export class SessionTransport {
         sessionName,
         reason: "tmux_unavailable",
         error: `The tmux session probe failed unexpectedly (${err instanceof Error ? err.message : String(err)}). Whether session '${sessionName}' exists was not determined. No text was sent.`,
+        sent: false, inputPhase: "not_reached",
       } };
     }
     const deadlineAt = Date.now() + timeoutMs;
@@ -2870,6 +2940,7 @@ export class SessionTransport {
         sessionName,
         reason: "transport_unavailable",
         error: `Session '${sessionName}' is attached as an external CLI node. Inbound tmux transport is unavailable for this target.`,
+        sent: false, inputPhase: "not_reached",
       };
     }
 
@@ -2923,6 +2994,7 @@ export class SessionTransport {
           sessionName,
           reason: "session_missing",
           error: `Session '${sessionName}' not found: tmux reports no session with this name. No text was sent. Check available sessions with: rig ps --nodes`,
+          sent: false, inputPhase: "not_reached",
         };
       }
       if (probe.state === "transport_unavailable") {
@@ -2931,6 +3003,7 @@ export class SessionTransport {
           sessionName,
           reason: "tmux_unavailable",
           error: `The tmux server could not be reached (${probe.cause}). Whether session '${sessionName}' exists was not determined. No text was sent.`,
+          sent: false, inputPhase: "not_reached",
         };
       }
     } catch (err) {
@@ -2939,6 +3012,7 @@ export class SessionTransport {
         sessionName,
         reason: "tmux_unavailable",
         error: `The tmux session probe failed unexpectedly (${err instanceof Error ? err.message : String(err)}). Whether session '${sessionName}' exists was not determined. No text was sent.`,
+        sent: false, inputPhase: "not_reached",
       };
     }
 
@@ -2994,21 +3068,28 @@ export class SessionTransport {
       // The last check runs in the adapter, immediately before the key (after its guard checks).
       const beforeKey = cancel ? () => { if (cancel.aborted) throw new DeliveryGuardError(CALLER_CANCELLED, "caller cancelled before the key"); } : undefined;
       let submitResult;
+      let enterIssued = false;
       try {
         submitResult = await this.runStage(
           "session_transport.submit",
-          () => checkOriginal ? this.tmuxAdapter.sendKeys(sessionName, ["Enter"], () => { beforeOriginalInput(); beforeKey?.(); }, { beforeKeys: checkOriginal })
-            : beforeKey ? this.tmuxAdapter.sendKeys(sessionName, ["Enter"], beforeKey) : this.tmuxAdapter.sendKeys(sessionName, ["Enter"]),
+          () => this.tmuxAdapter.sendKeys(sessionName, ["Enter"], () => {
+            if (checkOriginal) beforeOriginalInput();
+            beforeKey?.();
+            enterIssued = true;
+          }, checkOriginal ? { beforeKeys: checkOriginal } : undefined),
           (result) => result.ok ? "ok" : "failed",
         );
       } catch (error) {
         // Unguarded, the adapter's pre-key check throws instead of returning a result; no key was sent.
-        if (error instanceof DeliveryGuardError && error.code === CALLER_CANCELLED && cancel?.aborted) return callerCancelled(sessionName);
+        if (!enterIssued && error instanceof DeliveryGuardError && error.code === CALLER_CANCELLED && cancel?.aborted) return callerCancelled(sessionName);
+        if (enterIssued && error && typeof error === "object") Object.assign(error, { inputAttempted: true });
         throw error;
       }
-      if (!submitResult.ok && submitResult.code === CALLER_CANCELLED && cancel?.aborted) return callerCancelled(sessionName);
+      if (!submitResult.ok && !enterIssued && submitResult.code === CALLER_CANCELLED && cancel?.aborted) return callerCancelled(sessionName);
       if (!submitResult.ok) {
-        return { ok: false, sessionName, ...(submitResult.code?.startsWith("expected_identity_") ? { sent: false, inputPhase: "not_reached" as const } : {}), reason: submitResult.code?.startsWith("expected_identity_") ? submitResult.code : "submit_failed", outcome: "failed", error: `submitOnly: Enter did not land on '${sessionName}': ${submitResult.message}` };
+        return { ok: false, sessionName, inputPhase: enterIssued ? "attempted" : "not_reached", ...(!enterIssued ? { sent: false } : {}), reason: submitResult.code?.startsWith("expected_identity_") ? submitResult.code : "submit_failed", outcome: "failed", error: enterIssued
+          ? `submitOnly: Enter reported a failure for '${sessionName}'; submission is unconfirmed: ${submitResult.message}`
+          : `submitOnly: Enter was not sent to '${sessionName}': ${submitResult.message}` };
       }
       try { opts.onInputEffect?.("submitted"); } catch { /* Observation cannot change an input result. */ }
       return observe({ ok: true, sessionName, outcome: "rendered-unconfirmed", submitOnly: true });
@@ -3227,6 +3308,7 @@ export class SessionTransport {
             ok: false,
             sessionName,
             reason: "target_needs_input",
+            sent: false, inputPhase: "not_reached",
             activity: readiness,
             error: `Refused: '${sessionName}' is at an interactive prompt (${readiness.reason}). A message must not select or approve it. To deliberately drive the prompt: rig send ${sessionName} "<text>" --dangerously-interact --reason "<why>".${clearAttentionHint(sessionName, readiness.reason)} No text was sent.`,
           };

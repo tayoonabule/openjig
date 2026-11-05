@@ -16,6 +16,8 @@ import type {
 import { COMMUNITY_HARNESS_RUNG_INVENTORY, COMMUNITY_RUNNER_RUNG_INVENTORY, EVIDENCE_RUNG_RANK, runtimeRungInventory } from "./activity-taxonomy.js";
 import { sessionCommunityHarnessSelect, sessionCommunityRunnerSelect } from "./session-registry.js";
 import { hookPrecedes } from "./agent-activity-store.js";
+import type { SeatStructuralActivityService } from "./seat-structural-activity-service.js";
+import { DEFAULT_STRUCTURAL_STALE_MS } from "./seat-structural-activity-service.js";
 
 /** Digit runs are normalised before hashing so countdown/clock/elapsed footers (e.g. "next task in 13h 20m") do not read as
  *  change; any real text change (streamed output, new tool lines, a new prompt) still does.
@@ -57,6 +59,8 @@ export interface SeatActivityServiceDeps {
   permissionPromptChanged?: (sessionName: string, confirmed: boolean, runtime: string) => void;
   /** Runtime-scoped self-report, consulted per sweep for seats declaring the rung. */
   selfReportReader?: (sessionName: string, seatNodeId: string, runtime: string | null) => ActivityEvidence | null | Promise<ActivityEvidence | null>;
+  /** Existing bounded pane observations; only a fresh Codex working frame contributes activity. */
+  structuralActivity?: Pick<SeatStructuralActivityService, "getStructuralActivity">;
   /** A runner seat's last recorded hook, restored when its inventory is declared with no hook evidence yet (after a
    *  daemon restart). Null when nothing qualifies: another generation or session, or nothing recorded. */
   restoreHookEvidence?: (seat: { seatNodeId: string; sessionName: string }, runtime: string) => ActivityEvidence | null;
@@ -79,6 +83,7 @@ export class SeatActivityService {
   private sweeping = false;
   private readonly permissionPromptReader?: SeatActivityServiceDeps["permissionPromptReader"];
   private readonly permissionPromptChanged?: SeatActivityServiceDeps["permissionPromptChanged"];
+  private readonly structuralActivity?: SeatActivityServiceDeps["structuralActivity"];
   // Content evidence for sampled seats: tmux's window_activity also advances on a TUI repaint/timer tick
   // with NO transcript change, which read as endless "working". Per pane: hash of the last captured content
   // and the epoch-ms it last CHANGED. An active-by-window reading with unchanged content for a full silence
@@ -90,6 +95,7 @@ export class SeatActivityService {
   constructor(deps: SeatActivityServiceDeps) {
     this.permissionPromptReader = deps.permissionPromptReader;
     this.permissionPromptChanged = deps.permissionPromptChanged;
+    this.structuralActivity = deps.structuralActivity;
     this.tmux = deps.tmux;
     this.defaultWindowSeconds = deps.defaultWindowSeconds;
     this.eventBus = deps.eventBus ?? null;
@@ -186,16 +192,32 @@ export class SeatActivityService {
     if (seatNodeId) {
       const seq = (this.samplerSeqBySession.get(paneId) ?? 0) + 1;
       this.samplerSeqBySession.set(paneId, seq);
+      const seat = this.ladder.get(seatNodeId);
+      let codexFrameWorking = false;
+      let codexFrameProofAt: string | undefined;
+      if (seat?.inventory?.runtime === "codex" && this.structuralActivity) {
+        const frame = this.structuralActivity.getStructuralActivity(paneId);
+        const capturedAt = frame ? Date.parse(frame.observedAt) : NaN;
+        const frameStarted = frame?.codexWorkingFrame ? Date.parse(frame.codexWorkingFrame.captureStartedAt) : NaN;
+        const proofAt = frame?.codexWorkingFrame ? Date.parse(frame.codexWorkingFrame.proofAt) : NaN;
+        const previousStarted = frame?.codexWorkingFrame?.previousCaptureStartedAt;
+        codexFrameWorking = frame !== null && frame?.state !== "attention" && Number.isFinite(capturedAt)
+          && Number.isFinite(frameStarted) && frameStarted >= seat.inventorySinceMs
+          && (previousStarted === undefined || Date.parse(previousStarted) >= seat.inventorySinceMs)
+          && Number.isFinite(proofAt) && proofAt <= capturedAt && proofAt <= observedAt.getTime()
+          && observedAt.getTime() - proofAt < DEFAULT_STRUCTURAL_STALE_MS && frameStarted <= proofAt;
+        if (codexFrameWorking) codexFrameProofAt = frame!.codexWorkingFrame!.proofAt;
+      }
+      const paneOverridesQuietWindow = codexFrameWorking && !isActiveWithinWindow;
       this.reportEvidence({
         seatNodeId,
         sessionName: paneId,
         rung: "window-sampling",
-        sourceId: "tmux:window-activity",
+        sourceId: paneOverridesQuietWindow ? "codex:working-frame-fallback" : "tmux:window-activity",
         seq,
-        observedAt: record.lastObservedAt,
-        activity: isActiveWithinWindow ? "working" : "idle-at-prompt",
+        observedAt: paneOverridesQuietWindow ? codexFrameProofAt! : record.lastObservedAt,
+        activity: isActiveWithinWindow || codexFrameWorking ? "working" : "idle-at-prompt",
       });
-      const seat = this.ladder.get(seatNodeId);
       if (this.selfReportReader && seat?.inventory?.rungs.some((r) => r.rung === "self-report")) {
         let evd: ActivityEvidence | null = null;
         try {
@@ -469,6 +491,7 @@ export class SeatActivityService {
     seat.retired = false;
     this.sessionToSeat.set(binding.sessionName, binding.seatNodeId);
     seat.inventory = inventory;
+    seat.inventorySinceMs = this.now().getTime();
     seat.trust.clear();
     for (const decl of inventory.rungs) seat.trust.set(decl.rung, decl.initialTrust);
     seat.promotion.clear();
@@ -632,6 +655,7 @@ export class SeatActivityService {
         sessionName,
         retired: false,
         inventory: null,
+        inventorySinceMs: this.now().getTime(),
         sources: new Map(),
         permissions: new Map(),
         claudeToolBatches: new Map(),
@@ -732,6 +756,9 @@ export class SeatActivityService {
       const evd = this.latestByRung(seat, rung, "activity");
       if (!evd || evd.activity === undefined) continue;
       if (evd.validForMs !== undefined && nowMs - Date.parse(evd.observedAt) > evd.validForMs) continue;
+      // A working frame only overrides the quiet window while its proof is fresh, even if polling stops.
+      if (rung === "window-sampling" && evd.sourceId === "codex:working-frame-fallback"
+          && nowMs - Date.parse(evd.observedAt) >= DEFAULT_STRUCTURAL_STALE_MS) return { ...evd, activity: "idle-at-prompt" };
       // A positive-only rung answers only "working"; its silence leaves the state to the rungs below, or unknown.
       if (trust === "positive-only" && evd.activity !== "working") continue;
       // A durable rung's idle or attention boundary holds; a bare working boundary still expires, then falls to the
@@ -973,6 +1000,7 @@ interface SeatLadderState {
   sessionName: string;
   retired: boolean;
   inventory: AdapterRungInventory | null;
+  inventorySinceMs: number;
   sources: Map<string, { latest: ActivityEvidence; latestActivity: ActivityEvidence | null }>;
   trust: Map<EvidenceRungId, RungTrust>;
   promotion: Map<EvidenceRungId, Map<EvidenceRoute | "untagged", PromotionRun>>;

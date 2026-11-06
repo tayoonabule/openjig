@@ -417,6 +417,17 @@ do not establish connectivity to a live peer.
 | `rig acp cancel <runId>` | — | — |
 | `rig acp stop <runId> [stopCommand...]` | — | — |
 
+### exec
+
+| Invocation | Aliases | Declared options |
+|---|---|---|
+| `rig exec` | — | — |
+| `rig exec harnesses` | — | `--json` |
+| `rig exec run <qitemId>` | — | `--harness <name>` **required**<br>`--cwd <dir>`<br>`--permissions-to <session>`<br>`--load-session <id>`<br>`--wait`<br>`--plan`<br>`--again`<br>`--poll-seconds <n>` |
+| `rig exec status <runIdOrQitemId>` | — | `--json` |
+| `rig exec cancel <runId>` | — | — |
+| `rig exec connector <runId>` (hidden) | — | — |
+
 ### agent
 
 | Invocation | Aliases | Declared options |
@@ -461,6 +472,11 @@ do not establish connectivity to a live peer.
 | `rig stream subscriptions` | — | `--json` |
 | `rig stream read` | — | `--limit <n>`<br>`--reader <session>`<br>`--json` |
 | `rig stream act <streamItemId>` | — | `--work <qitemId>`<br>`--decline <reason>`<br>`--duplicate <id>`<br>`--reader <session>`<br>`--json` |
+
+Stream intake: the `stream.intake` setting (default `queue.worker`, or a canonical `<seat>@<rig>`) receives each emitted item.
+It opens an intake row for that seat, which wakes it, or adds a note to that seat's intake row still pending; a `critical`
+or interrupting item makes the row urgent. `rig config set stream.intake off` keeps emits passive. A runner's
+default-permit record (tag `runner-permission-permit`) opens no row.
 
 ### queue
 

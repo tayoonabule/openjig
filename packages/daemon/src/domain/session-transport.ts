@@ -1814,8 +1814,10 @@ export interface SendOpts {
   onInputEffect?: (phase: "pasted" | "submitted") => void;
   /** Internal managed lifecycle prerequisite; never accepted from HTTP send options. */
   beforeWrite?: () => void;
-  /** Internal: managed lifecycle input must preserve a person's draft even when the optional typing guard is off. */
-  preserveInput?: true;
+  /** Internal: managed lifecycle input must preserve a person's draft even when the optional typing guard is off.
+   *  `"typed"` (#2575) holds only a box that reads typed or typed-with-suggestion; any other reading that isn't empty is
+   *  pasted over and named in `pastedOverInputBox`, never called empty. */
+  preserveInput?: true | "typed";
   /** The caller's request. Aborted while the send still waits, before any input starts, the send ends with
    *  `caller_cancelled` and never writes, then or later. Once input may have started it is ignored: the result stays
    *  attempted or written. Queue wakes and committed outbox deliveries have no caller and ignore it. */
@@ -1988,6 +1990,10 @@ export interface SendResult {
   inputPhase?: "not_reached" | "attempted" | "written";
   /** Typed refusal caught before any attempted/written input; never inferred from error text. */
   noInputCode?: "retained_quota_full" | "terminal_seat";
+  /** A `preserveInput: "typed"` send went ahead over an input box it couldn't read as empty: this was the reading. */
+  pastedOverInputBox?: InputBoxAnnotation["status"];
+  /** A `preserveInput` hold: the input box reading it held on. */
+  heldInputBox?: InputBoxAnnotation["status"];
 }
 
 /** One reading of a Claude Code or Codex input box: `exact` (the sent text, word boundaries kept), `ambiguous`
@@ -2885,8 +2891,9 @@ export class SessionTransport {
     };
     // #331: with mouse on, scrolling a seat pane puts it in tmux copy mode. A paste still reaches
     // the input there, but copy mode swallows the Enter, so the send would report ok while the
-    // text sits unsubmitted. Leave the mode once (send-keys -X cancel) and deliver; fail before
-    // typing anything only if the pane still reads as in a mode. An unknown answer keeps today's path.
+    // text sits unsubmitted. Leave every mode the pane is in (copy-mode -q) and deliver; fail before
+    // typing anything only if the pane still reads as in a mode, with the reason the exit failed.
+    // An unknown answer keeps today's path.
     const readPaneInMode = async (): Promise<boolean | null> => {
       try {
         return typeof this.tmuxAdapter.isPaneInMode === "function" ? await this.tmuxAdapter.isPaneInMode(readTarget) : null;
@@ -2894,12 +2901,15 @@ export class SessionTransport {
     };
     const leavePaneMode = async (outcome: string): Promise<SendResult | null> => {
       if (await readPaneInMode() !== true) return null;
+      let failure = "";
+      const failed = (message: string) => { failure = ` Leaving it failed: ${message.trim().replace(/\s+/g, " ").replace(/\.$/, "")}.`; };
       try {
-        if (typeof this.tmuxAdapter.cancelPaneMode === "function") await this.tmuxAdapter.cancelPaneMode(readTarget);
-      } catch { /* the re-read below decides */ }
+        const left = typeof this.tmuxAdapter.cancelPaneMode === "function" ? await this.tmuxAdapter.cancelPaneMode(readTarget) : undefined;
+        if (left && !left.ok) failed(left.message);
+      } catch (error) { failed(error instanceof Error ? error.message : String(error)); }
       if (await readPaneInMode() !== true) return null;
       return { ok: false, sessionName, sent: false, reason: "pane_in_mode",
-        error: `'${sessionName}' is in a tmux mode (such as copy mode) and could not leave it, so Enter would not reach the agent. ${outcome}` };
+        error: `'${sessionName}' is in a tmux mode (such as copy mode) and could not leave it, so Enter would not reach the agent.${failure} ${outcome}` };
     };
     // S01/S02 P2 observation context, frozen at attempt entry before any await.
     const observed = this.captureObserver && !opts?.dangerouslyInteract ? {
@@ -2910,9 +2920,12 @@ export class SessionTransport {
       sentHash: null as string | null,
     } : null;
     let existingInput: ExistingInput | undefined;
+    let pastedOverInputBox: InputBoxAnnotation["status"] | undefined, heldInputBox: InputBoxAnnotation["status"] | undefined;
     let overrideBeforePaste: (() => Promise<void>) | undefined;
     const observe = (result: SendResult): SendResult => {
       if (checkedIdentity) result = { ...result, checkedIdentity, identityContract: 1 };
+      if (pastedOverInputBox) result = { ...result, pastedOverInputBox };
+      if (heldInputBox && !result.ok) result = { ...result, heldInputBox };
       if (existingInput) result = { ...result, existingInput };
       if (result.ok && runtimeAdvisory) result = { ...result, warning: [runtimeAdvisory, result.warning].filter(Boolean).join(" ") };
       if (observed && this.captureObserver) {
@@ -3390,10 +3403,14 @@ export class SessionTransport {
         ? (await this.readAtReadableSize(sessionName, { width: 120, height: 40 }, { remainingMs: CAPTURE_READABLE_BUDGET_MS }, readBox)).value
         : await readBox();
       if (bindingChanged()) throw new DeliveryGuardError("draft_input_changed", "The managed input target changed; no input was written.");
-      if (box?.status !== "empty" && !(box?.status === "likely-suggestion" && box.confidence === "high")) {
+      const clear = box?.status === "empty" || (box?.status === "likely-suggestion" && box.confidence === "high");
+      const typed = box?.status === "typed" || box?.status === "typed-with-suggestion";
+      if (!clear && (opts?.preserveInput !== "typed" || typed)) {
+        heldInputBox = box?.status ?? "unknown";
         throw new DeliveryGuardError(box?.status === "typed" ? "draft_input_busy" : "draft_input_unknown",
           `Managed input waits for an empty composer (it reads ${box?.status ?? "unknown"}). Your draft was left untouched; inspect the pane before retrying.`);
       }
+      if (!clear) pastedOverInputBox = box?.status ?? "unknown";
     } : undefined;
     // Set once the text write has been handed to the adapter: from then on a throw is not "nothing sent".
     let writeIssued = false;

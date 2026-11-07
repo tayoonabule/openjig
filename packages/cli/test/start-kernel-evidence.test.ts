@@ -13,7 +13,7 @@ vi.mock("../src/daemon-lifecycle.js", async (importOriginal) => {
 const servers: http.Server[] = [];
 afterEach(async () => {
   for (const server of servers.splice(0)) { server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); }
-  vi.restoreAllMocks(); resetFetchAllowlist(); process.exitCode = 0;
+  vi.restoreAllMocks(); vi.unstubAllEnvs(); resetFetchAllowlist(); process.exitCode = 0;
 });
 async function run(kernelState?: string, httpStatus = 200, summaryStatus = 200, kernelExtra: Record<string, unknown> = {}, json = false, kernelDetail = "fixture detail", keptDown = false) {
   const received: string[] = [];
@@ -32,6 +32,9 @@ async function run(kernelState?: string, httpStatus = 200, summaryStatus = 200, 
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); }); servers.push(server);
   const port = (server.address() as { port: number }).port;
   const url = `http://127.0.0.1:${port}`; allowFetchTarget(url);
+  // This test intentionally points at a local fixture. Do not let the operator's
+  // optional real-daemon owner guard consume the short polling deadline.
+  vi.stubEnv("OPENRIG_URL", url);
   const lifecycleDeps: LifecycleDeps = {
     spawn: () => { throw new Error("must not spawn"); }, fetch: async (target) => fetch(target),
     kill: () => { throw new Error("must not signal"); }, exists: (file) => file === STATE_FILE,

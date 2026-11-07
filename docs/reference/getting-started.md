@@ -270,6 +270,17 @@ opt in with
 `rig config set terminal.inherit_tmux_environment true`. Setup points out this option
 when it detects custom tmux configuration; it never enables it automatically. The setting
 applies to future launches and successors, not running agents or your personal tmux server.
+
+Managed Codex seats run tool commands in a non-login shell: OpenRig passes Codex
+`-c allow_login_shell=false`. Tool commands inherit the environment their pane's shell set up,
+OpenRig's command folder included, so plain `rig` works however OpenRig was installed.
+Inherited setup isn't re-run for each command. Setup that lives only in login or rc files, such as
+lines in `~/.bashrc` that your login file doesn't source, or a tmux `default-command` that doesn't
+start a login shell, may be missing from tool commands, and so may shell functions and aliases.
+To defer to Codex's own setting instead, run `rig config set launch.codex_login_shell true`. That
+omits OpenRig's override rather than forcing login shells, and a login file that sets `PATH`
+outright can then hide `rig`. It applies at each seat's next launch; a restart in place keeps
+the running choice.
 If the scoped environment cannot be prepared, launch keeps its previous environment and
 reports a warning in fresh launch results and the daemon log. For handovers, check
 that log for this warning. This is not a promise that shell startup cannot add or override values.
@@ -1165,8 +1176,15 @@ rig up ./openrig-specs/rigs/launch/starter/rig.yaml --cwd .
 
 OpenRig's `permission_policy: builtin:yolo` setting selects
 `-s danger-full-access -a never` on fresh, resume and fork launches, replacing
-the named-profile argument. The profile recipe above remains useful when you
-want to maintain those choices in native configuration. The legacy
+the named-profile argument. That drops the whole profile, not only its sandbox
+and approval settings. To keep a named profile with full access, put full access
+in the profile itself and leave `permission_policy` absent, as in the recipe
+above. To keep it with a workspace-write or read-only posture that OpenRig
+records, use the member's `codex_permissions` (see
+[per-member Codex permissions](rig-spec.md#per-member-codex-permissions)):
+OpenRig passes `-p` and adds that envelope's flags, and for that seat the
+envelope replaces a policy posture such as `builtin:yolo`. Full access isn't an
+envelope. The legacy
 environment-only `OPENRIG_YOLO=1` path remains sandbox-only when no resolved
 policy is present. A standalone `codex --yolo` command is not an OpenRig setting.
 At full access, Codex can show its full-access and GPT-5.1 migration notices at

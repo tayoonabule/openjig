@@ -7,6 +7,7 @@ import Database from "better-sqlite3";
 import { parse as parseToml } from "smol-toml";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { CodexRuntimeAdapter, type CodexAdapterFsOps } from "../src/adapters/codex-runtime-adapter.js";
+import { codexNonLoginShellArg } from "../src/domain/native-resume-probe.js";
 import type { NodeBinding, ResolvedStartupFile } from "../src/domain/runtime-adapter.js";
 import type { ProjectionPlan, ProjectionEntry } from "../src/domain/projection-planner.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
@@ -101,7 +102,7 @@ function expectedFreshLaunchCommand(options: { cwd?: string; model?: string; eff
   const queueDirArg = options.queueRoot === null ? "" : ` --add-dir ${quote(options.queueRoot ?? testQueueRoot())}`;
   const modelArg = options.model ? ` -m ${quote(options.model)}` : "";
   const effortArg = options.effort ? ` -c ${quote(`model_reasoning_effort="${options.effort}"`)}` : "";
-  return `codex -s workspace-write '-c' 'check_for_update_on_startup=false' -C ${quote(cwd)}${gitDirArg}${queueDirArg}${modelArg}${effortArg}`;
+  return `codex -s workspace-write '-c' 'check_for_update_on_startup=false' -c 'allow_login_shell=false' -C ${quote(cwd)}${gitDirArg}${queueDirArg}${modelArg}${effortArg}`;
 }
 
 // A resume and a fork add the same git metadata dir as the fresh launch, after the conversation id (`gitCwd` null: none,
@@ -114,14 +115,14 @@ function expectedResumeCommand(token = "sess-456", queueRoot: string | null = te
   const queueDirArg = queueRoot === null ? "" : ` --add-dir ${quote(queueRoot)}`;
   const modelArg = model ? ` -m ${quote(model)}` : "";
   const effortArg = effort ? ` -c ${quote(`model_reasoning_effort="${effort}"`)}` : "";
-  return `codex -s workspace-write '-c' 'check_for_update_on_startup=false'${modelArg}${effortArg} resume ${quote(token)}${queueDirArg}${gitDirOption(gitCwd)}`;
+  return `codex -s workspace-write '-c' 'check_for_update_on_startup=false' -c 'allow_login_shell=false'${modelArg}${effortArg} resume ${quote(token)}${queueDirArg}${gitDirOption(gitCwd)}`;
 }
 
 function expectedForkCommand(parentId = "parent-thread-id", options: { model?: string; effort?: string; queueRoot?: string | null; gitCwd?: string | null } = {}): string {
   const queueDirArg = options.queueRoot === null ? "" : ` --add-dir ${quote(options.queueRoot ?? testQueueRoot())}`;
   const modelArg = options.model ? ` -m ${quote(options.model)}` : "";
   const effortArg = options.effort ? ` -c ${quote(`model_reasoning_effort="${options.effort}"`)}` : "";
-  return `codex -s workspace-write '-c' 'check_for_update_on_startup=false'${modelArg}${effortArg} fork${queueDirArg} ${quote(parentId)}${gitDirOption(options.gitCwd === undefined ? "/project" : options.gitCwd)}`;
+  return `codex -s workspace-write '-c' 'check_for_update_on_startup=false' -c 'allow_login_shell=false'${modelArg}${effortArg} fork${queueDirArg} ${quote(parentId)}${gitDirOption(options.gitCwd === undefined ? "/project" : options.gitCwd)}`;
 }
 
 function expectedProfileFreshLaunchCommand(profile: string, options: { cwd?: string; model?: string; queueRoot?: string | null } = {}): string {
@@ -129,12 +130,12 @@ function expectedProfileFreshLaunchCommand(profile: string, options: { cwd?: str
   const gitDirArg = ` --add-dir ${quote(nodePath.join(cwd, ".git"))}`;
   const queueDirArg = options.queueRoot === null ? "" : ` --add-dir ${quote(options.queueRoot ?? testQueueRoot())}`;
   const modelArg = options.model ? ` -m ${quote(options.model)}` : "";
-  return `codex -p ${quote(profile)} '-c' 'check_for_update_on_startup=false' -C ${quote(cwd)}${gitDirArg}${queueDirArg}${modelArg}`;
+  return `codex -p ${quote(profile)} '-c' 'check_for_update_on_startup=false' -c 'allow_login_shell=false' -C ${quote(cwd)}${gitDirArg}${queueDirArg}${modelArg}`;
 }
 
 function expectedProfileResumeCommand(profile: string, token = "sess-456", queueRoot: string | null = testQueueRoot(), gitCwd: string | null = "/project"): string {
   const queueDirArg = queueRoot === null ? "" : ` --add-dir ${quote(queueRoot)}`;
-  return `codex -p ${quote(profile)} '-c' 'check_for_update_on_startup=false' resume ${quote(token)}${queueDirArg}${gitDirOption(gitCwd)}`;
+  return `codex -p ${quote(profile)} '-c' 'check_for_update_on_startup=false' -c 'allow_login_shell=false' resume ${quote(token)}${queueDirArg}${gitDirOption(gitCwd)}`;
 }
 
 beforeEach(() => {
@@ -608,6 +609,15 @@ describe("Codex runtime adapter", () => {
     expect(sendText).toHaveBeenCalledWith("r01-qa", expectedFreshLaunchCommand());
   });
 
+  it("launch.codex_login_shell on keeps Codex's own login shells: the fresh launch has no non-login flag", async () => {
+    const tmux = mockTmux();
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), listProcesses: () => [], sleep: async () => {}, codexLoginShell: () => true });
+    const result = await adapter.launchHarness(makeBinding(), { name: "dev-qa@test-rig" });
+    expect(result.ok).toBe(true);
+    const sendText = tmux.sendText as ReturnType<typeof vi.fn>;
+    expect(sendText).toHaveBeenCalledWith("r01-qa", expectedFreshLaunchCommand().replace(" -c 'allow_login_shell=false'", ""));
+  });
+
   it("launchHarness passes the requested Codex model on fresh launch", async () => {
     const tmux = mockTmux();
     const adapter = new CodexRuntimeAdapter({
@@ -983,7 +993,7 @@ describe("Codex runtime adapter", () => {
 
     const result = await adapter.buildResumeCommand(binding, {
       name: "dev-qa@test-rig", resumeToken: "sess-456",
-      running: { addDirs: ["/carried/git", "/carried/queue"], daemonOptOut: true, networkOverride: false },
+      running: { addDirs: ["/carried/git", "/carried/queue"], daemonOptOut: true, networkOverride: false, nonLoginShell: false },
     });
 
     expect(result.ok).toBe(true);
@@ -993,6 +1003,15 @@ describe("Codex runtime adapter", () => {
     expect(result.core).not.toContain(testQueueRoot());
     expect(readFile).not.toHaveBeenCalledWith(profilePath);
     expect(verifyProfilePreflight).not.toHaveBeenCalled();
+  });
+
+  it("a relaunch from a running Codex adds the non-login shell flag only when that Codex ran with it", async () => {
+    const adapter = new CodexRuntimeAdapter({ tmux: mockTmux(), fsOps: mockFs() });
+    const running = { addDirs: [], daemonOptOut: false, networkOverride: false };
+    const kept = await adapter.buildResumeCommand(makeBinding(), { name: "dev-qa@test-rig", resumeToken: "sess-456", running: { ...running, nonLoginShell: true } });
+    const unchanged = await adapter.buildResumeCommand(makeBinding(), { name: "dev-qa@test-rig", resumeToken: "sess-456", running: { ...running, nonLoginShell: false } });
+    expect(kept.ok && kept.core).toContain("-c 'allow_login_shell=false' resume 'sess-456'");
+    expect(unchanged.ok && unchanged.core).not.toContain("allow_login_shell");
   });
 
   it("launchHarness passes the disposable proof Codex model on fresh launch", async () => {
@@ -2874,5 +2893,136 @@ describe("a fresh Codex seat's managed guidance as launch developer instructions
     await adapter.launchHarness({ ...makeBinding(), guidanceFile: null } as NodeBinding, { name: "dev-qa@test-rig" });
     const sent = (tmux.sendText as ReturnType<typeof vi.fn>).mock.calls.map((call) => call[1] as string).find((call) => call.includes(" -C '/project'"))!;
     expect(sent).not.toContain("developer_instructions");
+  });
+});
+
+describe("CodexRuntimeAdapter launch_wrapper", () => {
+  it.each((["fresh", "fork", "resume", "recovery"] as const).flatMap((kind) => [[kind, false], [kind, true]] as const))("passes launchWrapper through seatCommand for %s (login shell kept: %s) and keeps unconfigured byte-identical", async (kind, loginShell) => {
+    const tmux = mockTmux();
+    const commandCalls: Array<{ session: string; cmd: string; target: unknown }> = [];
+    const seatLaunchEnvironment = {
+      command: vi.fn(async (session: string, cmd: string, target: { launchWrapper?: readonly string[] }) => {
+        commandCalls.push({ session, cmd, target });
+        const prefix = target.launchWrapper?.length ? target.launchWrapper.map((a) => `'${a}'`).join(" ") + " " : "";
+        return `/usr/bin/env ${prefix}${cmd}`;
+      }),
+    } as never;
+    const adapter = new CodexRuntimeAdapter({
+      tmux,
+      fsOps: mockFs(),
+      seatLaunchEnvironment,
+      resolveGitAddDirs: async () => [],
+      listProcesses: () => [],
+      sleep: async () => {},
+      ...(loginShell ? { codexLoginShell: () => true } : {}),
+    });
+    vi.spyOn(adapter as any, "dismissSkippableCodexUpdatePrompt").mockResolvedValue(undefined);
+    vi.spyOn(adapter as any, "verifyResumeLaunch").mockResolvedValue({ ok: true });
+    vi.spyOn(adapter as any, "captureFreshThreadId").mockResolvedValue("fresh-thread");
+    vi.spyOn(adapter as any, "captureVerifiedForkId").mockResolvedValue("forked-thread");
+
+    const wrapper = ["codex-wrapper", "--seat", "target-seat", "--"];
+    const binding = { ...makeBinding("/project"), launchGeneration: "gen-2", launchWrapper: wrapper } as NodeBinding;
+
+    if (kind === "recovery") {
+      const built = await adapter.buildResumeCommand(binding, { name: "r01-qa", resumeToken: "thread-recovery" });
+      expect(built).toMatchObject({ ok: true });
+      if (built.ok) {
+        expect(built.command).toContain("'codex-wrapper' '--seat' 'target-seat' '--' codex ");
+      }
+    } else {
+      const res = await adapter.launchHarness(binding, {
+        name: "r01-qa",
+        ...(kind === "resume" ? { resumeToken: "thread-resume" } : {}),
+        ...(kind === "fork" ? { forkSource: { kind: "native_id", value: "parent-thread" } } : {}),
+      });
+      expect(res.ok).toBe(true);
+      const sent = (tmux.sendText as ReturnType<typeof vi.fn>).mock.calls[0]![1] as string;
+      expect(sent).toContain("'codex-wrapper' '--seat' 'target-seat' '--' codex ");
+    }
+
+    expect(commandCalls).toHaveLength(1);
+    // The wrapped command carries the non-login setting exactly once, or none when the login shell is kept.
+    expect(commandCalls[0]!.cmd.split(codexNonLoginShellArg).length - 1).toBe(loginShell ? 0 : 1);
+    expect(commandCalls[0]!.cmd).not.toContain(loginShell ? "allow_login_shell" : "allow_login_shell=true");
+    expect(commandCalls[0]!.target).toEqual({
+      codexCwd: "/project",
+      nodeId: "n1",
+      generation: "gen-2",
+      runtime: "codex",
+      launchWrapper: wrapper,
+    });
+    expect("launchShell" in (commandCalls[0]!.target as Record<string, unknown>)).toBe(false);
+  });
+
+  it("forwards launchShell from buildResumeCommand to seatCommand and returns ok:false when seatCommand throws under launchShell", async () => {
+    const tmux = mockTmux();
+    const commandCalls: Array<{ session: string; cmd: string; target: Record<string, unknown> }> = [];
+    let shouldThrow = false;
+    const seatLaunchEnvironment = {
+      command: vi.fn(async (session: string, cmd: string, target: Record<string, unknown>) => {
+        commandCalls.push({ session, cmd, target });
+        if (shouldThrow) throw new Error("launch_wrapper unavailable; no agent started.");
+        return `/usr/bin/env 'codex-wrapper' '--' ${cmd}`;
+      }),
+    } as never;
+    const adapter = new CodexRuntimeAdapter({
+      tmux,
+      fsOps: mockFs(),
+      seatLaunchEnvironment,
+      resolveGitAddDirs: async () => [],
+      listProcesses: () => [],
+      sleep: async () => {},
+    });
+    const wrapper = ["codex-wrapper", "--"];
+    const binding = { ...makeBinding("/project"), launchGeneration: "gen-2", launchWrapper: wrapper } as NodeBinding;
+
+    const okRes = await adapter.buildResumeCommand(binding, { name: "r01-qa", resumeToken: "thread-1", launchShell: "/bin/bash" });
+    expect(okRes).toMatchObject({ ok: true });
+    expect(commandCalls[0]!.target).toEqual({
+      codexCwd: "/project",
+      nodeId: "n1",
+      generation: "gen-2",
+      runtime: "codex",
+      launchWrapper: wrapper,
+      launchShell: "/bin/bash",
+    });
+
+    shouldThrow = true;
+    const failRes = await adapter.buildResumeCommand(binding, { name: "r01-qa", resumeToken: "thread-1", launchShell: "fish" });
+    expect(failRes).toEqual({
+      ok: false,
+      error: "launch_wrapper unavailable; no agent started.",
+    });
+  });
+
+  it("refuses fresh, fork, resume and buildResumeCommand when launchWrapper is selected but seatLaunchEnvironment is absent", async () => {
+    const tmux = mockTmux();
+    const adapter = new CodexRuntimeAdapter({
+      tmux,
+      fsOps: mockFs(),
+      resolveGitAddDirs: async () => [],
+      listProcesses: () => [],
+      sleep: async () => {},
+    });
+    const binding = { ...makeBinding("/project"), launchWrapper: ["codex-wrapper", "--"] } as NodeBinding;
+
+    expect(await adapter.launchHarness(binding, { name: "r01-qa" })).toEqual({
+      ok: false,
+      error: "launch_wrapper support unavailable; no agent started.",
+    });
+    expect(await adapter.launchHarness(binding, { name: "r01-qa", resumeToken: "thread-1" })).toEqual({
+      ok: false,
+      error: "launch_wrapper support unavailable; no agent started.",
+    });
+    expect(await adapter.launchHarness(binding, { name: "r01-qa", forkSource: { kind: "native_id", value: "parent-1" } })).toEqual({
+      ok: false,
+      error: "launch_wrapper support unavailable; no agent started.",
+    });
+    expect(await adapter.buildResumeCommand(binding, { name: "r01-qa", resumeToken: "thread-1" })).toEqual({
+      ok: false,
+      error: "launch_wrapper support unavailable; no agent started.",
+    });
+    expect(tmux.sendText).not.toHaveBeenCalled();
   });
 });

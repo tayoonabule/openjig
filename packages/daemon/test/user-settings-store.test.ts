@@ -123,6 +123,7 @@ describe("SettingsStore (User Settings v0)", () => {
       "skills.router_line.enabled",
       "onboarding.default_pack.enabled",
       "launch.non_interruptive",
+      "launch.codex_login_shell",
       "health.context_pressure.warning_percent",
       "health.context_pressure.critical_percent",
       "files.allowlist", "progress.scan_roots",
@@ -184,6 +185,7 @@ describe("SettingsStore (User Settings v0)", () => {
       "usage.pi_openrouter_charge",
       "transport.verify_input_box",
       "transport.local_user_guard",
+      "transport.draft_delivery",
       // Slice 22 (OPR.0.7.2.22) — typed decisions, off by default.
       "decisions.enabled",
       "decisions.consumers",

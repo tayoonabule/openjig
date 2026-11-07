@@ -153,8 +153,9 @@ describe.skipIf(process.platform === "win32")("the skill's opt-in wake loop", ()
 
   it("stays quiet when a failed poll is followed by a successful one", async () => {
     failLists = 2; // two failures, then the daemon answers again (with no work)
-    const result = await runLoop(4);
+    const result = await runLoop(12);
     expect(result.code).toBe(0);
+    expect(listCalls).toBeGreaterThanOrEqual(3); // two failures, then a successful no-work poll
     expect(result.stdout).toContain("No new work before the deadline");
     expect(result.stdout).not.toContain("Checking stopped working");
   }, 40_000);

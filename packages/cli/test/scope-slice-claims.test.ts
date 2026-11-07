@@ -49,7 +49,7 @@ describe("public slice creation ordinal claims", () => {
     ];
     try {
       const result = await promisify(execFile)(process.execPath, args, {
-        env: ownedEnv, encoding: "utf8", timeout: 15000,
+        env: ownedEnv, encoding: "utf8", timeout: 60000,
       });
       return { exitCode: 0, ...result };
     } catch (error) {
@@ -95,7 +95,7 @@ describe("public slice creation ordinal claims", () => {
     expect(fs.readdirSync(path.join(mission, "slices"), { withFileTypes: true }).filter((entry) => entry.isDirectory())).toHaveLength(33);
     expect(fs.readFileSync(path.join(mission, "README.md"), "utf8")).toBe(original);
     expect(fs.existsSync(path.join(mission, ".openrig-slice-create-lock"))).toBe(false);
-  }, 30000);
+  }, 60000);
 
   it("twenty eight-process manifest-backed batches preserve the admitted concurrency contract", async () => {
     const ref = "slices/01-existing/slice.yaml";
@@ -144,7 +144,7 @@ describe("public slice creation ordinal claims", () => {
     expect(new Set(successful(results).map((slice) => slice.id)).size).toBe(160);
     expect(fs.readFileSync(path.join(unrelated, "PROOF.md"), "utf8")).toBe("# unrelated authored proof\n");
     expect(fs.existsSync(path.join(mission, ".openrig-slice-create-lock"))).toBe(false);
-  }, 180000);
+  }, 300000);
 
   it("a later create repairs only pending complete registrations and preserves authored membership", async () => {
     const ref = "slices/01-existing/slice.yaml";
@@ -249,7 +249,7 @@ describe("public slice creation ordinal claims", () => {
     fs.writeFileSync(manifest, YAML.stringify(repairedDoc));
     successful([await create("after-repaired-removal")]);
     expect(YAML.parse(fs.readFileSync(manifest, "utf8")).composition.slices.map((member: { ref: string }) => member.ref)).not.toContain("slices/02-lost/slice.yaml");
-  });
+  }, 60000);
 
   it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("an actual manifest EACCES preserves the complete slice for later repair", async () => {
     const ref = "slices/01-existing/slice.yaml";

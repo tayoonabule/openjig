@@ -41,12 +41,17 @@ function client() {
 describe("auto-start only for a daemon confirmed down", () => {
   beforeEach(() => {
     lifecycle.startDaemon.mockClear();
+    // rig start's real preflight probes the configured bind port. Keep that
+    // probe on port 0 so a daemon running on the operator's default 7433 cannot
+    // make this mocked lifecycle test fail or interact with a live service.
+    vi.stubEnv("OPENRIG_PORT", "0");
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
     process.exitCode = undefined;
   });
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     process.exitCode = undefined;
   });
 
